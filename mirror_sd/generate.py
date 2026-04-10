@@ -3,24 +3,8 @@
 Implements the DFlash block-diffusion speculative decoding algorithm
 translated from the PyTorch reference to MLX.
 
-Key differences from standard speculative decoding:
-- Draft model generates entire BLOCKS of tokens in parallel (not autoregressive)
-- Draft uses target's lm_head for final logits (shares vocabulary)
-- Draft attention is non-causal (block diffusion)
-- Draft KV cache is cropped after each block (not accumulated)
-- Target hidden states are captured and fused as context for the draft
-
-Flow:
-1. PREFILL: Run target on prompt, get first token + hidden states
-2. DECODE LOOP:
-   a. Create block of tokens at current position (first is real, rest are mask)
-   b. Compute noise_embedding from target's embed_tokens
-   c. Run DFlash forward with target hidden -> draft hidden states
-   d. Pass through target's lm_head for logits
-   e. Sample draft tokens from logits, update block
-   f. VERIFY: Run target model on block
-   g. Accept matching prefix + correction token from target
-   h. Crop caches and extract new target hidden states
+Optimized for MLX lazy evaluation: reduces sync points from 5 to 2 per
+decode iteration by building draft and verify as separate lazy graphs.
 """
 
 import time
@@ -30,7 +14,10 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .dflash import DFlashDraftModel, DFlashConfig, extract_context_feature, sample
+from .dflash import (
+    DFlashDraftModel, DFlashConfig, DFlashKVCache,
+    extract_context_feature, sample, make_draft_mask,
+)
 from .target import forward_with_hidden_states
 
 
@@ -68,27 +55,6 @@ def spec_generate(
     temperature: float = 0.0,
     target_layer_ids: Optional[List[int]] = None,
 ) -> Tuple[mx.array, SpecDecodeStats]:
-    """DFlash speculative decoding loop.
-
-    Follows the algorithm from the DFlash reference implementation:
-    - Draft model generates blocks using target-aware attention
-    - Draft logits come from target's lm_head (not draft's own)
-    - Draft KV cache is fresh each block (cropped to current position)
-    - Target hidden states are extracted and fused as draft context
-
-    Args:
-        target_model: The target mlx-lm model
-        draft_model: The DFlash draft model
-        input_ids: Input token IDs [1, seq_len]
-        max_new_tokens: Maximum tokens to generate
-        stop_token_ids: Token IDs that stop generation
-        temperature: Sampling temperature (0 = greedy)
-        target_layer_ids: Which target layers to capture hidden states from
-
-    Returns:
-        output_ids: Generated token IDs [1, total_len]
-        stats: Generation statistics
-    """
     from mlx_lm.models import cache as cache_module
 
     if target_layer_ids is None:
@@ -107,8 +73,9 @@ def spec_generate(
         output_ids_list = [output_ids_list]
 
     target_cache = cache_module.make_prompt_cache(target_model)
+    draft_cache = draft_model.make_cache()
 
-    # --- Prefill stage ---
+    # --- Prefill ---
     logits, embed, hidden_states = forward_with_hidden_states(
         target_model, input_ids, cache=target_cache, capture_layers=target_layer_ids,
     )
@@ -123,46 +90,54 @@ def spec_generate(
 
     stats.prefill_time = time.perf_counter() - t_start
 
-    # --- Decode stage ---
+    # --- Decode ---
     start = num_input_tokens + 1
     while start < max_length:
         remaining = max_length - start
         current_block_size = min(block_size, remaining + 1)
 
+        # --- Draft phase (lazy graph, sync once) ---
         block_tokens = [output_ids_list[start - 1]]
         block_tokens.extend([mask_token_id] * (current_block_size - 1))
         block_output_ids = mx.array([block_tokens], dtype=mx.int32)
 
         noise_embedding = target_model.model.embed_tokens(block_output_ids)
 
+        cache_len = draft_cache[0].offset
+        ctx_len = target_hidden.shape[1]
+        q_len = noise_embedding.shape[1]
+        draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
+
         draft_hidden = draft_model(
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
+            mask=draft_mask,
+            cache=draft_cache,
         )
-
         draft_logits = target_model.lm_head(draft_hidden[:, -current_block_size + 1:, :])
-        mx.eval(draft_logits)
-
         sampled_tokens = sample(draft_logits, temperature)
+
         mx.eval(sampled_tokens)
 
+        # Update block with draft predictions
         block_tokens_updated = block_tokens.copy()
         for i in range(sampled_tokens.shape[1]):
             block_tokens_updated[i + 1] = int(sampled_tokens[0, i])
         block_output_ids = mx.array([block_tokens_updated], dtype=mx.int32)
 
+        # --- Verify phase (lazy graph, sync once) ---
         verify_logits, _, verify_hidden = forward_with_hidden_states(
             target_model,
             block_output_ids,
             cache=target_cache,
             capture_layers=target_layer_ids,
         )
-        mx.eval(verify_logits, *verify_hidden)
+        posterior = sample(verify_logits, temperature)
+
+        mx.eval(posterior, *verify_hidden)
         mx.eval([c.state for c in target_cache])
 
-        posterior = sample(verify_logits, temperature)
-        mx.eval(posterior)
-
+        # --- Accept/reject ---
         draft_tokens = block_tokens_updated[1:]
         target_tokens = posterior[0, :-1].tolist()
         if isinstance(target_tokens, int):
@@ -182,9 +157,12 @@ def spec_generate(
 
         start += acceptance_length + 1
 
-        n_to_trim = current_block_size - acceptance_length - 1
-        if n_to_trim > 0:
-            cache_module.trim_prompt_cache(target_cache, n_to_trim)
+        n_to_trim_target = current_block_size - acceptance_length - 1
+        if n_to_trim_target > 0:
+            cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
+
+        for c in draft_cache:
+            c.crop(start)
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 

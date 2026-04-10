@@ -16,6 +16,11 @@ Key design (from Section 4.1 of the DFlash paper):
   - K/V come from both target context (ctx) and draft positions (noise)
   - All masked positions decoded in parallel (block diffusion, non-causal)
   - Draft model shares embedding and lm_head with the target model
+
+Critical implementation details vs PyTorch reference:
+  - RoPE is applied to [k_ctx, k_noise] with correct positions for each segment
+  - Draft KV cache accumulates verified prefix and gets cropped after rejection
+  - Non-causal (full) attention mask is explicitly constructed for block diffusion
 """
 
 import math
@@ -133,6 +138,71 @@ def sample(logits: mx.array, temperature: float = 0.0) -> mx.array:
     return mx.argmax(probs, axis=-1)
 
 
+class DFlashKVCache:
+    """KV cache for the DFlash draft model.
+
+    Unlike the standard KVCache, this supports:
+    - Explicit position tracking (not offset-based) for correct RoPE on
+      concatenated [context, noise] keys
+    - Cropping to discard rejected tokens after verification (like the
+      PyTorch reference's DynamicCache.crop)
+    - Full bidirectional attention within the draft (non-causal)
+
+    The cache stores K/V from the verified prefix so that subsequent
+    draft blocks can attend to already-accepted tokens.
+    """
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+        self.offset = self.keys.shape[2]
+        return self.keys, self.values
+
+    def crop(self, new_length: int):
+        """Crop the cache to retain only the first new_length positions."""
+        if self.keys is not None and new_length < self.offset:
+            self.keys = self.keys[..., :new_length, :]
+            self.values = self.values[..., :new_length, :]
+            self.offset = new_length
+
+    def state(self):
+        if self.keys is None:
+            return []
+        return [self.keys, self.values]
+
+
+def make_draft_mask(
+    q_len: int,
+    ctx_len: int,
+    cache_len: int = 0,
+) -> mx.array:
+    """Create a non-causal (bidirectional) attention mask for DFlash draft.
+
+    DFlash uses block diffusion where all noise positions attend to each
+    other and to all context positions. The mask shape is
+    [1, 1, q_len, cache_len + ctx_len + q_len] where:
+      - cache_len: previously verified tokens from draft KV cache
+      - ctx_len: target context positions (injected into K/V this step)
+      - q_len: noise/query positions (draft tokens being decoded)
+
+    All query positions can attend to all key positions (full bidirectional).
+    """
+    total_kv = cache_len + ctx_len + q_len
+    if total_kv == q_len and cache_len == 0 and ctx_len == 0:
+        return None
+    mask = mx.zeros((1, 1, q_len, total_kv), dtype=mx.float16)
+    return mask
+
+
 class Qwen3DFlashAttention(nn.Module):
     def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
@@ -160,13 +230,27 @@ class Qwen3DFlashAttention(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
         )
 
+    def _apply_rope(
+        self,
+        x: mx.array,
+        offset: int = 0,
+    ) -> mx.array:
+        return mx.fast.rope(
+            x,
+            self.head_dim,
+            traditional=self.rope.traditional,
+            base=self.rope.base,
+            scale=self.rope.scale,
+            offset=offset,
+        )
+
     def __call__(
         self,
         hidden_states: mx.array,
         target_hidden: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> Tuple[mx.array, Optional[Any]]:
+        cache: Optional[DFlashKVCache] = None,
+    ) -> mx.array:
         B, q_len, _ = hidden_states.shape
         ctx_len = target_hidden.shape[1]
 
@@ -185,12 +269,20 @@ class Qwen3DFlashAttention(nn.Module):
         v = v.reshape(B, ctx_len + q_len, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            q = self.rope(q, offset=cache.offset)
-            k = self.rope(k, offset=cache.offset)
-            k, v = cache.update_and_fetch(k, v)
+            rope_offset = cache.offset
         else:
-            q = self.rope(q)
-            k = self.rope(k)
+            rope_offset = 0
+
+        q = self._apply_rope(q, offset=rope_offset + ctx_len)
+
+        k_ctx = k[:, :, :ctx_len, :]
+        k_noise = k[:, :, ctx_len:, :]
+        k_ctx = self._apply_rope(k_ctx, offset=rope_offset)
+        k_noise = self._apply_rope(k_noise, offset=rope_offset + ctx_len)
+        k = mx.concatenate([k_ctx, k_noise], axis=2)
+
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
 
         n_rep = self.n_heads // self.n_kv_heads
         if n_rep > 1:
@@ -228,7 +320,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         hidden_states: mx.array,
         target_hidden: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        cache: Optional[DFlashKVCache] = None,
     ) -> mx.array:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -275,15 +367,19 @@ class DFlashDraftModel(nn.Module):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            c = cache[i] if cache is not None else None
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
                 mask=mask,
-                cache=None,
+                cache=c,
             )
 
         return self.norm(hidden_states)
+
+    def make_cache(self) -> list:
+        return [DFlashKVCache() for _ in range(self.config.num_hidden_layers)]
 
     def sanitize(self, weights):
         return weights
