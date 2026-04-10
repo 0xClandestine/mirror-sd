@@ -185,7 +185,7 @@ pub fn build_q_kernel(w_sq: usize) -> Graph {
     g
 }
 
-pub fn build_k_proj_kernel(w_sq: usize, w_ctx: usize) -> Graph {
+pub fn build_k_proj_ctx_kernel(w_ctx: usize) -> Graph {
     let mut g = Graph::new();
     let target_hid = g.placeholder(Shape {
         batch: 1,
@@ -193,6 +193,18 @@ pub fn build_k_proj_kernel(w_sq: usize, w_ctx: usize) -> Graph {
         height: 1,
         width: w_ctx,
     });
+    let wk = g.placeholder(Shape {
+        batch: 1,
+        channels: N_KV_HEADS * HEAD_DIM,
+        height: 1,
+        width: HIDDEN,
+    });
+    let _out = conv1x1_proj(&mut g, target_hid, wk, N_KV_HEADS * HEAD_DIM, HIDDEN);
+    g
+}
+
+pub fn build_k_proj_noise_kernel(w_sq: usize) -> Graph {
+    let mut g = Graph::new();
     let hidden = g.placeholder(Shape {
         batch: 1,
         channels: HIDDEN,
@@ -212,19 +224,50 @@ pub fn build_k_proj_kernel(w_sq: usize, w_ctx: usize) -> Graph {
         height: 1,
         width: HIDDEN,
     });
-    let wk_t = g.transpose(wk, [0, 3, 2, 1]);
-    let wk_conv = g.reshape(
-        wk_t,
-        Shape {
-            batch: N_KV_HEADS * HEAD_DIM,
-            channels: HIDDEN,
-            height: 1,
-            width: 1,
-        },
-    );
-    let k_ctx = g.convolution_2d_1x1_dynamic(target_hid, wk_conv);
-    let k_noise = g.convolution_2d_1x1_dynamic(normed, wk_conv);
-    let _out = g.concat(&[k_ctx, k_noise], 3);
+    let _out = conv1x1_proj(&mut g, normed, wk, N_KV_HEADS * HEAD_DIM, HIDDEN);
+    g
+}
+
+pub fn build_v_proj_ctx_kernel(w_ctx: usize) -> Graph {
+    let mut g = Graph::new();
+    let target_hid = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: w_ctx,
+    });
+    let wv = g.placeholder(Shape {
+        batch: 1,
+        channels: N_KV_HEADS * HEAD_DIM,
+        height: 1,
+        width: HIDDEN,
+    });
+    let _out = conv1x1_proj(&mut g, target_hid, wv, N_KV_HEADS * HEAD_DIM, HIDDEN);
+    g
+}
+
+pub fn build_v_proj_noise_kernel(w_sq: usize) -> Graph {
+    let mut g = Graph::new();
+    let hidden = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: w_sq,
+    });
+    let in_norm_w = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: w_sq,
+    });
+    let normed = rmsnorm(&mut g, hidden, in_norm_w);
+    let wv = g.placeholder(Shape {
+        batch: 1,
+        channels: N_KV_HEADS * HEAD_DIM,
+        height: 1,
+        width: HIDDEN,
+    });
+    let _out = conv1x1_proj(&mut g, normed, wv, N_KV_HEADS * HEAD_DIM, HIDDEN);
     g
 }
 
@@ -243,49 +286,6 @@ pub fn build_k_norm_kernel(w_kv: usize) -> Graph {
         width: w_kv,
     });
     let _out = rmsnorm(&mut g, k_out, k_norm_w);
-    g
-}
-
-pub fn build_v_proj_kernel(w_sq: usize, w_ctx: usize) -> Graph {
-    let mut g = Graph::new();
-    let target_hid = g.placeholder(Shape {
-        batch: 1,
-        channels: HIDDEN,
-        height: 1,
-        width: w_ctx,
-    });
-    let hidden = g.placeholder(Shape {
-        batch: 1,
-        channels: HIDDEN,
-        height: 1,
-        width: w_sq,
-    });
-    let in_norm_w = g.placeholder(Shape {
-        batch: 1,
-        channels: HIDDEN,
-        height: 1,
-        width: w_sq,
-    });
-    let normed = rmsnorm(&mut g, hidden, in_norm_w);
-    let wv = g.placeholder(Shape {
-        batch: 1,
-        channels: HIDDEN,
-        height: 1,
-        width: N_KV_HEADS * HEAD_DIM,
-    });
-    let wv_t = g.transpose(wv, [0, 3, 2, 1]);
-    let wv_conv = g.reshape(
-        wv_t,
-        Shape {
-            batch: N_KV_HEADS * HEAD_DIM,
-            channels: HIDDEN,
-            height: 1,
-            width: 1,
-        },
-    );
-    let v_ctx = g.convolution_2d_1x1_dynamic(target_hid, wv_conv);
-    let v_noise = g.convolution_2d_1x1_dynamic(normed, wv_conv);
-    let _out = g.concat(&[v_ctx, v_noise], 3);
     g
 }
 

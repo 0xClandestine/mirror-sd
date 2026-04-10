@@ -142,9 +142,11 @@ pub fn compile_dflash_kernels(seq_q: usize, ctx_len: usize) -> PyResult<Vec<ANEK
     let kernel_builders: Vec<(&str, Graph)> = vec![
         ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
         ("q_kernel", dflash::build_q_kernel(w_sq)),
-        ("k_proj", dflash::build_k_proj_kernel(w_sq, w_ctx)),
+        ("k_proj_ctx", dflash::build_k_proj_ctx_kernel(w_ctx)),
+        ("k_proj_noise", dflash::build_k_proj_noise_kernel(w_sq)),
         ("k_norm", dflash::build_k_norm_kernel(w_kv)),
-        ("v_proj", dflash::build_v_proj_kernel(w_sq, w_ctx)),
+        ("v_proj_ctx", dflash::build_v_proj_ctx_kernel(w_ctx)),
+        ("v_proj_noise", dflash::build_v_proj_noise_kernel(w_sq)),
         ("rope_q", dflash::build_rope_q_kernel(w_sq)),
         ("rope_k", dflash::build_rope_k_kernel(w_sq, w_ctx)),
         ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
@@ -759,16 +761,24 @@ pub fn test_dflash_nlayers(_n_layers: usize, seq_q: usize, ctx_len: usize) -> Py
             dflash::build_q_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
         ),
         (
-            "k_proj",
-            dflash::build_k_proj_kernel(w_sq, w_ctx).compile(NSQualityOfService::UserInteractive),
+            "k_proj_ctx",
+            dflash::build_k_proj_ctx_kernel(w_ctx).compile(NSQualityOfService::UserInteractive),
+        ),
+        (
+            "k_proj_noise",
+            dflash::build_k_proj_noise_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
         ),
         (
             "k_norm",
             dflash::build_k_norm_kernel(w_kv).compile(NSQualityOfService::UserInteractive),
         ),
         (
-            "v_proj",
-            dflash::build_v_proj_kernel(w_sq, w_ctx).compile(NSQualityOfService::UserInteractive),
+            "v_proj_ctx",
+            dflash::build_v_proj_ctx_kernel(w_ctx).compile(NSQualityOfService::UserInteractive),
+        ),
+        (
+            "v_proj_noise",
+            dflash::build_v_proj_noise_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
         ),
         (
             "rope_q",
