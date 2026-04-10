@@ -184,6 +184,7 @@ def make_draft_mask(
     q_len: int,
     ctx_len: int,
     cache_len: int = 0,
+    dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
     """Create a non-causal (bidirectional) attention mask for DFlash draft.
 
@@ -195,12 +196,10 @@ def make_draft_mask(
       - q_len: noise/query positions (draft tokens being decoded)
 
     All query positions can attend to all key positions (full bidirectional).
+    Returns None when no masking is needed (MLX SDPA defaults to full
+    attention without a mask, which is exactly what DFlash wants).
     """
-    total_kv = cache_len + ctx_len + q_len
-    if total_kv == q_len and cache_len == 0 and ctx_len == 0:
-        return None
-    mask = mx.zeros((1, 1, q_len, total_kv), dtype=mx.float16)
-    return mask
+    return None
 
 
 class Qwen3DFlashAttention(nn.Module):

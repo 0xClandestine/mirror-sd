@@ -68,6 +68,17 @@ PROMPTS = [
     "How does photosynthesis work?",
 ]
 
+MATH_CODE_PROMPTS = [
+    "What is 15% of 200?",
+    "If a train travels 60 mph for 2.5 hours, how far does it go?",
+    "Solve for x: 3x + 7 = 22",
+    "Write a Python function to compute the Fibonacci sequence:",
+    "Write a Python function to check if a string is a palindrome:",
+    "Implement binary search in Python:",
+    "What is the time complexity of merge sort?",
+    "Find the derivative of f(x) = x^3 + 2x^2 - 5x + 1",
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark: baseline vs DFlash speculative decoding")
@@ -77,14 +88,24 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (default: built-in suite)")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup rounds before measuring")
+    parser.add_argument("--math", action="store_true", help="Use math/code prompts (paper's training distribution)")
+    parser.add_argument("--block-size", type=int, default=None, help="Override draft block size")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
     target_model, tokenizer = mlx_load(args.model)
     print(f"Loading draft:  {args.draft}")
     draft_model, config = load_dflash_model(args.draft)
+    if args.block_size is not None:
+        config.block_size = args.block_size
+        draft_model.block_size = args.block_size
 
-    prompts = [args.prompt] if args.prompt else PROMPTS
+    if args.prompt:
+        prompts = [args.prompt]
+    elif args.math:
+        prompts = MATH_CODE_PROMPTS
+    else:
+        prompts = PROMPTS
     max_tokens = args.max_tokens
     temperature = args.temperature
     eos_ids = list(_eos_ids(tokenizer)) or None

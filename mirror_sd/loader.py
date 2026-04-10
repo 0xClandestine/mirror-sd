@@ -20,7 +20,7 @@ from .dflash import DFlashDraftModel, DFlashConfig
 def load_dflash_model(
     model_path: str,
     config_overrides: Optional[Dict] = None,
-    dtype: mx.Dtype = mx.float16,
+    dtype: mx.Dtype = mx.bfloat16,
 ) -> Tuple[DFlashDraftModel, DFlashConfig]:
     """Load a DFlash draft model from a HuggingFace model directory.
 
@@ -67,16 +67,15 @@ def _load_config(model_path: Path, overrides: Optional[Dict] = None) -> DFlashCo
 
 def _load_safetensors(
     model_path: Path,
-    dtype: mx.Dtype = mx.float16,
+    dtype: mx.Dtype = mx.bfloat16,
 ) -> Dict[str, mx.array]:
     """Load weights from safetensors files using MLX native loader.
-
+    
     Handles both single file and sharded (model-00001-of-000NN.safetensors) formats.
-    Converts bfloat16 to float16 since MLX doesn't natively support bfloat16.
+    Converts to the specified dtype (default bfloat16 to match target model).
     """
     weights = {}
 
-    # Try loading directly with mx.load first (handles single & sharded)
     single = model_path / "model.safetensors"
     index_path = model_path / "model.safetensors.index.json"
 
@@ -88,18 +87,14 @@ def _load_safetensors(
             fpath = model_path / wf
             shard = mx.load(str(fpath))
             for k, v in shard.items():
-                if v.dtype == mx.bfloat16:
-                    v = v.astype(mx.float32).astype(dtype)
-                elif v.dtype != dtype:
+                if v.dtype != dtype:
                     v = v.astype(dtype)
                 weights[k] = v
     elif single.exists():
         loaded = mx.load(str(single))
         for k, v in loaded.items():
             if isinstance(v, mx.array):
-                if v.dtype == mx.bfloat16:
-                    v = v.astype(mx.float32).astype(dtype)
-                elif v.dtype != dtype:
+                if v.dtype != dtype:
                     v = v.astype(dtype)
                 weights[k] = v
     else:
@@ -108,9 +103,7 @@ def _load_safetensors(
             shard = mx.load(str(st_file))
             for k, v in shard.items():
                 if isinstance(v, mx.array):
-                    if v.dtype == mx.bfloat16:
-                        v = v.astype(mx.float32).astype(dtype)
-                    elif v.dtype != dtype:
+                    if v.dtype != dtype:
                         v = v.astype(dtype)
                     weights[k] = v
 
@@ -120,7 +113,7 @@ def _load_safetensors(
 def convert_dflash_to_mlx(
     source_path: str,
     output_dir: str,
-    dtype: mx.Dtype = mx.float16,
+    dtype: mx.Dtype = mx.bfloat16,
 ):
     """Convert a DFlash model from HuggingFace format to MLX format.
 

@@ -92,9 +92,26 @@ def spec_generate(
 
     # --- Decode ---
     start = num_input_tokens + 1
+    repeat_window = []
+    max_repeat_window = 4
     while start < max_length:
         remaining = max_length - start
         current_block_size = min(block_size, remaining + 1)
+
+        if len(repeat_window) >= max_repeat_window:
+            recent = output_ids_list[-max_repeat_window:]
+            if len(set(recent)) == 1:
+                repeat_window = []
+                token_id = mx.array([[output_ids_list[-1]]], dtype=mx.int32)
+                logits = target_model(token_id, cache=target_cache)
+                mx.eval(logits)
+                mx.eval([c.state for c in target_cache])
+                next_token = sample(logits[:, -1:, :], temperature)
+                mx.eval(next_token)
+                output_ids_list.append(int(next_token[0, 0]))
+                start += 1
+                stats.total_tokens = len(output_ids_list) - num_input_tokens
+                continue
 
         # --- Draft phase (lazy graph, sync once) ---
         block_tokens = [output_ids_list[start - 1]]
@@ -156,6 +173,11 @@ def spec_generate(
         output_ids_list.append(correction_token)
 
         start += acceptance_length + 1
+
+        for tid in draft_tokens[:acceptance_length] + [correction_token]:
+            repeat_window.append(tid)
+            if len(repeat_window) > max_repeat_window:
+                repeat_window.pop(0)
 
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:

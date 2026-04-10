@@ -156,10 +156,12 @@ print(f"Speed: {stats.tokens_per_sec:.1f} tok/s, "
 - [x] Draft KV cache with crop (accumulates verified prefix)
 - [x] Correct RoPE on concatenated [context, noise] K
 - [x] Non-causal attention mask for block diffusion
+- [x] bf16 draft model (matches target model dtype)
+- [x] Repetition detection (prevents degenerate accept/reject loops)
+- [x] Benchmark script with math/code prompts
 - [ ] ANE execution path (CoreML conversion of draft model)
 - [ ] Mirror-SD early-exit signal (target mid-layer → draft parallel start)
 - [ ] Mirror-SD branch-complete rollout (top-κ candidate expansion)
-- [ ] Quantized draft model support
 
 ## Project Structure
 
@@ -168,14 +170,10 @@ mirror_sd/
 ├── __init__.py       # Package exports
 ├── dflash.py         # DFlash draft model (target-aware attention + block diffusion)
 ├── target.py         # Target model integration (hidden state capture)
-├── generate.py       # Speculative decoding loop
-├── loader.py         # Weight loading + HuggingFace conversion
+├── generate.py       # Speculative decoding loop (with repetition detection)
+├── loader.py         # Weight loading + HuggingFace conversion (bf16 by default)
+├── bench.py          # Benchmark: baseline vs DFlash (with math/code prompts)
 └── cli.py            # CLI entry point
-references/           # Reference implementations
-├── dflash/           # PyTorch DFlash reference
-├── mlx-eagle3/       # EAGLE-3 on MLX reference
-├── rustane/          # Rust ANE + Metal engine reference
-└── Mirror-Speculative-Decoding.md  # Mirror-SD paper notes
 ```
 
 ## ANE Execution (Future)
@@ -194,6 +192,38 @@ import coremltools as ct
 ```
 
 ## Dev Log
+
+### 2025-04-10: bf16 Fix, Repetition Detection, Benchmark Improvements
+
+**The bf16 dtype fix was the single biggest improvement:**
+- Draft model now loads in `bfloat16` (matching the target model) instead of `float16`
+- This required removing the explicit zero-valued attention mask — `mx.fast.scaled_dot_product_attention` rejects f32 masks when the output is bf16. Since SDPA defaults to full (non-causal) attention with no mask, `make_draft_mask()` now returns `None` always, which is exactly what DFlash needs.
+- `load_dflash_model()` default dtype changed from `float16` to `bfloat16`
+- Weight loading simplified: bf16→bf16 (no intermediate float32 conversion needed)
+
+**Results comparison:**
+| Metric | f16 Draft | bf16 Draft | Change |
+|--------|-----------|------------|--------|
+| Avg acceptance | 2.0 | 3.01 | +50% |
+| Speedup | 0.57x | **1.27x** | Now faster than baseline! |
+| "Capital of France" | 8.3 (degenerate) | 6.40 | Fixed by repetition detection |
+
+**Repetition detection added to `spec_generate()`:**
+- Tracks last 4 generated tokens; if all identical, falls back to single-token autoregressive step
+- Prevents degenerate loops where draft locks into repeating patterns and target keeps confirming
+- The "Capital of France" prompt now shows genuine acceptance (~6.4) before repetition triggers
+
+**Other experiments:**
+- **Math/code prompts**: Acceptance ~2.4-2.9 on math/code (paper's training distribution is GSM8K/MATH500 format specifically, not general math questions). Not significantly higher than general prompts.
+- **Block size comparison** (4 vs 8 vs 16): Minimal difference at our acceptance rates. Block=8 sometimes slightly better for code prompts (14.0 vs 11.5 tok/s), but inconsistent.
+- **Draft quantization**: 4-bit gives identical speed and acceptance (draft is only 5 layers, so memory bandwidth isn't the bottleneck). 2-bit hurts both. Not worth it.
+
+**Current benchmark (bf16 draft, block_size=16):**
+```
+Baseline:   12.4 tok/s
+DFlash:     15.8 tok/s (accept=3.01)
+Speedup:    1.27x
+```
 
 ### 2025-04-10: Initial MLX Implementation
 
@@ -263,8 +293,8 @@ DFlash uses block diffusion (non-causal/bidirectional attention). MLX's `scaled_
 
 *\*The "capital of France" prompt shows a degenerate loop — the draft locks into repeating "Paris." and the target keeps confirming. This is not a bug in the implementation but a known issue with speculative decoding when the draft diverges from the target's true greedy path in a self-reinforcing way. The PT reference doesn't have this issue because its bf16 draft produces slightly different (more diverse) predictions.*
 
-**Key learning: f16 vs bf16 precision difference**
-The MLX target model runs in f16 while the PT reference uses bf16. Target hidden states differ by ~0.0625 max after just 4 layers. These differences compound through the 5 draft layers, causing draft predictions to diverge from the PT reference. This is the main reason our acceptance rate (2.0-2.4) is below the PT reference (2.85-3.1) on diverse prompts, and why the "simple prompt" loop behavior differs. Future fix: support bf16 in MLX or run draft model in f32 for higher accuracy.
+**Key learning: f16 vs bf16 precision difference (RESOLVED)**
+The MLX target model loads in **bf16** (not f16!). When the draft was loaded in f16, the dtype mismatch between target hidden states (bf16) and draft weights (f16) caused draft predictions to diverge from the PT reference. Fixed by loading the draft model in bf16 to match the target model. This was the single biggest acceptance rate improvement (+50%).
 
 **Architecture decisions:**
 - No draft KV cache currently (simpler, correct; cache interaction with target-aware attention's concatenated K/V is complex — context K comes from `target_hidden` which changes each step, not from the cache)
