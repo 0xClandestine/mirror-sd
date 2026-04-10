@@ -1,0 +1,23 @@
+[submodule "references/ane"]
+	path = references/ane
+	url = https://github.com/ncdrone/ane
+	branch = main
+[submodule "references/mlx"]
+	path = references/mlx
+	url = https://github.com/ml-explore/mlx
+	branch = main
+[submodule "references/mlx-vlm"]
+	path = references/mlx-vlm
+	url = https://github.com/Blaizzy/mlx-vlm
+	branch = main
+[submodule "references/rustane"]
+	path = references/rustane
+	url = https://github.com/ncdrone/rustane
+	branch = master
+[submodule "references/mlx-eagle3"]
+	path = references/mlx-eagle3
+	url = https://github.com/kmsalah/mlx
+	branch = eagle3-speculative-decoding
+[submodule "references/dflash"]
+	path = references/dflash
+	url = https://github.com/z-lab/dflash

@@ -1,0 +1,2 @@
+[console_scripts]
+mirror-sd = mirror_sd.cli:main

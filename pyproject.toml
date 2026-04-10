@@ -1,0 +1,23 @@
+[project]
+name = "mirror-sd"
+version = "0.1.0"
+description = "DFlash speculative decoding on Apple Silicon via MLX"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.25.0",
+    "mlx-lm>=0.23.0",
+    "safetensors",
+    "huggingface-hub",
+    "transformers",
+    "tokenizers",
+]
+
+[project.scripts]
+mirror-sd = "mirror_sd.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mirror_sd*"]
