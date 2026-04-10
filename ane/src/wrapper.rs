@@ -109,6 +109,24 @@ impl ANEKernel {
         Ok(())
     }
 
+    fn run_uncached(
+        &self,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        self.executable
+            .run(&input_refs, &output_refs)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_uncached failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
     fn run_timed(
         &self,
         inputs: Vec<PyRef<ANETensor>>,
@@ -144,10 +162,11 @@ pub fn compile_dflash_kernels(seq_q: usize, ctx_len: usize) -> PyResult<Vec<ANEK
         ("q_kernel", dflash::build_q_kernel(w_sq)),
         ("k_proj_ctx", dflash::build_k_proj_ctx_kernel(w_ctx)),
         ("k_proj_noise", dflash::build_k_proj_noise_kernel(w_sq)),
-        ("kv_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
+        ("k_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
         ("k_norm", dflash::build_k_norm_kernel(w_kv)),
         ("v_proj_ctx", dflash::build_v_proj_ctx_kernel(w_ctx)),
         ("v_proj_noise", dflash::build_v_proj_noise_kernel(w_sq)),
+        ("v_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
         ("rope_q", dflash::build_rope_q_kernel(w_sq)),
         ("rope_k", dflash::build_rope_k_kernel(w_sq, w_ctx)),
         ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
@@ -702,6 +721,156 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
         }
     }
     Ok(out.trim_end().to_string())
+}
+
+/// Compile a test conv1x1 kernel using Approach A (current):
+/// Weight placeholder [1, OC, 1, IC] with transpose+reshape
+/// Input: [1, IC, 1, SEQ], Weight: [1, OC, 1, IC], Output: [1, OC, 1, SEQ]
+#[pyfunction]
+pub fn compile_conv1x1_transpose(ic: usize, oc: usize, seq: usize) -> PyResult<Vec<ANEKernel>> {
+    let w = dflash::align_width(seq);
+    let w_wt = dflash::align_width(ic);
+
+    let mut g = Graph::new();
+    let input = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: w,
+    });
+    // Current approach: weight as [1, OC, 1, IC] with transpose
+    let weight = g.placeholder(Shape {
+        batch: 1,
+        channels: oc,
+        height: 1,
+        width: w_wt,
+    });
+    let wt = g.transpose(weight, [0, 3, 2, 1]);
+    let w_conv = g.reshape(
+        wt,
+        Shape {
+            batch: oc,
+            channels: ic,
+            height: 1,
+            width: 1,
+        },
+    );
+    let _out = g.convolution_2d_1x1_dynamic(input, w_conv);
+
+    let exec = g
+        .compile(NSQualityOfService::UserInteractive)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "compile_conv1x1_transpose failed: {:?}",
+                e
+            ))
+        })?;
+    Ok(vec![ANEKernel {
+        executable: exec,
+        name: "conv1x1_transpose".to_string(),
+    }])
+}
+
+/// Compile a test conv1x1 kernel using Approach B (rustane reference):
+/// Weight placeholder [1, IC, 1, OC] with concat+slice+transpose+reshape
+/// Input: [1, IC, 1, SEQ], Weight: [1, IC, 1, OC], Output: [1, OC, 1, SEQ]
+#[pyfunction]
+pub fn compile_conv1x1_concat(ic: usize, oc: usize, seq: usize) -> PyResult<Vec<ANEKernel>> {
+    let w = dflash::align_width(seq);
+    let w_wt = dflash::align_width(oc);
+
+    let mut g = Graph::new();
+    let acts = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: w,
+    });
+    let wts = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: w_wt,
+    });
+
+    // Concat then slice (mirrors rustane build_conv_split pattern)
+    let packed = g.concat(&[acts, wts], 3);
+    let a = g.slice(packed, [0, 0, 0, 0], [1, ic, 1, seq]);
+    let w_sliced = g.slice(packed, [0, 0, 0, seq], [1, ic, 1, oc]);
+
+    let wt = g.transpose(w_sliced, [0, 3, 2, 1]);
+    let w_conv = g.reshape(
+        wt,
+        Shape {
+            batch: oc,
+            channels: ic,
+            height: 1,
+            width: 1,
+        },
+    );
+    let _out = g.convolution_2d_1x1_dynamic(a, w_conv);
+
+    let exec = g
+        .compile(NSQualityOfService::UserInteractive)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "compile_conv1x1_concat failed: {:?}",
+                e
+            ))
+        })?;
+    Ok(vec![ANEKernel {
+        executable: exec,
+        name: "conv1x1_concat".to_string(),
+    }])
+}
+
+/// Compile a test conv1x1 kernel using Approach C (transpose on placeholder, no concat-slice):
+/// Weight placeholder [1, IC, 1, OC] with transposed data, direct transpose+reshape.
+/// Tests whether transpose on placeholder works at all when using [1, IC, 1, OC] shape.
+/// Input: [1, IC, 1, SEQ], Weight: [1, IC, 1, OC], Output: [1, OC, 1, SEQ]
+#[pyfunction]
+pub fn compile_conv1x1_transpose_b(ic: usize, oc: usize, seq: usize) -> PyResult<Vec<ANEKernel>> {
+    let w = dflash::align_width(seq);
+    let w_wt = dflash::align_width(oc);
+
+    let mut g = Graph::new();
+    let input = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: w,
+    });
+    // Weight as [1, IC, 1, OC] (transposed shape), then transpose+reshape
+    let weight = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: w_wt,
+    });
+    let wt = g.transpose(weight, [0, 3, 2, 1]);
+    let w_conv = g.reshape(
+        wt,
+        Shape {
+            batch: oc,
+            channels: ic,
+            height: 1,
+            width: 1,
+        },
+    );
+    let _out = g.convolution_2d_1x1_dynamic(input, w_conv);
+
+    let exec = g
+        .compile(NSQualityOfService::UserInteractive)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "compile_conv1x1_transpose_b failed: {:?}",
+                e
+            ))
+        })?;
+    Ok(vec![ANEKernel {
+        executable: exec,
+        name: "conv1x1_transpose_b".to_string(),
+    }])
 }
 
 #[pyfunction]
