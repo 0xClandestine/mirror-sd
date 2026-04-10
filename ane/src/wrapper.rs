@@ -144,6 +144,7 @@ pub fn compile_dflash_kernels(seq_q: usize, ctx_len: usize) -> PyResult<Vec<ANEK
         ("q_kernel", dflash::build_q_kernel(w_sq)),
         ("k_proj_ctx", dflash::build_k_proj_ctx_kernel(w_ctx)),
         ("k_proj_noise", dflash::build_k_proj_noise_kernel(w_sq)),
+        ("kv_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
         ("k_norm", dflash::build_k_norm_kernel(w_kv)),
         ("v_proj_ctx", dflash::build_v_proj_ctx_kernel(w_ctx)),
         ("v_proj_noise", dflash::build_v_proj_noise_kernel(w_sq)),

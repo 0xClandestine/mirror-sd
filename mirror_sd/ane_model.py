@@ -1,17 +1,19 @@
 """DFlash draft model running on Apple Neural Engine.
 
-Chains 11 ANE kernels (9 per decoder layer + fc_norm + final_norm)
+Chains 13 ANE kernels (11 per layer iteration + fc_norm + final_norm)
 with IOSurface buffers for intermediate results and real weight loading.
+
+K/V projections are split into ctx/noise sub-kernels (ANE can't handle
+concat+conv1x1 in one dispatch). Python concatenates the outputs.
 
 Data flow per layer:
   hidden ──┬──→ q_kernel ──→ rope_q ──→ (4D) ──┐
            │                                    ├──→ attn_residual ──→ attn_res ──→ ffn_residual ──→ hidden_next
-  context ─┼──→ k_proj ──→ k_norm ──→ rope_k ──┐│   (residual input = hidden)
-           │                    └──→ gqa_tile ──┘│
-           └──→ v_proj ──────────────→ gqa_tile ─┘
-
-Note: attn_residual writes to b_attn_res (NOT b_hidden). ffn_residual reads
-b_attn_res and writes to b_hidden. This avoids read-write hazards on b_hidden.
+  context ─┼──→ k_proj_ctx ──┐                  │   (residual input = hidden)
+           │                 ├── concat → k_norm → rope_k ─┐
+           └──→ k_proj_noise ┘                            ├──→ gqa_tile ──┐
+                 v_proj_ctx ──┐                                           │
+                 v_proj_noise ┘── concat ─────────────────────────────────┘
 """
 
 import math
@@ -49,7 +51,7 @@ class ANEDraftModel:
         self.w_ctx = align_width(ctx_len)
         self.w_kv = self.w_ctx + self.w_sq
 
-        print(f"[ANE] Compiling 11 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
+        print(f"[ANE] Compiling 13 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
         self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled")
@@ -68,17 +70,20 @@ class ANEDraftModel:
         self.b_hidden = ane.ANETensor(1, HIDDEN, 1, w_sq)
 
         self.b_q_out = ane.ANETensor(1, N_HEADS * HEAD_DIM, 1, w_sq)
+
+        self.b_k_ctx = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_ctx)
+        self.b_k_noise = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_sq)
         self.b_k_out = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
         self.b_k_normed = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
-        self.b_v_out = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
 
-        self.b_q_rope = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
+        self.b_v_ctx = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_ctx)
+        self.b_v_noise = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_sq)
+        self.b_v_out = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)        self.b_q_rope = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
         self.b_k_rope = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
 
         self.b_kv_tiled = ane.ANETensor(1, 2 * N_HEADS, w_kv, HEAD_DIM)
 
         self.b_attn_res = ane.ANETensor(1, HIDDEN, 1, w_sq)
-
         self.b_output = ane.ANETensor(1, HIDDEN, 1, w_sq)
 
         self.b_cos_q = ane.ANETensor(1, 1, w_sq, HEAD_DIM)
@@ -199,22 +204,34 @@ class ANEDraftModel:
             [self.b_q_out],
         )
 
-        k['k_proj'].run(
-            [self.b_context, self.b_hidden, getattr(self, f"w_{p}in_norm"),
-             getattr(self, f"w_{p}k_proj")],
-            [self.b_k_out],
+        k['k_proj_ctx'].run(
+            [self.b_context, getattr(self, f"w_{p}k_proj")],
+            [self.b_k_ctx],
         )
+
+        k['k_proj_noise'].run(
+            [self.b_hidden, getattr(self, f"w_{p}in_norm"), getattr(self, f"w_{p}k_proj")],
+            [self.b_k_noise],
+        )
+
+        k['kv_concat'].run([self.b_k_ctx, self.b_k_noise], [self.b_k_out])
 
         k['k_norm'].run(
             [self.b_k_out, getattr(self, f"w_{p}k_norm")],
             [self.b_k_normed],
         )
 
-        k['v_proj'].run(
-            [self.b_context, self.b_hidden, getattr(self, f"w_{p}in_norm"),
-             getattr(self, f"w_{p}v_proj")],
-            [self.b_v_out],
+        k['v_proj_ctx'].run(
+            [self.b_context, getattr(self, f"w_{p}v_proj")],
+            [self.b_v_ctx],
         )
+
+        k['v_proj_noise'].run(
+            [self.b_hidden, getattr(self, f"w_{p}in_norm"), getattr(self, f"w_{p}v_proj")],
+            [self.b_v_noise],
+        )
+
+        k['kv_concat'].run([self.b_v_ctx, self.b_v_noise], [self.b_v_out])
 
         k['rope_q'].run(
             [self.b_q_out, self.b_cos_q, self.b_sin_q],

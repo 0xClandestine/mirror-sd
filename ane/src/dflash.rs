@@ -185,6 +185,24 @@ pub fn build_q_kernel(w_sq: usize) -> Graph {
     g
 }
 
+pub fn build_kv_concat_kernel(w_ctx: usize, w_sq: usize) -> Graph {
+    let mut g = Graph::new();
+    let ctx = g.placeholder(Shape {
+        batch: 1,
+        channels: N_KV_HEADS * HEAD_DIM,
+        height: 1,
+        width: w_ctx,
+    });
+    let noise = g.placeholder(Shape {
+        batch: 1,
+        channels: N_KV_HEADS * HEAD_DIM,
+        height: 1,
+        width: w_sq,
+    });
+    let _out = g.concat(&[ctx, noise], 3);
+    g
+}
+
 pub fn build_k_proj_ctx_kernel(w_ctx: usize) -> Graph {
     let mut g = Graph::new();
     let target_hid = g.placeholder(Shape {
