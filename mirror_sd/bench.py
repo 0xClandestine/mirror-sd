@@ -70,13 +70,13 @@ PROMPTS = [
 
 MATH_CODE_PROMPTS = [
     "What is 15% of 200?",
-    "If a train travels 60 mph for 2.5 hours, how far does it go?",
-    "Solve for x: 3x + 7 = 22",
-    "Write a Python function to compute the Fibonacci sequence:",
-    "Write a Python function to check if a string is a palindrome:",
-    "Implement binary search in Python:",
-    "What is the time complexity of merge sort?",
-    "Find the derivative of f(x) = x^3 + 2x^2 - 5x + 1",
+    # "If a train travels 60 mph for 2.5 hours, how far does it go?",
+    # "Solve for x: 3x + 7 = 22",
+    # "Write a Python function to compute the Fibonacci sequence:",
+    # "Write a Python function to check if a string is a palindrome:",
+    # "Implement binary search in Python:",
+    # "What is the time complexity of merge sort?",
+    # "Find the derivative of f(x) = x^3 + 2x^2 - 5x + 1",
 ]
 
 
