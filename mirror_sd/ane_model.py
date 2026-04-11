@@ -105,6 +105,7 @@ class ANEDraftModel:
         self.b_q_norm_4d = ane.ANETensor(1, HEAD_DIM, 1, N_HEADS * w_sq)
 
         self.b_q_4d = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
+        self.b_q_rope_4d = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
         self.b_k_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
         self.b_k_rope_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
         self.b_v_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
@@ -381,7 +382,7 @@ class ANEDraftModel:
         self._4d_norm_to_4d_heads(self.b_q_norm_4d, N_HEADS, self.w_sq, self.b_q_4d)
         k['rope_q'].run_uncached(
             [self.b_q_4d, self.b_cos_q, self.b_sin_q],
-            [self.b_q_4d],
+            [self.b_q_rope_4d],
         )
 
         # K: flat → norm_4d format → per-head rmsnorm → 4D heads → rope_k
@@ -406,7 +407,7 @@ class ANEDraftModel:
         )
 
         k['attn_out'].run_uncached(
-            [self.b_q_4d, self.b_kv_tiled],
+            [self.b_q_rope_4d, self.b_kv_tiled],
             [self.b_attn_out],
         )
 
@@ -435,9 +436,9 @@ class ANEDraftModel:
                 freq = 1.0 / (rope_theta ** (2.0 * d / HEAD_DIM))
                 angle = angle_pos * freq
                 cos_q_data.append(math.cos(angle))
-                cos_q_data.append(1.0)
+                cos_q_data.append(math.cos(angle))
                 sin_q_data.append(math.sin(angle))
-                sin_q_data.append(0.0)
+                sin_q_data.append(math.sin(angle))
 
         self.b_cos_q.write_f32(cos_q_data)
         self.b_sin_q.write_f32(sin_q_data)
@@ -453,9 +454,9 @@ class ANEDraftModel:
                 freq = 1.0 / (rope_theta ** (2.0 * d / HEAD_DIM))
                 angle = angle_pos * freq
                 cos_k_data.append(math.cos(angle))
-                cos_k_data.append(1.0)
+                cos_k_data.append(math.cos(angle))
                 sin_k_data.append(math.sin(angle))
-                sin_k_data.append(0.0)
+                sin_k_data.append(math.sin(angle))
 
         self.b_cos_k.write_f32(cos_k_data)
         self.b_sin_k.write_f32(sin_k_data)
