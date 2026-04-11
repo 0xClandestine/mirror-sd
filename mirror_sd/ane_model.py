@@ -76,12 +76,17 @@ class ANEDraftModel:
 
         self.ane = ane
         self.seq_q = seq_q
-        self.ctx_len = ctx_len
+        self.max_ctx_len = ctx_len
         self.w_sq = align_width(seq_q)
         self.w_ctx = align_width(ctx_len)
         self.w_kv = self.w_ctx + self.w_sq
 
-        print(f"[ANE] Compiling 16 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
+        self.config = DFlashConfig.qwen3_8b()
+        self.config.block_size = seq_q
+        self.block_size = seq_q
+        self.mask_token_id = self.config.mask_token_id
+
+        print(f"[ANE] Compiling 17 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
         self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled")
@@ -242,7 +247,15 @@ class ANEDraftModel:
         norm_w = self._mlx_to_f32_list(model.norm.weight)
         self.w_final_norm = self._make_norm_weight_expanded(norm_w, HIDDEN, self.w_sq)
 
-    def forward(self, noise_embedding: mx.array, target_hidden: mx.array, rope_offset: int = 0) -> mx.array:
+    def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
+                rope_offset: int = 0, ctx_len: int = None) -> mx.array:
+        if ctx_len is None:
+            ctx_len = target_hidden.shape[1]
+        if ctx_len > self.max_ctx_len:
+            raise ValueError(
+                f"ctx_len={ctx_len} exceeds compiled max_ctx_len={self.max_ctx_len}. "
+                f"Re-initialize ANEDraftModel with a larger ctx_len."
+            )
         k = self.kernels
         self._write_mlx_2d(self.b_noise, noise_embedding)
         self._write_mlx_2d(self.b_target, target_hidden)
@@ -250,7 +263,7 @@ class ANEDraftModel:
         noise_data = self.b_noise.read_f32()
         self.b_hidden.write_f32(noise_data)
 
-        self._compute_rope(rope_offset)
+        self._compute_rope(rope_offset, ctx_len)
 
         k['fc_norm'].run_uncached(
             [self.b_target, self.w_fc, self.w_hidden_norm],
@@ -266,6 +279,25 @@ class ANEDraftModel:
         )
 
         return self._read_mlx_2d(self.b_output, self.seq_q, HIDDEN)
+
+    def __call__(self, noise_embedding: mx.array, target_hidden: mx.array,
+                 mask=None, cache=None, **kwargs) -> mx.array:
+        """Drop-in replacement for DFlashDraftModel.__call__.
+
+        Ignores mask and cache (ANE runs full non-causal attention each step).
+        rope_offset is derived from cache offset if provided.
+        ctx_len is derived from target_hidden.shape[1].
+        """
+        rope_offset = 0
+        if cache is not None and len(cache) > 0 and cache[0].offset > 0:
+            rope_offset = cache[0].offset
+        return self.forward(noise_embedding, target_hidden, rope_offset=rope_offset,
+                           ctx_len=target_hidden.shape[1])
+
+    def make_cache(self):
+        """Return list of DFlashKVCache instances (unused by ANE but needed by spec_generate)."""
+        from .dflash import DFlashKVCache
+        return [DFlashKVCache() for _ in range(N_DFLASH_LAYERS)]
 
     def _write_mlx_2d(self, buf, arr: mx.array):
         seq_len = arr.shape[1]
@@ -419,30 +451,27 @@ class ANEDraftModel:
             [self.b_hidden],
         )
 
-    def _compute_rope(self, rope_offset: int):
+    def _compute_rope(self, rope_offset: int, ctx_len: int):
         rope_theta = 1000000.0
         half = HEAD_DIM // 2
 
-        # Q positions: rope_offset + ctx_len + pos
-        q_positions = mx.array([rope_offset + self.ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
+        q_positions = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
         q_freqs = mx.array([1.0 / (rope_theta ** (2.0 * d / HEAD_DIM)) for d in range(half)], dtype=mx.float32)
-        q_angles = q_positions[:, None] * q_freqs[None, :]  # [w_sq, half]
-        q_cos = mx.cos(q_angles)  # [w_sq, half]
+        q_angles = q_positions[:, None] * q_freqs[None, :]
+        q_cos = mx.cos(q_angles)
         q_sin = mx.sin(q_angles)
-        # Repeat each value for both elements of the pair: [cos_k, cos_k] not [cos_k, 1.0]
-        q_cos = mx.repeat(q_cos, 2, axis=1)  # [w_sq, HEAD_DIM]
+        q_cos = mx.repeat(q_cos, 2, axis=1)
         q_sin = mx.repeat(q_sin, 2, axis=1)
         self.b_cos_q.write_f32(q_cos.flatten().tolist())
         self.b_sin_q.write_f32(q_sin.flatten().tolist())
 
-        # K positions: ctx uses offset, noise uses offset+ctx_len
-        k_ctx_pos = mx.array([rope_offset + p for p in range(self.ctx_len)], dtype=mx.float32)
-        k_noise_pos = mx.array([rope_offset + self.ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
-        k_positions = mx.concatenate([k_ctx_pos, k_noise_pos])  # [w_kv] (only first ctx_len+w_sq valid)
-        k_angles = k_positions[:, None] * q_freqs[None, :]  # [w_kv, half]
+        k_ctx_pos = mx.array([rope_offset + p for p in range(ctx_len)], dtype=mx.float32)
+        k_noise_pos = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
+        k_positions = mx.concatenate([k_ctx_pos, k_noise_pos])
+        k_angles = k_positions[:, None] * q_freqs[None, :]
         k_cos = mx.cos(k_angles)
         k_sin = mx.sin(k_angles)
-        k_cos = mx.repeat(k_cos, 2, axis=1)  # [w_kv, HEAD_DIM]
+        k_cos = mx.repeat(k_cos, 2, axis=1)
         k_sin = mx.repeat(k_sin, 2, axis=1)
         self.b_cos_k.write_f32(k_cos.flatten().tolist())
         self.b_sin_k.write_f32(k_sin.flatten().tolist())

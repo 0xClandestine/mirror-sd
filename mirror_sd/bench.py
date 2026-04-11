@@ -2,6 +2,7 @@
 
 Usage:
     python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
+    python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --ane
     python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --prompt "Explain quantum computing:" --max-tokens 256
 """
 
@@ -90,6 +91,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1, help="Warmup rounds before measuring")
     parser.add_argument("--math", action="store_true", help="Use math/code prompts (paper's training distribution)")
     parser.add_argument("--block-size", type=int, default=None, help="Override draft block size")
+    parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
+    parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -99,6 +102,13 @@ def main():
     if args.block_size is not None:
         config.block_size = args.block_size
         draft_model.block_size = args.block_size
+
+    if args.ane:
+        from .ane_model import ANEDraftModel
+        print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
+        ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
+        ane_model.load_weights(draft_model, target_model)
+        draft_model = ane_model
 
     if args.prompt:
         prompts = [args.prompt]
@@ -132,9 +142,10 @@ def main():
     baseline_avg = sum(r[1] for r in baseline_results) / len(baseline_results)
     print(f"  {'AVERAGE':55s} {baseline_avg:6.1f} tok/s")
 
-    # --- DFlash ---
+    # --- DFlash / ANE ---
+    mode = "ANE" if args.ane else "DFLASH"
     print(f"\n{'='*60}")
-    print(f"  DFLASH (speculative decoding, block_size={config.block_size})")
+    print(f"  {mode} (speculative decoding, block_size={config.block_size})")
     print(f"{'='*60}")
 
     dflash_results = []
@@ -161,10 +172,20 @@ def main():
     print(f"  SUMMARY")
     print(f"{'='*60}")
     print(f"  Baseline:   {baseline_avg:6.1f} tok/s")
-    print(f"  DFlash:     {dflash_avg:6.1f} tok/s")
+    print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
     print(f"  Speedup:    {speedup:6.2f}x")
     print(f"  Avg accept: {dflash_accept_avg:.2f} tokens/block")
     print(f"  Block size:  {config.block_size}")
+    print(f"  Draft mode:  {'ANE' if args.ane else 'GPU'}")
+
+    if args.ane and dflash_results:
+        stats0 = dflash_results[0][1]
+        if stats0.parallel_mode:
+            print(f"  Draft time:  {stats0.total_draft_time:.3f}s")
+            print(f"  Verify time: {stats0.total_verify_time:.3f}s")
+            print(f"  Overlap:     {stats0.total_overlap_time:.3f}s")
+            if stats0.total_verify_time > 0:
+                print(f"  Overlap %%:   {100*stats0.total_overlap_time/stats0.total_verify_time:.1f}%")
 
 
 if __name__ == "__main__":

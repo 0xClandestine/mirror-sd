@@ -26,6 +26,13 @@ def cmd_generate(args):
     print(f"Loading DFlash draft model: {args.draft}")
     draft_model, config = load_dflash_model(args.draft)
 
+    if args.ane:
+        from .ane_model import ANEDraftModel
+        print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
+        ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
+        ane_model.load_weights(draft_model, target_model)
+        draft_model = ane_model
+
     if args.quantize_draft > 0:
         print(f"Quantizing draft model to {args.quantize_draft}-bit...")
         nn.quantize(draft_model, bits=args.quantize_draft)
@@ -81,6 +88,13 @@ def cmd_bench(args):
 
     print(f"Loading DFlash draft model: {args.draft}")
     draft_model, config = load_dflash_model(args.draft)
+
+    if args.ane:
+        from .ane_model import ANEDraftModel
+        print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
+        ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
+        ane_model.load_weights(draft_model, target_model)
+        draft_model = ane_model
 
     prompt = args.prompt or "The meaning of life is"
     tokens = tokenizer.encode(prompt)
@@ -155,6 +169,8 @@ def main():
     gen_parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens to generate")
     gen_parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     gen_parser.add_argument("--quantize-draft", type=int, default=0, help="Quantize draft to N bits (0=off)")
+    gen_parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
+    gen_parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
 
     # convert
     conv_parser = subparsers.add_parser("convert", help="Convert DFlash model to MLX format")
@@ -167,6 +183,8 @@ def main():
     bench_parser.add_argument("--draft", type=str, required=True, help="DFlash draft model path")
     bench_parser.add_argument("--prompt", type=str, default=None, help="Benchmark prompt")
     bench_parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens for benchmark")
+    bench_parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
+    bench_parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
 
     args = parser.parse_args()
 
