@@ -295,21 +295,40 @@ def _spec_generate_parallel(
     draft_result = None
     draft_thread = None
 
+    gpu_fallback = getattr(draft_model, 'gpu_fallback', None)
+
     def _run_draft(th, ne, dc, rope_offset):
         nonlocal draft_result
-        cache_len = dc[0].offset
         ctx_len = th.shape[1]
+        use_gpu = (gpu_fallback is not None and
+                   ctx_len > getattr(draft_model, 'max_ctx_len', ctx_len))
+        active_draft = gpu_fallback if use_gpu else draft_model
+        if use_gpu:
+            dc_active = active_draft.make_cache()
+            for c_old, c_new in zip(dc, dc_active):
+                if c_old.keys is not None:
+                    c_new.keys = c_old.keys
+                    c_new.values = c_old.values
+                    c_new.offset = c_old.offset
+        else:
+            dc_active = dc
+        cache_len = dc_active[0].offset
         q_len = ne.shape[1]
         draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
-        draft_hidden = draft_model(
+        draft_hidden = active_draft(
             noise_embedding=ne,
             target_hidden=th,
             mask=draft_mask,
-            cache=dc,
+            cache=dc_active,
         )
         draft_logits = target_model.lm_head(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
+        if use_gpu:
+            for c_old, c_new in zip(dc, dc_active):
+                c_old.keys = c_new.keys
+                c_old.values = c_new.values
+                c_old.offset = c_new.offset
         draft_result = sampled_tokens
 
     # Kick off first draft

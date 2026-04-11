@@ -108,6 +108,7 @@ def main():
         print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
         ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
         ane_model.load_weights(draft_model, target_model)
+        ane_model.gpu_fallback = draft_model
         draft_model = ane_model
 
     if args.prompt:

@@ -31,9 +31,10 @@ def cmd_generate(args):
         print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
         ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
         ane_model.load_weights(draft_model, target_model)
+        ane_model.gpu_fallback = draft_model
         draft_model = ane_model
 
-    if args.quantize_draft > 0:
+    if args.quantize_draft > 0 and not args.ane:
         print(f"Quantizing draft model to {args.quantize_draft}-bit...")
         nn.quantize(draft_model, bits=args.quantize_draft)
         mx.eval(draft_model.parameters())
@@ -94,6 +95,7 @@ def cmd_bench(args):
         print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
         ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
         ane_model.load_weights(draft_model, target_model)
+        ane_model.gpu_fallback = draft_model
         draft_model = ane_model
 
     prompt = args.prompt or "The meaning of life is"

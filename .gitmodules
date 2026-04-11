@@ -21,3 +21,6 @@
 [submodule "references/dflash"]
 	path = references/dflash
 	url = https://github.com/z-lab/dflash
+[submodule "references/autoresearch-ANE"]
+	path = references/autoresearch-ANE
+	url = https://github.com/ncdrone/autoresearch-ANE.git

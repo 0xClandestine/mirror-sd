@@ -152,32 +152,101 @@ impl ANEKernel {
 }
 
 #[pyfunction]
-pub fn compile_dflash_kernels(seq_q: usize, ctx_len: usize) -> PyResult<Vec<ANEKernel>> {
+pub fn compile_dflash_kernels(
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+) -> PyResult<Vec<ANEKernel>> {
     let w_sq = dflash::align_width(seq_q);
     let w_ctx = dflash::align_width(ctx_len);
     let w_kv = w_ctx + w_sq;
 
     let kernel_builders: Vec<(&str, Graph)> = vec![
         ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
-        ("q_proj", dflash::build_q_proj_kernel(w_sq)),
-        ("q_norm_4d", dflash::build_q_norm_4d_kernel(w_sq)),
-        ("k_proj_ctx", dflash::build_k_proj_ctx_kernel(w_ctx)),
-        ("k_proj_noise", dflash::build_k_proj_noise_kernel(w_sq)),
-        ("k_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
-        ("k_norm_4d", dflash::build_k_norm_4d_kernel(w_kv)),
-        ("v_proj_ctx", dflash::build_v_proj_ctx_kernel(w_ctx)),
-        ("v_proj_noise", dflash::build_v_proj_noise_kernel(w_sq)),
-        ("v_concat", dflash::build_kv_concat_kernel(w_ctx, w_sq)),
-        ("rope_q", dflash::build_rope_q_kernel(w_sq)),
-        ("rope_k", dflash::build_rope_k_kernel(w_sq, w_ctx)),
+        (
+            "mega_qkv",
+            dflash::build_kqv_plus_vnorm_qnorm_kernel(w_sq, w_ctx),
+        ),
         ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
-        ("attn_out", dflash::build_attn_out_kernel(w_sq, w_kv)),
+        (
+            "attn_out",
+            dflash::build_attn_out_kernel(w_sq, w_kv, softcap),
+        ),
         (
             "o_proj_residual",
-            dflash::build_o_proj_residual_kernel(w_sq),
+            dflash::build_o_proj_residual_kernel(w_sq, softcap),
         ),
-        ("ffn_residual", dflash::build_ffn_residual_kernel(w_sq)),
+        (
+            "ffn_residual",
+            dflash::build_ffn_residual_kernel(w_sq, softcap),
+        ),
         ("final_norm", dflash::build_final_norm_kernel(w_sq)),
+    ];
+
+    let mut compiled = Vec::new();
+    for (name, graph) in kernel_builders {
+        let exec = graph
+            .compile(NSQualityOfService::UserInteractive)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE compile '{}' failed: {:?}",
+                    name, e
+                ))
+            })?;
+        compiled.push(ANEKernel {
+            executable: exec,
+            name: name.to_string(),
+        });
+    }
+    Ok(compiled)
+}
+
+#[pyfunction]
+pub fn test_input_pack_k(seq_q: usize, ctx_len: usize) -> PyResult<String> {
+    let w_sq = dflash::align_width(seq_q);
+    let w_ctx = dflash::align_width(ctx_len);
+
+    let results = vec![
+        (
+            "input_pack_k",
+            dflash::build_input_pack_k_kernel(w_sq, w_ctx)
+                .compile(NSQualityOfService::UserInteractive),
+        ),
+        (
+            "input_pack_k_full",
+            dflash::build_input_pack_k_full_kernel(w_sq, w_ctx)
+                .compile(NSQualityOfService::UserInteractive),
+        ),
+    ];
+
+    let mut out = String::new();
+    for (name, result) in results {
+        match result {
+            Ok(_) => out.push_str(&format!("  {}: OK\n", name)),
+            Err(e) => out.push_str(&format!("  {}: FAILED {:?}\n", name, e)),
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+#[pyfunction]
+pub fn compile_incremental_test_kernels(seq_q: usize, ctx_len: usize) -> PyResult<Vec<ANEKernel>> {
+    let w_sq = dflash::align_width(seq_q);
+    let w_ctx = dflash::align_width(ctx_len);
+    let w_kv = w_ctx + w_sq;
+
+    let kernel_builders: Vec<(&str, Graph)> = vec![
+        ("gqa_tile_only", dflash::build_gqa_tile_only_kernel(w_kv)),
+        (
+            "gqa_plus_scores",
+            dflash::build_gqa_plus_scores_kernel(w_sq, w_kv),
+        ),
+        ("sdpa_no_gqa", dflash::build_sdpa_no_gqa_kernel(w_sq, w_kv)),
+        ("sdpa_o_proj", dflash::build_sdpa_o_proj_kernel(w_sq, w_kv)),
+        (
+            "fused_attn_out",
+            dflash::build_fused_attn_out_kernel(w_sq, w_kv),
+        ),
     ];
 
     let mut compiled = Vec::new();
@@ -966,15 +1035,18 @@ pub fn test_dflash_nlayers(_n_layers: usize, seq_q: usize, ctx_len: usize) -> Py
         ),
         (
             "attn_out",
-            dflash::build_attn_out_kernel(w_sq, w_kv).compile(NSQualityOfService::UserInteractive),
+            dflash::build_attn_out_kernel(w_sq, w_kv, 50.0)
+                .compile(NSQualityOfService::UserInteractive),
         ),
         (
             "o_proj_residual",
-            dflash::build_o_proj_residual_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
+            dflash::build_o_proj_residual_kernel(w_sq, 30000.0)
+                .compile(NSQualityOfService::UserInteractive),
         ),
         (
             "ffn_residual",
-            dflash::build_ffn_residual_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
+            dflash::build_ffn_residual_kernel(w_sq, 30000.0)
+                .compile(NSQualityOfService::UserInteractive),
         ),
         (
             "final_norm",
