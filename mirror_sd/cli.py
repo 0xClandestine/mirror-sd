@@ -60,6 +60,10 @@ def cmd_generate(args):
         max_new_tokens=args.max_tokens,
         stop_token_ids=stop_ids,
         temperature=args.temperature,
+        mirror_sd=args.mirror_sd,
+        failfast=args.failfast,
+        failfast_tau=args.failfast_tau,
+        failfast_max_spec=args.failfast_max_spec,
     )
 
     text = tokenizer.decode(output_ids[0].tolist())
@@ -146,6 +150,10 @@ def cmd_bench(args):
         max_new_tokens=args.max_tokens,
         stop_token_ids=stop_ids,
         temperature=0.0,
+        mirror_sd=args.mirror_sd,
+        failfast=args.failfast,
+        failfast_tau=args.failfast_tau,
+        failfast_max_spec=args.failfast_max_spec,
     )
 
     print(f"\n{'='*60}")
@@ -173,6 +181,10 @@ def main():
     gen_parser.add_argument("--quantize-draft", type=int, default=0, help="Quantize draft to N bits (0=off)")
     gen_parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
     gen_parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
+    gen_parser.add_argument("--mirror-sd", action="store_true", help="Use Mirror-SD early-exit (prefix/suffix split + parallel draft)")
+    gen_parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length (extends draft in high-confidence regions)")
+    gen_parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
+    gen_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
 
     # convert
     conv_parser = subparsers.add_parser("convert", help="Convert DFlash model to MLX format")
@@ -187,6 +199,10 @@ def main():
     bench_parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens for benchmark")
     bench_parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
     bench_parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
+    bench_parser.add_argument("--mirror-sd", action="store_true", help="Use Mirror-SD early-exit (prefix/suffix split + parallel draft)")
+    bench_parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length")
+    bench_parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
+    bench_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
 
     args = parser.parse_args()
 

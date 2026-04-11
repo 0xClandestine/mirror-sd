@@ -95,6 +95,10 @@ def main():
     parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
     parser.add_argument("--no-baseline", action="store_true", help="Skip baseline autoregressive run")
     parser.add_argument("--quick", action="store_true", help="Quick mode: 1 prompt, 32 tokens, no warmup, no baseline")
+    parser.add_argument("--mirror-sd", action="store_true", help="Use Mirror-SD early-exit (prefix/suffix split + parallel draft)")
+    parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length")
+    parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
+    parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -157,8 +161,10 @@ def main():
         baseline_avg = sum(r[1] for r in baseline_results) / len(baseline_results)
         print(f"  {'AVERAGE':55s} {baseline_avg:6.1f} tok/s")
 
-    # --- DFlash / ANE ---
-    mode = "ANE" if args.ane else "DFLASH"
+    # --- DFlash / ANE / Mirror-SD ---
+    mode = "MIRROR-SD" if args.mirror_sd else ("ANE" if args.ane else "DFLASH")
+    if args.failfast:
+        mode += "+FAILFAST"
     print(f"\n{'='*60}")
     print(f"  {mode} (speculative decoding, block_size={config.block_size})")
     print(f"{'='*60}")
@@ -172,6 +178,10 @@ def main():
             max_new_tokens=max_tokens,
             temperature=temperature,
             stop_token_ids=eos_ids,
+            mirror_sd=args.mirror_sd,
+            failfast=args.failfast,
+            failfast_tau=args.failfast_tau,
+            failfast_max_spec=args.failfast_max_spec,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
@@ -195,10 +205,13 @@ def main():
     else:
         print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
     print(f"  Avg accept: {dflash_accept_avg:.2f} tokens/block")
+    if args.failfast:
+        dflash_spec_avg = sum(r[1].avg_spec_length for r in dflash_results) / len(dflash_results)
+        print(f"  Avg spec:   {dflash_spec_avg:.1f} tokens/block")
     print(f"  Block size:  {config.block_size}")
-    print(f"  Draft mode:  {'ANE' if args.ane else 'GPU'}")
+    print(f"  Draft mode:  {'ANE' if args.ane else ('Mirror-SD' if args.mirror_sd else 'GPU')}")
 
-    if args.ane and dflash_results:
+    if (args.ane or args.mirror_sd) and dflash_results:
         stats0 = dflash_results[0][1]
         if stats0.parallel_mode:
             print(f"  Draft time:  {stats0.total_draft_time:.3f}s")
