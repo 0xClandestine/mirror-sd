@@ -169,22 +169,24 @@ class ANEDraftModel:
         """Build weight for q_norm_4d/k_norm_4d kernels.
 
         These kernels take [1, HEAD_DIM, 1, N_HEADS * w_sq] input.
-        Weight shape: [1, HEAD_DIM, 1, N_HEADS * w_sq] with the head_dim=128
-        weight values repeated for each (head, position) spatial location.
+        Weight shape: [1, HEAD_DIM, 1, N_HEADS * w_sq] with interleaved
+        norm weight values repeated for each (head, position) spatial location.
 
-        The weight values are in INTERLEAVED order (matching the interleaved
-        q_proj/k_proj output dimensions) so that per-head norm is applied
-        correctly to the rearranged data.
+        IOSurface stores data channels-first: all spatial values for channel 0,
+        then channel 1, etc. So we must iterate (d, h, pos) not (h, pos, d).
         """
         w = align_width(width)
         head_dim = len(head_weight_list)
         half = head_dim // 2
+        il_weights = []
+        for k in range(half):
+            il_weights.append(head_weight_list[k])
+            il_weights.append(head_weight_list[k + half])
         data = []
-        for h in range(n_heads):
-            for pos in range(w):
-                for k in range(half):
-                    data.append(head_weight_list[k])
-                    data.append(head_weight_list[k + half])
+        for d in range(head_dim):
+            for h in range(n_heads):
+                for pos in range(w):
+                    data.append(il_weights[d])
         return self.ane.ANETensor.from_f32(1, head_dim, 1, n_heads * w, data)
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
