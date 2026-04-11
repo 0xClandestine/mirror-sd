@@ -163,7 +163,7 @@ pub fn build_fc_norm_kernel(w_ctx: usize) -> Graph {
     g
 }
 
-pub fn build_q_kernel(w_sq: usize) -> Graph {
+pub fn build_q_proj_kernel(w_sq: usize) -> Graph {
     let mut g = Graph::new();
     let hidden = g.placeholder(Shape {
         batch: 1,
@@ -184,14 +184,28 @@ pub fn build_q_kernel(w_sq: usize) -> Graph {
         height: 1,
         width: N_HEADS * HEAD_DIM,
     });
-    let q_out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
+    let _out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
+    g
+}
+
+/// Per-head rmsnorm for Q: input is [1, HEAD_DIM, 1, N_HEADS * w_sq].
+/// Each spatial position is one (head, seq_pos) pair; rmsnorm reduces over
+/// channels (HEAD_DIM) per position, giving the same result as per-head RMSNorm(head_dim).
+pub fn build_q_norm_4d_kernel(w_sq: usize) -> Graph {
+    let mut g = Graph::new();
+    let q_in = g.placeholder(Shape {
+        batch: 1,
+        channels: HEAD_DIM,
+        height: 1,
+        width: N_HEADS * w_sq,
+    });
     let q_norm_w = g.placeholder(Shape {
         batch: 1,
-        channels: N_HEADS * HEAD_DIM,
+        channels: HEAD_DIM,
         height: 1,
-        width: w_sq,
+        width: N_HEADS * w_sq,
     });
-    let _out = rmsnorm(&mut g, q_out, q_norm_w);
+    let _out = rmsnorm(&mut g, q_in, q_norm_w);
     g
 }
 
@@ -299,45 +313,36 @@ pub fn build_v_proj_noise_kernel(w_sq: usize) -> Graph {
     g
 }
 
-pub fn build_k_norm_kernel(w_kv: usize) -> Graph {
+/// Per-head rmsnorm for K: input is [1, HEAD_DIM, 1, N_KV_HEADS * w_kv].
+/// Same approach as q_norm_4d — each spatial position is one (kv_head, seq_pos) pair.
+pub fn build_k_norm_4d_kernel(w_kv: usize) -> Graph {
     let mut g = Graph::new();
-    let k_out = g.placeholder(Shape {
+    let k_in = g.placeholder(Shape {
         batch: 1,
-        channels: N_KV_HEADS * HEAD_DIM,
+        channels: HEAD_DIM,
         height: 1,
-        width: w_kv,
+        width: N_KV_HEADS * w_kv,
     });
     let k_norm_w = g.placeholder(Shape {
         batch: 1,
-        channels: N_KV_HEADS * HEAD_DIM,
+        channels: HEAD_DIM,
         height: 1,
-        width: w_kv,
+        width: N_KV_HEADS * w_kv,
     });
-    let _out = rmsnorm(&mut g, k_out, k_norm_w);
+    let _out = rmsnorm(&mut g, k_in, k_norm_w);
     g
 }
 
+/// RoPE on Q: takes 4D input [1, N_HEADS, w_sq, HEAD_DIM], applies interleaved RoPE.
+/// The flat→4D conversion is done in Python to avoid IOSurface reshape issues.
 pub fn build_rope_q_kernel(w_sq: usize) -> Graph {
     let mut g = Graph::new();
-    let q_in = g.placeholder(Shape {
+    let q4 = g.placeholder(Shape {
         batch: 1,
-        channels: N_HEADS * HEAD_DIM,
-        height: 1,
-        width: w_sq,
+        channels: N_HEADS,
+        height: w_sq,
+        width: HEAD_DIM,
     });
-    // Reshape to [1, N_HEADS, HEAD_DIM, w_sq] then transpose to [1, N_HEADS, w_sq, HEAD_DIM].
-    // A direct reshape to [1, N_HEADS, w_sq, HEAD_DIM] would misinterpret the data layout
-    // because IOSurface data is stored channels-first.
-    let q_intermediate = g.reshape(
-        q_in,
-        Shape {
-            batch: 1,
-            channels: N_HEADS,
-            height: HEAD_DIM,
-            width: w_sq,
-        },
-    );
-    let q4 = g.transpose(q_intermediate, [0, 1, 3, 2]);
     let cos_q = g.placeholder(Shape {
         batch: 1,
         channels: 1,
@@ -354,30 +359,19 @@ pub fn build_rope_q_kernel(w_sq: usize) -> Graph {
     g
 }
 
-/// RoPE on K: reshape+transpose (not direct reshape, see ANE_RULES.md #16),
-/// single apply_rope with precomputed cos/sin for full sequence,
-/// then transpose+reshape back to flat.
+/// RoPE on K: takes 4D input [1, N_KV_HEADS, w_kv, HEAD_DIM], applies interleaved RoPE.
+/// Python does flat→4D conversion before calling, and 4D→flat after.
 /// Caller pre-fills cos/sin with correct position IDs for ctx and noise segments.
 pub fn build_rope_k_kernel(w_sq: usize, w_ctx: usize) -> Graph {
     let mut g = Graph::new();
     let w_kv = w_ctx + w_sq;
 
-    let k_in = g.placeholder(Shape {
+    let k4 = g.placeholder(Shape {
         batch: 1,
-        channels: N_KV_HEADS * HEAD_DIM,
-        height: 1,
-        width: w_kv,
+        channels: N_KV_HEADS,
+        height: w_kv,
+        width: HEAD_DIM,
     });
-    let k_intermediate = g.reshape(
-        k_in,
-        Shape {
-            batch: 1,
-            channels: N_KV_HEADS,
-            height: HEAD_DIM,
-            width: w_kv,
-        },
-    );
-    let k4 = g.transpose(k_intermediate, [0, 1, 3, 2]);
     let cos_k = g.placeholder(Shape {
         batch: 1,
         channels: 1,
@@ -390,65 +384,37 @@ pub fn build_rope_k_kernel(w_sq: usize, w_ctx: usize) -> Graph {
         height: w_kv,
         width: HEAD_DIM,
     });
-    let k_rope = apply_rope(&mut g, k4, cos_k, sin_k, N_KV_HEADS, w_kv, HEAD_DIM);
-    let k_transposed = g.transpose(k_rope, [0, 1, 3, 2]);
-    let _out = g.reshape(
-        k_transposed,
-        Shape {
-            batch: 1,
-            channels: N_KV_HEADS * HEAD_DIM,
-            height: 1,
-            width: w_kv,
-        },
-    );
+    let _out = apply_rope(&mut g, k4, cos_k, sin_k, N_KV_HEADS, w_kv, HEAD_DIM);
     g
 }
 
-/// GQA tile K and V: reshape+transpose to [N_KV_HEADS, w_kv, HEAD_DIM], tile, concat
+/// GQA tile K and V: takes 4D K [1, N_KV_HEADS, w_kv, HEAD_DIM] and 4D V [1, N_KV_HEADS, w_kv, HEAD_DIM],
+/// tiles KV heads, outputs concat [1, 2*N_HEADS, w_kv, HEAD_DIM].
 pub fn build_gqa_tile_kernel(w_kv: usize) -> Graph {
     let mut g = Graph::new();
 
-    let k_in = g.placeholder(Shape {
+    let k4 = g.placeholder(Shape {
         batch: 1,
-        channels: N_KV_HEADS * HEAD_DIM,
-        height: 1,
-        width: w_kv,
+        channels: N_KV_HEADS,
+        height: w_kv,
+        width: HEAD_DIM,
     });
-    let k_intermediate = g.reshape(
-        k_in,
-        Shape {
-            batch: 1,
-            channels: N_KV_HEADS,
-            height: HEAD_DIM,
-            width: w_kv,
-        },
-    );
-    let k4 = g.transpose(k_intermediate, [0, 1, 3, 2]);
     let k_t = tile_kv_heads(&mut g, k4, N_KV_HEADS, GQA_RATIO, w_kv, HEAD_DIM);
 
-    let v_in = g.placeholder(Shape {
+    let v4 = g.placeholder(Shape {
         batch: 1,
-        channels: N_KV_HEADS * HEAD_DIM,
-        height: 1,
-        width: w_kv,
+        channels: N_KV_HEADS,
+        height: w_kv,
+        width: HEAD_DIM,
     });
-    let v_intermediate = g.reshape(
-        v_in,
-        Shape {
-            batch: 1,
-            channels: N_KV_HEADS,
-            height: HEAD_DIM,
-            width: w_kv,
-        },
-    );
-    let v4 = g.transpose(v_intermediate, [0, 1, 3, 2]);
     let v_t = tile_kv_heads(&mut g, v4, N_KV_HEADS, GQA_RATIO, w_kv, HEAD_DIM);
 
     let _out = g.concat(&[k_t, v_t], 1);
     g
 }
 
-pub fn build_attn_residual_kernel(w_sq: usize, w_kv: usize) -> Graph {
+/// SDPA only: Q, K, V → attention output (4D [1, NH, w_sq, HD])
+pub fn build_attn_out_kernel(w_sq: usize, w_kv: usize) -> Graph {
     let mut g = Graph::new();
 
     let q = g.placeholder(Shape {
@@ -479,18 +445,19 @@ pub fn build_attn_residual_kernel(w_sq: usize, w_kv: usize) -> Graph {
     );
     let scores_scaled = g.multiplication(scores, scale);
     let attn_probs = g.soft_max(scores_scaled, 3);
-    let attn_out = g.matrix_multiplication(attn_probs, v, false, false);
+    let _out = g.matrix_multiplication(attn_probs, v, false, false);
+    g
+}
 
-    let attn_t = g.transpose(attn_out, [0, 1, 3, 2]);
-    let attn_flat = g.reshape(
-        attn_t,
-        Shape {
-            batch: 1,
-            channels: N_HEADS * HEAD_DIM,
-            height: 1,
-            width: w_sq,
-        },
-    );
+/// o_proj + residual: takes flat attn output [1, NH*HD, 1, w_sq], applies o_proj, adds residual
+pub fn build_o_proj_residual_kernel(w_sq: usize) -> Graph {
+    let mut g = Graph::new();
+    let attn_flat = g.placeholder(Shape {
+        batch: 1,
+        channels: N_HEADS * HEAD_DIM,
+        height: 1,
+        width: w_sq,
+    });
     let wo = g.placeholder(Shape {
         batch: 1,
         channels: N_HEADS * HEAD_DIM,

@@ -1,7 +1,7 @@
 """DFlash draft model running on Apple Neural Engine.
 
-Chains 15 ANE kernels (13 per layer + fc_norm + final_norm)
-with IOSurface buffers for intermediate results and real weight loading.
+Chains 17 ANE kernels per layer with IOSurface buffers for intermediate
+results and real weight loading.
 
 K/V projections are split into ctx/noise sub-kernels (ANE can't handle
 concat+conv1x1 in one dispatch). Python concatenates the outputs.
@@ -16,14 +16,20 @@ This makes the interleaved ANE RoPE equivalent to the standard half-rotation.
 Q and K are both interleaved, so Q@K^T is invariant; V stays in original
 format, so attn_out is also original format and o_proj needs no changes.
 
+CRITICAL: q_norm and k_norm must be per-head rmsnorm (reduce over HEAD_DIM=128
+per head), NOT global rmsnorm (reduce over all N_HEADS*HEAD_DIM channels).
+ANE reduce_mean only works on channel axis, so we reshape to [1, HEAD_DIM, 1, N_HEADS*w_sq]
+where each spatial position is one (head, seq_pos) pair, then rmsnorm reduces
+over channels (HEAD_DIM values) per position.
+
 Data flow per layer:
-  hidden ──┬──→ q_kernel ──→ rope_q ──→ (4D, interleaved) ──┐
-           │                                                ├──→ attn_residual ──→ attn_res ──→ ffn_residual ──→ hidden_next
-  context ─┼──→ k_proj_ctx ──┐                               │   (residual input = hidden)
-           │                 ├── k_concat → k_norm → rope_k ─┤
-           └──→ k_proj_noise ┘                               ├──→ gqa_tile ──┐
-                 v_proj_ctx ──┐                                              │
-                 v_proj_noise ┘── v_concat ──────────────────────────────────┘
+  hidden ──┬──→ q_proj ──→ (Python flat→4d_norm) ──→ q_norm_4d ──→ (Python 4d_norm→4d) ──→ rope_q ──┐
+           │                                                                                ├──→ attn_out ──→ (Python 4D→flat) ──→ o_proj_residual ──→ attn_res ──→ ffn_residual ──→ hidden_next
+  context ─┼──→ k_proj_ctx ──┐                                                               │
+           │                 ├── k_concat → (Python flat→4d_norm) → k_norm_4d → (Python 4d_norm→4d) → rope_k ─┤
+           └──→ k_proj_noise ┘                                                               ├──→ gqa_tile ──┐
+                 v_proj_ctx ──┐                                                                              │
+                 v_proj_noise ┘── v_concat ──→ (Python flat→4d) ───────────────────────────────────────────┘
 """
 
 import math
@@ -77,7 +83,7 @@ class ANEDraftModel:
         self.w_ctx = align_width(ctx_len)
         self.w_kv = self.w_ctx + self.w_sq
 
-        print(f"[ANE] Compiling 13 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
+        print(f"[ANE] Compiling 16 kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
         self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled")
@@ -96,21 +102,26 @@ class ANEDraftModel:
         self.b_hidden = ane.ANETensor(1, HIDDEN, 1, w_sq)
 
         self.b_q_out = ane.ANETensor(1, N_HEADS * HEAD_DIM, 1, w_sq)
+        self.b_q_norm_4d = ane.ANETensor(1, HEAD_DIM, 1, N_HEADS * w_sq)
+
+        self.b_q_4d = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
+        self.b_k_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
+        self.b_k_rope_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
+        self.b_v_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
 
         self.b_k_ctx = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_ctx)
         self.b_k_noise = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_sq)
         self.b_k_out = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
-        self.b_k_normed = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
+        self.b_k_norm_4d = ane.ANETensor(1, HEAD_DIM, 1, N_KV_HEADS * w_kv)
 
         self.b_v_ctx = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_ctx)
         self.b_v_noise = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_sq)
         self.b_v_out = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
 
-        self.b_q_rope = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
-        self.b_k_rope = ane.ANETensor(1, N_KV_HEADS * HEAD_DIM, 1, w_kv)
-
         self.b_kv_tiled = ane.ANETensor(1, 2 * N_HEADS, w_kv, HEAD_DIM)
 
+        self.b_attn_out = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
+        self.b_attn_flat = ane.ANETensor(1, N_HEADS * HEAD_DIM, 1, w_sq)
         self.b_attn_res = ane.ANETensor(1, HIDDEN, 1, w_sq)
         self.b_output = ane.ANETensor(1, HIDDEN, 1, w_sq)
 
@@ -153,6 +164,28 @@ class ANEDraftModel:
                     data.extend([head_weight_list[d]] * w)
         return self.ane.ANETensor.from_f32(1, n_heads * head_dim, 1, w, data)
 
+    def _make_4d_norm_weight(self, head_weight_list, n_heads, width):
+        """Build weight for q_norm_4d/k_norm_4d kernels.
+
+        These kernels take [1, HEAD_DIM, 1, N_HEADS * w_sq] input.
+        Weight shape: [1, HEAD_DIM, 1, N_HEADS * w_sq] with the head_dim=128
+        weight values repeated for each (head, position) spatial location.
+
+        The weight values are in INTERLEAVED order (matching the interleaved
+        q_proj/k_proj output dimensions) so that per-head norm is applied
+        correctly to the rearranged data.
+        """
+        w = align_width(width)
+        head_dim = len(head_weight_list)
+        half = head_dim // 2
+        data = []
+        for h in range(n_heads):
+            for pos in range(w):
+                for k in range(half):
+                    data.append(head_weight_list[k])
+                    data.append(head_weight_list[k + half])
+        return self.ane.ANETensor.from_f32(1, head_dim, 1, n_heads * w, data)
+
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
         self._load_fc_weights(draft_model)
         for i in range(N_DFLASH_LAYERS):
@@ -182,14 +215,14 @@ class ANEDraftModel:
         setattr(self, f"w_{p}q_proj", self._make_weight(q_proj_w_il, N_HEADS * HEAD_DIM, HIDDEN))
 
         q_norm_w = self._mlx_to_f32_list(layer.self_attn.q_norm.weight)
-        setattr(self, f"w_{p}q_norm", self._make_per_head_norm_weight(q_norm_w, N_HEADS, self.w_sq, interleave=True))
+        setattr(self, f"w_{p}q_norm_4d", self._make_4d_norm_weight(q_norm_w, N_HEADS, self.w_sq))
 
         k_proj_w = self._mlx_to_f32_list(layer.self_attn.k_proj.weight)
         k_proj_w_il = _interleave_head_dims(k_proj_w, N_KV_HEADS * HEAD_DIM, N_KV_HEADS, HEAD_DIM)
         setattr(self, f"w_{p}k_proj", self._make_weight(k_proj_w_il, N_KV_HEADS * HEAD_DIM, HIDDEN))
 
         k_norm_w = self._mlx_to_f32_list(layer.self_attn.k_norm.weight)
-        setattr(self, f"w_{p}k_norm", self._make_per_head_norm_weight(k_norm_w, N_KV_HEADS, self.w_kv, interleave=True))
+        setattr(self, f"w_{p}k_norm_4d", self._make_4d_norm_weight(k_norm_w, N_KV_HEADS, self.w_kv))
 
         v_proj_w = self._mlx_to_f32_list(layer.self_attn.v_proj.weight)
         setattr(self, f"w_{p}v_proj", self._make_weight(v_proj_w, N_KV_HEADS * HEAD_DIM, HIDDEN))
@@ -253,12 +286,65 @@ class ANEDraftModel:
         arr = mx.array(data, dtype=mx.float32).reshape(1, channels, w)[:, :, :seq_len]
         return arr.transpose(0, 2, 1)  # [1, seq, channels]
 
+    def _flatten_attn_4d(self):
+        w_sq = self.w_sq
+        data = self.b_attn_out.read_f32()
+        attn_4d = mx.array(data, dtype=mx.float32).reshape(1, N_HEADS, w_sq, HEAD_DIM)
+        flat = attn_4d.transpose(0, 2, 1, 3).reshape(1, w_sq, N_HEADS * HEAD_DIM)
+        flat_t = flat.transpose(0, 2, 1)
+        padded = mx.zeros((1, N_HEADS * HEAD_DIM, w_sq), dtype=mx.float32)
+        padded[:, :, :self.seq_q] = flat_t[:, :, :self.seq_q]
+        self.b_attn_flat.write_f32(padded.flatten().tolist())
+
+    def _flat_to_4d_heads(self, flat_buf, n_heads, seq_w, out_4d_buf):
+        data = flat_buf.read_f32()
+        channels = n_heads * HEAD_DIM
+        arr = mx.array(data, dtype=mx.float32).reshape(1, channels, 1, seq_w)
+        arr2 = arr.reshape(1, n_heads, HEAD_DIM, seq_w)
+        arr3 = arr2.transpose(0, 1, 3, 2)
+        out_4d_buf.write_f32(arr3.flatten().tolist())
+
+    def _flat_to_4d_norm(self, flat_buf, n_heads, seq_w, out_norm_buf):
+        """Rearrange flat [1, N_HEADS*HEAD_DIM, 1, w] to norm format [1, HEAD_DIM, 1, N_HEADS*w].
+
+        For per-head rmsnorm: HEAD_DIM must be the channel axis.
+        Rearrange: [NH, HD, w] → [HD, NH, w] → flatten to [HD, NH*w].
+        Data is interleaved (from q_proj/k_proj), so channel ordering within
+        each head's HEAD_DIM already matches the interleaved norm weight.
+        """
+        data = flat_buf.read_f32()
+        channels = n_heads * HEAD_DIM
+        w = flat_buf.shape[3]
+        arr = mx.array(data, dtype=mx.float32).reshape(1, n_heads, HEAD_DIM, w)
+        arr_t = arr.transpose(0, 2, 1, 3)  # [1, HEAD_DIM, N_HEADS, w]
+        arr_flat = arr_t.reshape(1, HEAD_DIM, 1, n_heads * w)
+        out_norm_buf.write_f32(arr_flat.flatten().tolist())
+
+    def _4d_norm_to_4d_heads(self, norm_buf, n_heads, seq_w, out_4d_buf):
+        """Convert norm format [1, HEAD_DIM, 1, N_HEADS*w] back to 4D [1, N_HEADS, w, HEAD_DIM].
+
+        Inverse of _flat_to_4d_norm: [HD, NH*w] → [HD, NH, w] → [NH, w, HD].
+        """
+        data = norm_buf.read_f32()
+        w = seq_w
+        arr = mx.array(data, dtype=mx.float32).reshape(1, HEAD_DIM, n_heads, w)
+        arr_t = arr.transpose(0, 2, 3, 1)  # [1, N_HEADS, w, HEAD_DIM]
+        out_4d_buf.write_f32(arr_t.flatten().tolist())
+
+    def _4d_to_flat_heads(self, buf_4d, n_heads, seq_w, out_flat_buf):
+        data = buf_4d.read_f32()
+        arr = mx.array(data, dtype=mx.float32).reshape(1, n_heads, seq_w, HEAD_DIM)
+        arr2 = arr.transpose(0, 1, 3, 2)
+        arr3 = arr2.reshape(1, n_heads * HEAD_DIM, 1, seq_w)
+        out_flat_buf.write_f32(arr3.flatten().tolist())
+
     def _run_layer(self, k, layer_idx: int):
         p = f"l{layer_idx}_"
 
-        k['q_kernel'].run_uncached(
+        # Q: in_norm + q_proj (no q_norm — that's separate now)
+        k['q_proj'].run_uncached(
             [self.b_hidden, getattr(self, f"w_{p}in_norm"),
-             getattr(self, f"w_{p}q_proj"), getattr(self, f"w_{p}q_norm")],
+             getattr(self, f"w_{p}q_proj")],
             [self.b_q_out],
         )
 
@@ -274,11 +360,6 @@ class ANEDraftModel:
 
         k['k_concat'].run_uncached([self.b_k_ctx, self.b_k_noise], [self.b_k_out])
 
-        k['k_norm'].run_uncached(
-            [self.b_k_out, getattr(self, f"w_{p}k_norm")],
-            [self.b_k_normed],
-        )
-
         k['v_proj_ctx'].run_uncached(
             [self.b_context, getattr(self, f"w_{p}v_proj")],
             [self.b_v_ctx],
@@ -291,23 +372,48 @@ class ANEDraftModel:
 
         k['v_concat'].run_uncached([self.b_v_ctx, self.b_v_noise], [self.b_v_out])
 
+        # Q: flat → norm_4d format → per-head rmsnorm → 4D heads → rope_q
+        self._flat_to_4d_norm(self.b_q_out, N_HEADS, self.w_sq, self.b_q_norm_4d)
+        k['q_norm_4d'].run_uncached(
+            [self.b_q_norm_4d, getattr(self, f"w_{p}q_norm_4d")],
+            [self.b_q_norm_4d],
+        )
+        self._4d_norm_to_4d_heads(self.b_q_norm_4d, N_HEADS, self.w_sq, self.b_q_4d)
         k['rope_q'].run_uncached(
-            [self.b_q_out, self.b_cos_q, self.b_sin_q],
-            [self.b_q_rope],
+            [self.b_q_4d, self.b_cos_q, self.b_sin_q],
+            [self.b_q_4d],
         )
 
+        # K: flat → norm_4d format → per-head rmsnorm → 4D heads → rope_k
+        self._flat_to_4d_norm(self.b_k_out, N_KV_HEADS, self.w_kv, self.b_k_norm_4d)
+        k['k_norm_4d'].run_uncached(
+            [self.b_k_norm_4d, getattr(self, f"w_{p}k_norm_4d")],
+            [self.b_k_norm_4d],
+        )
+        self._4d_norm_to_4d_heads(self.b_k_norm_4d, N_KV_HEADS, self.w_kv, self.b_k_4d)
         k['rope_k'].run_uncached(
-            [self.b_k_normed, self.b_cos_k, self.b_sin_k],
-            [self.b_k_rope],
+            [self.b_k_4d, self.b_cos_k, self.b_sin_k],
+            [self.b_k_rope_4d],
         )
 
+        # V: flat → 4D (no norm for V)
+        self._flat_to_4d_heads(self.b_v_out, N_KV_HEADS, self.w_kv, self.b_v_4d)
+
+        # GQA tile + attention
         k['gqa_tile'].run_uncached(
-            [self.b_k_rope, self.b_v_out],
+            [self.b_k_rope_4d, self.b_v_4d],
             [self.b_kv_tiled],
         )
 
-        k['attn_residual'].run_uncached(
-            [self.b_q_rope, self.b_kv_tiled, getattr(self, f"w_{p}o_proj"), self.b_hidden],
+        k['attn_out'].run_uncached(
+            [self.b_q_4d, self.b_kv_tiled],
+            [self.b_attn_out],
+        )
+
+        self._flatten_attn_4d()
+
+        k['o_proj_residual'].run_uncached(
+            [self.b_attn_flat, getattr(self, f"w_{p}o_proj"), self.b_hidden],
             [self.b_attn_res],
         )
 

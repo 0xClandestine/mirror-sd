@@ -17,6 +17,16 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - **rmsnorm after conv1x1 on a concatenated input fails** (concat → conv1x1 → rmsnorm chain)
 - rmsnorm + matmul combined works fine
 
+### CRITICAL: ANE rmsnorm is GLOBAL across all channels, NOT per-head
+- `reduce_mean(x, axis=1)` reduces over **ALL channels** in the tensor
+- For input `[1, N_HEADS*HEAD_DIM, 1, w_sq]` (4096 channels), rmsnorm computes variance over all 4096 values per position — **NOT per-head** (128 values per head)
+- GPU `nn.RMSNorm(head_dim)` normalizes each head's 128 dimensions independently
+- **Per-head variance differs significantly** (e.g., 9.2 to 16.5 across heads) — global norm gives completely wrong results
+- **This was the ROOT CAUSE of the attention output being wrong** (cosine ~0.005 vs GPU)
+- **Fix**: reshape to `[1, HEAD_DIM, 1, N_HEADS*w_sq]` where each spatial position = one (head, seq_pos) pair, then rmsnorm reduces over channels (HEAD_DIM=128) per position = per-head rmsnorm
+- Python rearrangement required: `_flat_to_4d_norm` (flat → norm format) and `_4d_norm_to_4d_heads` (norm format → 4D heads)
+- Weight for 4d norm: `[1, HEAD_DIM, 1, N_HEADS*w_sq]` with interleaved weight values repeated per (head, position)
+
 ## Conv1x1 vs Matmul
 - `conv1x1_dynamic` preferred over `reshape+transpose+matmul+transpose+reshape` (fewer ops)
 - Weight format for conv1x1: `[OC, IC, 1, 1]` (batch=OC, channels=IC)
@@ -85,26 +95,40 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - **Solution**: compile **separate kernel instances** for K concat and V concat, even though the graph structure is identical.
 - `k_concat` and `v_concat` must be separate `ANEKernel` objects.
 
-## Proven kernel splits (DFlash per layer)
+## Same-buffer input/output (POTENTIAL ISSUE)
+- Using the same IOSurface buffer for both input and output of a kernel (e.g., `rope_q` reads from and writes to `b_q_4d`) may cause data corruption if the ANE reads input while writing output.
+- **Workaround**: use a separate output buffer when possible. For `rope_q`, consider using `b_q_rope_4d` as output instead of `b_q_4d`.
+- Not yet confirmed as a real problem — needs testing.
+
+## Proven kernel splits (DFlash per layer — CURRENT)
 1. `fc_norm`: conv1x1(fc) + rmsnorm ✓
-2. `q_kernel`: rmsnorm(hidden) → conv1x1(Q) → rmsnorm(q_norm) ✓
-3. `k_proj_ctx`: conv1x1(context → K) ✓
-4. `k_proj_noise`: rmsnorm(hidden) → conv1x1(K) ✓
-5. `k_concat`: concat(ctx_K, noise_K) ✓
-6. `k_norm`: rmsnorm on K output ✓
-7. `v_proj_ctx`: conv1x1(context → V) ✓
-8. `v_proj_noise`: rmsnorm(hidden) → conv1x1(V) ✓
-9. `v_concat`: concat(ctx_V, noise_V) ✓ (separate instance from k_concat)
-10. `rope_q`: reshape+transpose → interleaved apply_rope ✓
-11. `rope_k`: reshape+transpose → interleaved apply_rope → transpose+reshape ✓
-12. `gqa_tile`: reshape+transpose K/V → tile_kv_heads → concat ✓
-13. `attn_residual`: slice Q/K/V from tiled KV → SDPA → transpose+reshape → conv1x1(o_proj) → residual add
-14. `ffn_residual`: rmsnorm → 2×conv1x1 → swiglu → conv1x1 → residual add ✓
-15. `final_norm`: rmsnorm ✓
+2. `q_proj`: rmsnorm(hidden) → conv1x1(Q) ✓ (cosine=1.0 vs GPU)
+3. `q_norm_4d`: per-head rmsnorm on `[1, HEAD_DIM, 1, N_HEADS*w_sq]` ✓
+4. `k_proj_ctx`: conv1x1(context → K) ✓
+5. `k_proj_noise`: rmsnorm(hidden) → conv1x1(K) ✓
+6. `k_concat`: concat(ctx_K, noise_K) ✓
+7. `k_norm_4d`: per-head rmsnorm on `[1, HEAD_DIM, 1, N_KV_HEADS*w_kv]` ✓
+8. `v_proj_ctx`: conv1x1(context → V) ✓
+9. `v_proj_noise`: rmsnorm(hidden) → conv1x1(V) ✓
+10. `v_concat`: concat(ctx_V, noise_V) ✓ (separate instance from k_concat)
+11. `rope_q`: interleaved apply_rope on 4D Q ✓
+12. `rope_k`: interleaved apply_rope on 4D K ✓
+13. `gqa_tile`: tile_kv_heads + concat K/V ✓
+14. `attn_out`: SDPA (Q @ K^T / sqrt(d) → softmax → @ V) ✓
+15. `o_proj_residual`: conv1x1(o_proj) + residual add ✓
+16. `ffn_residual`: rmsnorm → 2×conv1x1 → swiglu → conv1x1 → residual add ✓
+17. `final_norm`: rmsnorm ✓
+
+### Python rearrangements per layer
+- After `q_proj`: `_flat_to_4d_norm` → `q_norm_4d` → `_4d_norm_to_4d_heads` → `rope_q`
+- After `k_concat`: `_flat_to_4d_norm` → `k_norm_4d` → `_4d_norm_to_4d_heads` → `rope_k`
+- After `v_concat`: `_flat_to_4d_heads` → `gqa_tile`
+- After `attn_out`: `_flatten_attn_4d` → `o_proj_residual`
 
 ### Known issues
-- `attn_residual`: the 4D→flat reshape of attention output may still have data layout issues. The transpose+reshape pattern has been applied but full correctness is not yet verified end-to-end.
-- `rope_k` reverse reshape (4D→flat after RoPE): uses transpose+reshape pattern but not yet independently verified.
+- `attn_out`: full SDPA correctness not yet verified end-to-end with per-head norms
+- `rope_q` uses same buffer for input and output — may cause corruption
+- Per-head norm adds 4 Python read+rearrange+write round-trips per layer (performance impact TBD)
 
 ## Weight loading
 - IOSurface stores fp32, ANE casts to fp16 internally
@@ -113,5 +137,36 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - Always use timeout when testing ANE execution
 - Weight data for conv1x1_proj is stored as **W.T** in `[1, IC, 1, OC]` format
 - q_proj and k_proj weights must be **interleaved** (`[d0,d64,d1,d65,...]` per head) to match ANE interleaved RoPE
-- q_norm and k_norm weights must be **interleaved per head** the same way
-- `_make_per_head_norm_weight` has `interleave=True` option for this purpose
+- q_norm and k_norm weights must be **interleaved** and in 4d norm format: `[1, HEAD_DIM, 1, N_HEADS*w_sq]` with values repeated per (head, position)
+- `_make_4d_norm_weight` builds this format (interleaved, spatial-expanded)
+- `_make_per_head_norm_weight` is DEPRECATED — was for the old global-norm approach
+
+## Bug history (lessons learned)
+
+### Bug #1: Global rmsnorm vs per-head rmsnorm (FIXED)
+- **Symptom**: ANE attention output cosine ~0.005 vs GPU. Individual components (Q, K, V, RoPE) tested OK but combined pipeline failed.
+- **Root cause**: ANE `rmsnorm` with `reduce_mean(x, 1)` reduces over ALL channels. For `[1, N_HEADS*HEAD_DIM, 1, w_sq]` (4096 channels), this computes a single variance across all heads, not per-head. GPU `nn.RMSNorm(head_dim)` normalizes each head's 128 dims independently.
+- **Why individual tests passed**: with random inputs, per-head and global variance happen to be similar, giving misleadingly high cosine (~0.994). Real model inputs have significantly different per-head variances (9.2 to 16.5), exposing the bug.
+- **Fix**: split q_norm and k_norm into separate 4d norm kernels that take `[1, HEAD_DIM, 1, N_HEADS*w_sq]` format, where each spatial position = one (head, seq_pos) pair. rmsnorm then reduces over HEAD_DIM channels per position = correct per-head norm.
+- **Lesson**: always test with REAL model inputs, not just random data. Random data can mask bugs by having uniform statistics.
+
+### Bug #2: IOSurface reshape is not data rearrangement (FIXED)
+- **Symptom**: after converting flat `[1, C, 1, W]` to 4D `[1, NH, w, HD]`, data was garbage.
+- **Root cause**: IOSurface reshape reinterprets bytes without moving data. Channels-first layout ≠ the target 4D layout.
+- **Fix**: reshape `[1, NH*HD, 1, w]` → `[1, NH, HD, w]` (splits channels, valid), then transpose to `[1, NH, w, HD]`.
+- **Lesson**: all flat↔4D conversions must go through explicit transpose, done in Python (read_f32 → rearrange → write_f32).
+
+### Bug #3: Placeholder transpose produces garbage (FIXED)
+- **Symptom**: conv1x1 with direct transpose on weight placeholder gave cosine ~0.06.
+- **Root cause**: ANE compiler bug — `transpose()` on a placeholder doesn't work correctly.
+- **Fix**: concat+slice+transpose pattern (see Conv1x1 section).
+
+### Bug #4: run_cached IOSurface caching (FIXED)
+- **Symptom**: V concat output was all zeros when using same kernel instance as K concat.
+- **Root cause**: `run_cached` stores IOSurface references from first call. Same kernel + different TensorData = silently uses cached surfaces.
+- **Fix**: compile separate kernel instances for K concat and V concat.
+
+### Bug #5: concat + conv1x1 in same kernel fails at runtime (FIXED)
+- **Symptom**: compiles but produces wrong results.
+- **Root cause**: ANE runtime can't handle concat → conv1x1 in single dispatch.
+- **Fix**: split k_proj/v_proj into separate ctx/noise sub-kernels with Python concat.
