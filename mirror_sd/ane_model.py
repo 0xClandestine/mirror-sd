@@ -32,7 +32,6 @@ Data flow per layer:
                  v_proj_noise ┘── v_concat ──→ (Python flat→4d) ───────────────────────────────────────────┘
 """
 
-import math
 from typing import Optional
 
 import mlx.core as mx
@@ -59,17 +58,16 @@ def align_width(w: int) -> int:
 def _interleave_head_dims(data_flat, oc, n_heads, head_dim):
     """Reorder OC rows of [OC, IC] weight so that within each head,
     dimensions are interleaved: [d0..d63, d64..d127] -> [d0,d64,d1,d65,...,d63,d127].
-    This makes the ANE interleaved RoPE (pairs 2k,2k+1) equivalent to
-    the standard half-rotation (pairs d, d+64)."""
+    This makes the ANE interleaved RoPE equivalent to the standard half-rotation."""
     half = head_dim // 2
     w = mx.array(data_flat, dtype=mx.float32).reshape(oc, -1)
-    w_new = mx.zeros_like(w)
-    for h in range(n_heads):
-        base = h * head_dim
-        for k in range(half):
-            w_new[base + 2 * k] = w[base + k]
-            w_new[base + 2 * k + 1] = w[base + k + half]
-    return w_new.flatten().tolist()
+    w_4d = w.reshape(n_heads, head_dim, -1)  # [NH, HD, IC]
+    w_first = w_4d[:, :half, :]   # [NH, half, IC]
+    w_second = w_4d[:, half:, :]  # [NH, half, IC]
+    # Interleave: stack along dim 1 → [NH, half, 2, IC] → reshape [NH, HD, IC]
+    stacked = mx.stack([w_first, w_second], axis=2)  # [NH, half, 2, IC]
+    w_il = stacked.reshape(n_heads, head_dim, -1)  # [NH, HD, IC]
+    return w_il.reshape(oc, -1).flatten().tolist()
 
 
 class ANEDraftModel:
@@ -144,50 +142,45 @@ class ANEDraftModel:
 
     def _make_norm_weight_expanded(self, weight_list, channels, width):
         w = align_width(width)
-        data = []
-        for c in range(channels):
-            val = weight_list[c]
-            data.extend([val] * w)
-        return self.ane.ANETensor.from_f32(1, channels, 1, w, data)
+        arr = mx.array(weight_list, dtype=mx.float32).reshape(channels, 1)
+        arr = mx.broadcast_to(arr, (channels, w))
+        return self.ane.ANETensor.from_f32(1, channels, 1, w, arr.flatten().tolist())
 
     def _make_per_head_norm_weight(self, head_weight_list, n_heads, width, interleave=False):
         w = align_width(width)
         head_dim = len(head_weight_list)
         half = head_dim // 2
-        data = []
-        for h in range(n_heads):
-            if interleave:
-                for k in range(half):
-                    data.extend([head_weight_list[k]] * w)
-                    data.extend([head_weight_list[k + half]] * w)
-            else:
-                for d in range(head_dim):
-                    data.extend([head_weight_list[d]] * w)
-        return self.ane.ANETensor.from_f32(1, n_heads * head_dim, 1, w, data)
+        if interleave:
+            il = []
+            for k in range(half):
+                il.append(head_weight_list[k])
+                il.append(head_weight_list[k + half])
+            per_head = mx.array(il, dtype=mx.float32).reshape(1, head_dim)
+        else:
+            per_head = mx.array(head_weight_list, dtype=mx.float32).reshape(1, head_dim)
+        all_heads = mx.repeat(per_head, n_heads, axis=0)  # [n_heads*head_dim]
+        all_heads = all_heads.reshape(n_heads * head_dim, 1)
+        arr = mx.broadcast_to(all_heads, (n_heads * head_dim, w))
+        return self.ane.ANETensor.from_f32(1, n_heads * head_dim, 1, w, arr.flatten().tolist())
 
     def _make_4d_norm_weight(self, head_weight_list, n_heads, width):
         """Build weight for q_norm_4d/k_norm_4d kernels.
 
-        These kernels take [1, HEAD_DIM, 1, N_HEADS * w_sq] input.
         Weight shape: [1, HEAD_DIM, 1, N_HEADS * w_sq] with interleaved
         norm weight values repeated for each (head, position) spatial location.
-
-        IOSurface stores data channels-first: all spatial values for channel 0,
-        then channel 1, etc. So we must iterate (d, h, pos) not (h, pos, d).
+        IOSurface stores data channels-first: iterate (d, h, pos) not (h, pos, d).
         """
         w = align_width(width)
         head_dim = len(head_weight_list)
         half = head_dim // 2
-        il_weights = []
+        il = []
         for k in range(half):
-            il_weights.append(head_weight_list[k])
-            il_weights.append(head_weight_list[k + half])
-        data = []
-        for d in range(head_dim):
-            for h in range(n_heads):
-                for pos in range(w):
-                    data.append(il_weights[d])
-        return self.ane.ANETensor.from_f32(1, head_dim, 1, n_heads * w, data)
+            il.append(head_weight_list[k])
+            il.append(head_weight_list[k + half])
+        il_arr = mx.array(il, dtype=mx.float32).reshape(head_dim, 1)
+        # Broadcast: [head_dim, 1] -> [head_dim, n_heads * w]
+        arr = mx.broadcast_to(il_arr, (head_dim, n_heads * w))
+        return self.ane.ANETensor.from_f32(1, head_dim, 1, n_heads * w, arr.flatten().tolist())
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
         self._load_fc_weights(draft_model)
@@ -430,35 +423,26 @@ class ANEDraftModel:
         rope_theta = 1000000.0
         half = HEAD_DIM // 2
 
-        cos_q_data = []
-        sin_q_data = []
-        for pos in range(self.w_sq):
-            angle_pos = rope_offset + self.ctx_len + pos
-            for d in range(half):
-                freq = 1.0 / (rope_theta ** (2.0 * d / HEAD_DIM))
-                angle = angle_pos * freq
-                cos_q_data.append(math.cos(angle))
-                cos_q_data.append(math.cos(angle))
-                sin_q_data.append(math.sin(angle))
-                sin_q_data.append(math.sin(angle))
+        # Q positions: rope_offset + ctx_len + pos
+        q_positions = mx.array([rope_offset + self.ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
+        q_freqs = mx.array([1.0 / (rope_theta ** (2.0 * d / HEAD_DIM)) for d in range(half)], dtype=mx.float32)
+        q_angles = q_positions[:, None] * q_freqs[None, :]  # [w_sq, half]
+        q_cos = mx.cos(q_angles)  # [w_sq, half]
+        q_sin = mx.sin(q_angles)
+        # Repeat each value for both elements of the pair: [cos_k, cos_k] not [cos_k, 1.0]
+        q_cos = mx.repeat(q_cos, 2, axis=1)  # [w_sq, HEAD_DIM]
+        q_sin = mx.repeat(q_sin, 2, axis=1)
+        self.b_cos_q.write_f32(q_cos.flatten().tolist())
+        self.b_sin_q.write_f32(q_sin.flatten().tolist())
 
-        self.b_cos_q.write_f32(cos_q_data)
-        self.b_sin_q.write_f32(sin_q_data)
-
-        cos_k_data = []
-        sin_k_data = []
-        for pos in range(self.w_kv):
-            if pos < self.ctx_len:
-                angle_pos = rope_offset + pos
-            else:
-                angle_pos = rope_offset + self.ctx_len + (pos - self.ctx_len)
-            for d in range(half):
-                freq = 1.0 / (rope_theta ** (2.0 * d / HEAD_DIM))
-                angle = angle_pos * freq
-                cos_k_data.append(math.cos(angle))
-                cos_k_data.append(math.cos(angle))
-                sin_k_data.append(math.sin(angle))
-                sin_k_data.append(math.sin(angle))
-
-        self.b_cos_k.write_f32(cos_k_data)
-        self.b_sin_k.write_f32(sin_k_data)
+        # K positions: ctx uses offset, noise uses offset+ctx_len
+        k_ctx_pos = mx.array([rope_offset + p for p in range(self.ctx_len)], dtype=mx.float32)
+        k_noise_pos = mx.array([rope_offset + self.ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
+        k_positions = mx.concatenate([k_ctx_pos, k_noise_pos])  # [w_kv] (only first ctx_len+w_sq valid)
+        k_angles = k_positions[:, None] * q_freqs[None, :]  # [w_kv, half]
+        k_cos = mx.cos(k_angles)
+        k_sin = mx.sin(k_angles)
+        k_cos = mx.repeat(k_cos, 2, axis=1)  # [w_kv, HEAD_DIM]
+        k_sin = mx.repeat(k_sin, 2, axis=1)
+        self.b_cos_k.write_f32(k_cos.flatten().tolist())
+        self.b_sin_k.write_f32(k_sin.flatten().tolist())
