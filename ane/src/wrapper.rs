@@ -51,6 +51,46 @@ impl ANETensor {
         })
     }
 
+    #[staticmethod]
+    fn from_buffer(
+        py: Python<'_>,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        buf: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let w = align_width(width);
+        let shape = Shape {
+            batch,
+            channels,
+            height,
+            width: w,
+        };
+        let bytes = buf.call_method0("tobytes")?;
+        let raw: &[u8] = bytes.downcast::<pyo3::types::PyBytes>()?.as_bytes();
+        let float_count = raw.len() / 4;
+        let data: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, float_count).to_vec() };
+        py.allow_threads(|| {
+            Ok(Self {
+                inner: TensorData::with_f32(&data, shape),
+            })
+        })
+    }
+
+    fn write_buffer(&self, py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = buf.call_method0("tobytes")?;
+        let raw: &[u8] = bytes.downcast::<pyo3::types::PyBytes>()?.as_bytes();
+        let float_count = raw.len() / 4;
+        let data: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, float_count).to_vec() };
+        py.allow_threads(|| {
+            self.inner.copy_from_f32(&data);
+        });
+        Ok(())
+    }
+
     fn write_f32(&self, data: Vec<f32>) -> PyResult<()> {
         self.inner.copy_from_f32(&data);
         Ok(())

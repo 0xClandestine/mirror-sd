@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--block-size", type=int, default=None, help="Override draft block size")
     parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
     parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
+    parser.add_argument("--no-baseline", action="store_true", help="Skip baseline autoregressive run")
+    parser.add_argument("--quick", action="store_true", help="Quick mode: 1 prompt, 32 tokens, no warmup, no baseline")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -111,7 +113,15 @@ def main():
         ane_model.gpu_fallback = draft_model
         draft_model = ane_model
 
-    if args.prompt:
+    if args.quick:
+        args.max_tokens = args.max_tokens or 32
+        args.warmup = 0
+        args.no_baseline = True
+        if not args.prompt:
+            prompts = [PROMPTS[0]]
+        else:
+            prompts = [args.prompt]
+    elif args.prompt:
         prompts = [args.prompt]
     elif args.math:
         prompts = MATH_CODE_PROMPTS
@@ -129,19 +139,23 @@ def main():
         spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids)
 
     # --- Baseline ---
-    print(f"\n{'='*60}")
-    print(f"  BASELINE (autoregressive)")
-    print(f"{'='*60}")
+    if args.no_baseline:
+        baseline_avg = None
+    else:
+        print(f"\n{'='*60}")
+        print(f"  BASELINE (autoregressive)")
+        print(f"{'='*60}")
 
-    baseline_results = []
-    for prompt in prompts:
-        text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature)
-        baseline_results.append((prompt, tps))
-        short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-        print(f"  {short:55s} {tps:6.1f} tok/s")
+        baseline_results = []
+        for prompt in prompts:
+            text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature)
+            baseline_results.append((prompt, tps, text))
+            short = prompt[:50] + "..." if len(prompt) > 50 else prompt
+            print(f"  {short:55s} {tps:6.1f} tok/s")
+            print(f"    -> {text[:200]}")
 
-    baseline_avg = sum(r[1] for r in baseline_results) / len(baseline_results)
-    print(f"  {'AVERAGE':55s} {baseline_avg:6.1f} tok/s")
+        baseline_avg = sum(r[1] for r in baseline_results) / len(baseline_results)
+        print(f"  {'AVERAGE':55s} {baseline_avg:6.1f} tok/s")
 
     # --- DFlash / ANE ---
     mode = "ANE" if args.ane else "DFLASH"
@@ -159,22 +173,27 @@ def main():
             temperature=temperature,
             stop_token_ids=eos_ids,
         )
-        dflash_results.append((prompt, stats))
+        dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
         print(f"  {short:55s} {stats.tokens_per_sec:6.1f} tok/s  accept={stats.avg_acceptance_length:.2f}  steps={stats.draft_steps}")
+        gen_text = tokenizer.decode(output_ids.tolist() if hasattr(output_ids, 'tolist') else list(output_ids))
+        print(f"    -> {gen_text[:200]}")
 
     dflash_avg = sum(r[1].tokens_per_sec for r in dflash_results) / len(dflash_results)
     dflash_accept_avg = sum(r[1].avg_acceptance_length for r in dflash_results) / len(dflash_results)
     print(f"  {'AVERAGE':55s} {dflash_avg:6.1f} tok/s  accept={dflash_accept_avg:.2f}")
 
     # --- Summary ---
-    speedup = dflash_avg / max(baseline_avg, 1e-9)
     print(f"\n{'='*60}")
     print(f"  SUMMARY")
     print(f"{'='*60}")
-    print(f"  Baseline:   {baseline_avg:6.1f} tok/s")
-    print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
-    print(f"  Speedup:    {speedup:6.2f}x")
+    if baseline_avg is not None:
+        speedup = dflash_avg / max(baseline_avg, 1e-9)
+        print(f"  Baseline:   {baseline_avg:6.1f} tok/s")
+        print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
+        print(f"  Speedup:    {speedup:6.2f}x")
+    else:
+        print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
     print(f"  Avg accept: {dflash_accept_avg:.2f} tokens/block")
     print(f"  Block size:  {config.block_size}")
     print(f"  Draft mode:  {'ANE' if args.ane else 'GPU'}")
