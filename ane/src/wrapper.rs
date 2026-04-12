@@ -20,15 +20,8 @@ impl ANETensor {
     #[new]
     fn py_new(batch: usize, channels: usize, height: usize, width: usize) -> PyResult<Self> {
         let w = align_width(width);
-        let shape = Shape {
-            batch,
-            channels,
-            height,
-            width: w,
-        };
-        Ok(Self {
-            inner: TensorData::new(shape),
-        })
+        let shape = Shape { batch, channels, height, width: w };
+        Ok(Self { inner: TensorData::new(shape) })
     }
 
     #[staticmethod]
@@ -40,15 +33,8 @@ impl ANETensor {
         data: Vec<f32>,
     ) -> PyResult<Self> {
         let w = align_width(width);
-        let shape = Shape {
-            batch,
-            channels,
-            height,
-            width: w,
-        };
-        Ok(Self {
-            inner: TensorData::with_f32(&data, shape),
-        })
+        let shape = Shape { batch, channels, height, width: w };
+        Ok(Self { inner: TensorData::with_f32(&data, shape) })
     }
 
     #[staticmethod]
@@ -61,22 +47,13 @@ impl ANETensor {
         buf: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         let w = align_width(width);
-        let shape = Shape {
-            batch,
-            channels,
-            height,
-            width: w,
-        };
+        let shape = Shape { batch, channels, height, width: w };
         let bytes = buf.call_method0("tobytes")?;
         let raw: &[u8] = bytes.downcast::<pyo3::types::PyBytes>()?.as_bytes();
         let float_count = raw.len() / 4;
         let data: Vec<f32> =
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, float_count).to_vec() };
-        py.allow_threads(|| {
-            Ok(Self {
-                inner: TensorData::with_f32(&data, shape),
-            })
-        })
+        py.allow_threads(|| Ok(Self { inner: TensorData::with_f32(&data, shape) }))
     }
 
     fn write_buffer(&self, py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -138,14 +115,12 @@ impl ANEKernel {
     fn run(&self, inputs: Vec<PyRef<ANETensor>>, outputs: Vec<PyRef<ANETensor>>) -> PyResult<()> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable
-            .run_cached(&input_refs, &output_refs)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "ANE kernel '{}' run failed: {:?}",
-                    self.name, e
-                ))
-            })?;
+        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ANE kernel '{}' run failed: {:?}",
+                self.name, e
+            ))
+        })?;
         Ok(())
     }
 
@@ -156,14 +131,12 @@ impl ANEKernel {
     ) -> PyResult<()> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable
-            .run(&input_refs, &output_refs)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "ANE kernel '{}' run_uncached failed: {:?}",
-                    self.name, e
-                ))
-            })?;
+        self.executable.run(&input_refs, &output_refs).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ANE kernel '{}' run_uncached failed: {:?}",
+                self.name, e
+            ))
+        })?;
         Ok(())
     }
 
@@ -175,14 +148,12 @@ impl ANEKernel {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
         let start = Instant::now();
-        self.executable
-            .run_cached(&input_refs, &output_refs)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "ANE kernel '{}' run failed: {:?}",
-                    self.name, e
-                ))
-            })?;
+        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ANE kernel '{}' run failed: {:?}",
+                self.name, e
+            ))
+        })?;
         Ok(start.elapsed().as_secs_f64())
     }
 
@@ -203,40 +174,23 @@ pub fn compile_dflash_kernels(
 
     let kernel_builders: Vec<(&str, Graph)> = vec![
         ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
-        (
-            "mega_qkv",
-            dflash::build_kqv_plus_vnorm_qnorm_kernel(w_sq, w_ctx),
-        ),
+        ("mega_qkv", dflash::build_kqv_plus_vnorm_qnorm_kernel(w_sq, w_ctx)),
         ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
-        (
-            "attn_out",
-            dflash::build_attn_out_kernel(w_sq, w_kv, softcap),
-        ),
-        (
-            "o_proj_residual",
-            dflash::build_o_proj_residual_kernel(w_sq, softcap),
-        ),
-        (
-            "ffn_residual",
-            dflash::build_ffn_residual_kernel(w_sq, softcap),
-        ),
+        ("attn_out", dflash::build_attn_out_kernel(w_sq, w_kv, softcap)),
+        ("o_proj_residual", dflash::build_o_proj_residual_kernel(w_sq, softcap)),
+        ("ffn_residual", dflash::build_ffn_residual_kernel(w_sq, softcap)),
         ("final_norm", dflash::build_final_norm_kernel(w_sq)),
     ];
 
     let mut compiled = Vec::new();
     for (name, graph) in kernel_builders {
-        let exec = graph
-            .compile(NSQualityOfService::UserInteractive)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "ANE compile '{}' failed: {:?}",
-                    name, e
-                ))
-            })?;
-        compiled.push(ANEKernel {
-            executable: exec,
-            name: name.to_string(),
-        });
+        let exec = graph.compile(NSQualityOfService::UserInteractive).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ANE compile '{}' failed: {:?}",
+                name, e
+            ))
+        })?;
+        compiled.push(ANEKernel { executable: exec, name: name.to_string() });
     }
     Ok(compiled)
 }
@@ -277,32 +231,21 @@ pub fn compile_incremental_test_kernels(seq_q: usize, ctx_len: usize) -> PyResul
 
     let kernel_builders: Vec<(&str, Graph)> = vec![
         ("gqa_tile_only", dflash::build_gqa_tile_only_kernel(w_kv)),
-        (
-            "gqa_plus_scores",
-            dflash::build_gqa_plus_scores_kernel(w_sq, w_kv),
-        ),
+        ("gqa_plus_scores", dflash::build_gqa_plus_scores_kernel(w_sq, w_kv)),
         ("sdpa_no_gqa", dflash::build_sdpa_no_gqa_kernel(w_sq, w_kv)),
         ("sdpa_o_proj", dflash::build_sdpa_o_proj_kernel(w_sq, w_kv)),
-        (
-            "fused_attn_out",
-            dflash::build_fused_attn_out_kernel(w_sq, w_kv),
-        ),
+        ("fused_attn_out", dflash::build_fused_attn_out_kernel(w_sq, w_kv)),
     ];
 
     let mut compiled = Vec::new();
     for (name, graph) in kernel_builders {
-        let exec = graph
-            .compile(NSQualityOfService::UserInteractive)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "ANE compile '{}' failed: {:?}",
-                    name, e
-                ))
-            })?;
-        compiled.push(ANEKernel {
-            executable: exec,
-            name: name.to_string(),
-        });
+        let exec = graph.compile(NSQualityOfService::UserInteractive).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ANE compile '{}' failed: {:?}",
+                name, e
+            ))
+        })?;
+        compiled.push(ANEKernel { executable: exec, name: name.to_string() });
     }
     Ok(compiled)
 }
@@ -310,35 +253,15 @@ pub fn compile_incremental_test_kernels(seq_q: usize, ctx_len: usize) -> PyResul
 #[pyfunction]
 pub fn test_rmsnorm(dim: usize, seq: usize) -> PyResult<String> {
     let mut g = Graph::new();
-    let x = g.placeholder(Shape {
-        batch: 1,
-        channels: dim,
-        height: 1,
-        width: seq,
-    });
+    let x = g.placeholder(Shape { batch: 1, channels: dim, height: 1, width: seq });
     let ms = g.reduce_mean(x, 1);
     let diff = g.subtraction(x, ms);
     let sq = g.multiplication(diff, diff);
     let mean_sq = g.reduce_mean(sq, 1);
-    let eps = g.constant_with_scalar(
-        1e-6,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: 1,
-            width: 1,
-        },
-    );
+    let eps = g.constant_with_scalar(1e-6, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let meps = g.addition(mean_sq, eps);
-    let neg_half = g.constant_with_scalar(
-        -0.5,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: 1,
-            width: 1,
-        },
-    );
+    let neg_half =
+        g.constant_with_scalar(-0.5, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let inv_std = g.power(meps, neg_half);
     let _out = g.multiplication(x, inv_std);
 
@@ -351,135 +274,58 @@ pub fn test_rmsnorm(dim: usize, seq: usize) -> PyResult<String> {
 #[pyfunction]
 pub fn test_rmsnorm_matmul(dim: usize, oc: usize, seq: usize) -> PyResult<String> {
     let mut g = Graph::new();
-    let x = g.placeholder(Shape {
-        batch: 1,
-        channels: dim,
-        height: 1,
-        width: seq,
-    });
+    let x = g.placeholder(Shape { batch: 1, channels: dim, height: 1, width: seq });
     let ms = g.reduce_mean(x, 1);
     let diff = g.subtraction(x, ms);
     let sq = g.multiplication(diff, diff);
     let mean_sq = g.reduce_mean(sq, 1);
-    let eps_t = g.constant_with_scalar(
-        1e-6,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: 1,
-            width: 1,
-        },
-    );
+    let eps_t = g.constant_with_scalar(1e-6, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let meps = g.addition(mean_sq, eps_t);
-    let neg_half = g.constant_with_scalar(
-        -0.5,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: 1,
-            width: 1,
-        },
-    );
+    let neg_half =
+        g.constant_with_scalar(-0.5, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let inv_std = g.power(meps, neg_half);
     let normed = g.multiplication(x, inv_std);
 
-    let nr = g.reshape(
-        normed,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: dim,
-            width: seq,
-        },
-    );
+    let nr = g.reshape(normed, Shape { batch: 1, channels: 1, height: dim, width: seq });
     let nt = g.transpose(nr, [0, 1, 3, 2]);
-    let w = g.placeholder(Shape {
-        batch: 1,
-        channels: dim,
-        height: 1,
-        width: oc,
-    });
-    let wr = g.reshape(
-        w,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: dim,
-            width: oc,
-        },
-    );
+    let w = g.placeholder(Shape { batch: 1, channels: dim, height: 1, width: oc });
+    let wr = g.reshape(w, Shape { batch: 1, channels: 1, height: dim, width: oc });
     let _out = g.matrix_multiplication(nt, wr, false, false);
 
     match g.compile(NSQualityOfService::UserInteractive) {
-        Ok(_) => Ok(format!(
-            "rmsnorm+matmul(dim={}, oc={}, seq={}) compiled OK",
-            dim, oc, seq
-        )),
-        Err(e) => Ok(format!(
-            "rmsnorm+matmul(dim={}, oc={}, seq={}) FAILED: {:?}",
-            dim, oc, seq, e
-        )),
+        Ok(_) => Ok(format!("rmsnorm+matmul(dim={}, oc={}, seq={}) compiled OK", dim, oc, seq)),
+        Err(e) => {
+            Ok(format!("rmsnorm+matmul(dim={}, oc={}, seq={}) FAILED: {:?}", dim, oc, seq, e))
+        }
     }
 }
 
 #[pyfunction]
 pub fn test_matmul(ic: usize, oc: usize, seq: usize) -> PyResult<String> {
     let mut g = Graph::new();
-    let acts = g.placeholder(Shape {
-        batch: 1,
-        channels: 1,
-        height: seq,
-        width: ic,
-    });
-    let wts = g.placeholder(Shape {
-        batch: 1,
-        channels: 1,
-        height: ic,
-        width: oc,
-    });
+    let acts = g.placeholder(Shape { batch: 1, channels: 1, height: seq, width: ic });
+    let wts = g.placeholder(Shape { batch: 1, channels: 1, height: ic, width: oc });
     let _out = g.matrix_multiplication(acts, wts, false, false);
 
     match g.compile(NSQualityOfService::UserInteractive) {
-        Ok(_) => Ok(format!(
-            "matmul(ic={}, oc={}, seq={}) compiled OK",
-            ic, oc, seq
-        )),
-        Err(e) => Ok(format!(
-            "matmul(ic={}, oc={}, seq={}) FAILED: {:?}",
-            ic, oc, seq, e
-        )),
+        Ok(_) => Ok(format!("matmul(ic={}, oc={}, seq={}) compiled OK", ic, oc, seq)),
+        Err(e) => Ok(format!("matmul(ic={}, oc={}, seq={}) FAILED: {:?}", ic, oc, seq, e)),
     }
 }
 
 #[pyfunction]
 pub fn test_swiglu(dim: usize, ffn: usize, seq: usize) -> PyResult<String> {
     let mut g = Graph::new();
-    let h1 = g.placeholder(Shape {
-        batch: 1,
-        channels: ffn,
-        height: 1,
-        width: seq,
-    });
-    let h3 = g.placeholder(Shape {
-        batch: 1,
-        channels: ffn,
-        height: 1,
-        width: seq,
-    });
+    let h1 = g.placeholder(Shape { batch: 1, channels: ffn, height: 1, width: seq });
+    let h3 = g.placeholder(Shape { batch: 1, channels: ffn, height: 1, width: seq });
     let sig = g.sigmoid(h1);
     let silu = g.multiplication(h1, sig);
     let gate = g.multiplication(silu, h3);
     let _out = gate;
 
     match g.compile(NSQualityOfService::UserInteractive) {
-        Ok(_) => Ok(format!(
-            "swiglu(dim={}, ffn={}, seq={}) compiled OK",
-            dim, ffn, seq
-        )),
-        Err(e) => Ok(format!(
-            "swiglu(dim={}, ffn={}, seq={}) FAILED: {:?}",
-            dim, ffn, seq, e
-        )),
+        Ok(_) => Ok(format!("swiglu(dim={}, ffn={}, seq={}) compiled OK", dim, ffn, seq)),
+        Err(e) => Ok(format!("swiglu(dim={}, ffn={}, seq={}) FAILED: {:?}", dim, ffn, seq, e)),
     }
 }
 
@@ -517,43 +363,21 @@ pub fn test_sdpa(
     let w_sk = align_width(seq_k);
     let gqa_ratio = n_heads / n_kv_heads;
 
-    let q = g.placeholder(Shape {
-        batch: 1,
-        channels: n_heads,
-        height: head_dim,
-        width: w_sq,
-    });
+    let q = g.placeholder(Shape { batch: 1, channels: n_heads, height: head_dim, width: w_sq });
     let q_t = g.transpose(q, [0, 1, 3, 2]);
 
-    let k = g.placeholder(Shape {
-        batch: 1,
-        channels: n_kv_heads,
-        height: head_dim,
-        width: w_sk,
-    });
+    let k = g.placeholder(Shape { batch: 1, channels: n_kv_heads, height: head_dim, width: w_sk });
     let k_base = g.transpose(k, [0, 1, 3, 2]);
     let k_t = tile_kv_heads(&mut g, k_base, n_kv_heads, gqa_ratio, seq_k, head_dim);
 
-    let v = g.placeholder(Shape {
-        batch: 1,
-        channels: n_kv_heads,
-        height: head_dim,
-        width: w_sk,
-    });
+    let v = g.placeholder(Shape { batch: 1, channels: n_kv_heads, height: head_dim, width: w_sk });
     let v_base = g.transpose(v, [0, 1, 3, 2]);
     let v_t = tile_kv_heads(&mut g, v_base, n_kv_heads, gqa_ratio, seq_k, head_dim);
 
     let scores = g.matrix_multiplication(q_t, k_t, false, true);
     let scale_val = 1.0 / (head_dim as f32).sqrt();
-    let scale = g.constant_with_scalar(
-        scale_val,
-        Shape {
-            batch: 1,
-            channels: 1,
-            height: 1,
-            width: 1,
-        },
-    );
+    let scale =
+        g.constant_with_scalar(scale_val, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let scores_scaled = g.multiplication(scores, scale);
     let attn_probs = g.soft_max(scores_scaled, 3);
     let _out = g.matrix_multiplication(attn_probs, v_t, false, false);
@@ -580,18 +404,10 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
     // Level 1: rmsnorm + concat + 1 conv1x1
     {
         let mut g = Graph::new();
-        let hidden = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_sq,
-        });
-        let target_hid = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_ctx,
-        });
+        let hidden =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_sq });
+        let target_hid =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_ctx });
         let norm_w = g.placeholder(Shape {
             batch: 1,
             channels: dflash::HIDDEN,
@@ -617,27 +433,16 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
             },
         );
         let _out = g.convolution_2d_1x1_dynamic(packed, wk_conv);
-        results.push((
-            "1_norm+concat+1conv",
-            g.compile(NSQualityOfService::UserInteractive),
-        ));
+        results.push(("1_norm+concat+1conv", g.compile(NSQualityOfService::UserInteractive)));
     }
 
     // Level 2: + q conv + q_norm
     {
         let mut g = Graph::new();
-        let hidden = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_sq,
-        });
-        let target_hid = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_ctx,
-        });
+        let hidden =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_sq });
+        let target_hid =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_ctx });
         let norm_w = g.placeholder(Shape {
             batch: 1,
             channels: dflash::HIDDEN,
@@ -690,21 +495,14 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
             width: MIN_SPATIAL_WIDTH,
         });
         let _q_normed = dflash::rmsnorm(&mut g, q_out, q_norm_w);
-        results.push((
-            "2_norm+2conv+qnorm_flat",
-            g.compile(NSQualityOfService::UserInteractive),
-        ));
+        results.push(("2_norm+2conv+qnorm_flat", g.compile(NSQualityOfService::UserInteractive)));
     }
 
     // Level 3: norm + Qconv + q_norm (just one path)
     {
         let mut g = Graph::new();
-        let hidden = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_sq,
-        });
+        let hidden =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_sq });
         let norm_w = g.placeholder(Shape {
             batch: 1,
             channels: dflash::HIDDEN,
@@ -736,27 +534,16 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
             width: MIN_SPATIAL_WIDTH,
         });
         let _q_normed = dflash::rmsnorm(&mut g, q_out, q_norm_w);
-        results.push((
-            "3_norm+Qconv+qnorm",
-            g.compile(NSQualityOfService::UserInteractive),
-        ));
+        results.push(("3_norm+Qconv+qnorm", g.compile(NSQualityOfService::UserInteractive)));
     }
 
     // Level 4: K conv + k_norm only
     {
         let mut g = Graph::new();
-        let target_hid = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_ctx,
-        });
-        let normed = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_sq,
-        });
+        let target_hid =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_ctx });
+        let normed =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_sq });
         let packed = g.concat(&[target_hid, normed], 3);
         let wk = g.placeholder(Shape {
             batch: 1,
@@ -782,27 +569,16 @@ pub fn test_qkv_progressive(seq_q: usize, ctx_len: usize) -> PyResult<String> {
             width: MIN_SPATIAL_WIDTH,
         });
         let _k_normed = dflash::rmsnorm(&mut g, k_out, k_norm_w);
-        results.push((
-            "4_Kconv+knorm",
-            g.compile(NSQualityOfService::UserInteractive),
-        ));
+        results.push(("4_Kconv+knorm", g.compile(NSQualityOfService::UserInteractive)));
     }
 
     // Level 5: V conv only
     {
         let mut g = Graph::new();
-        let target_hid = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_ctx,
-        });
-        let normed = g.placeholder(Shape {
-            batch: 1,
-            channels: dflash::HIDDEN,
-            height: 1,
-            width: w_sq,
-        });
+        let target_hid =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_ctx });
+        let normed =
+            g.placeholder(Shape { batch: 1, channels: dflash::HIDDEN, height: 1, width: w_sq });
         let packed = g.concat(&[target_hid, normed], 3);
         let wv = g.placeholder(Shape {
             batch: 1,
@@ -843,43 +619,20 @@ pub fn compile_conv1x1_transpose(ic: usize, oc: usize, seq: usize) -> PyResult<V
     let w_wt = dflash::align_width(ic);
 
     let mut g = Graph::new();
-    let input = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: w,
-    });
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: w });
     // Current approach: weight as [1, OC, 1, IC] with transpose
-    let weight = g.placeholder(Shape {
-        batch: 1,
-        channels: oc,
-        height: 1,
-        width: w_wt,
-    });
+    let weight = g.placeholder(Shape { batch: 1, channels: oc, height: 1, width: w_wt });
     let wt = g.transpose(weight, [0, 3, 2, 1]);
-    let w_conv = g.reshape(
-        wt,
-        Shape {
-            batch: oc,
-            channels: ic,
-            height: 1,
-            width: 1,
-        },
-    );
+    let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     let _out = g.convolution_2d_1x1_dynamic(input, w_conv);
 
-    let exec = g
-        .compile(NSQualityOfService::UserInteractive)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "compile_conv1x1_transpose failed: {:?}",
-                e
-            ))
-        })?;
-    Ok(vec![ANEKernel {
-        executable: exec,
-        name: "conv1x1_transpose".to_string(),
-    }])
+    let exec = g.compile(NSQualityOfService::UserInteractive).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "compile_conv1x1_transpose failed: {:?}",
+            e
+        ))
+    })?;
+    Ok(vec![ANEKernel { executable: exec, name: "conv1x1_transpose".to_string() }])
 }
 
 /// Compile a test conv1x1 kernel using Approach B (rustane reference):
@@ -891,18 +644,8 @@ pub fn compile_conv1x1_concat(ic: usize, oc: usize, seq: usize) -> PyResult<Vec<
     let w_wt = dflash::align_width(oc);
 
     let mut g = Graph::new();
-    let acts = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: w,
-    });
-    let wts = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: w_wt,
-    });
+    let acts = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: w });
+    let wts = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: w_wt });
 
     // Concat then slice (mirrors rustane build_conv_split pattern)
     let packed = g.concat(&[acts, wts], 3);
@@ -910,29 +653,13 @@ pub fn compile_conv1x1_concat(ic: usize, oc: usize, seq: usize) -> PyResult<Vec<
     let w_sliced = g.slice(packed, [0, 0, 0, seq], [1, ic, 1, oc]);
 
     let wt = g.transpose(w_sliced, [0, 3, 2, 1]);
-    let w_conv = g.reshape(
-        wt,
-        Shape {
-            batch: oc,
-            channels: ic,
-            height: 1,
-            width: 1,
-        },
-    );
+    let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     let _out = g.convolution_2d_1x1_dynamic(a, w_conv);
 
-    let exec = g
-        .compile(NSQualityOfService::UserInteractive)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "compile_conv1x1_concat failed: {:?}",
-                e
-            ))
-        })?;
-    Ok(vec![ANEKernel {
-        executable: exec,
-        name: "conv1x1_concat".to_string(),
-    }])
+    let exec = g.compile(NSQualityOfService::UserInteractive).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("compile_conv1x1_concat failed: {:?}", e))
+    })?;
+    Ok(vec![ANEKernel { executable: exec, name: "conv1x1_concat".to_string() }])
 }
 
 /// Compile a test conv1x1 kernel using Approach C (transpose on placeholder, no concat-slice):
@@ -945,84 +672,37 @@ pub fn compile_conv1x1_transpose_b(ic: usize, oc: usize, seq: usize) -> PyResult
     let w_wt = dflash::align_width(oc);
 
     let mut g = Graph::new();
-    let input = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: w,
-    });
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: w });
     // Weight as [1, IC, 1, OC] (transposed shape), then transpose+reshape
-    let weight = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: w_wt,
-    });
+    let weight = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: w_wt });
     let wt = g.transpose(weight, [0, 3, 2, 1]);
-    let w_conv = g.reshape(
-        wt,
-        Shape {
-            batch: oc,
-            channels: ic,
-            height: 1,
-            width: 1,
-        },
-    );
+    let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     let _out = g.convolution_2d_1x1_dynamic(input, w_conv);
 
-    let exec = g
-        .compile(NSQualityOfService::UserInteractive)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "compile_conv1x1_transpose_b failed: {:?}",
-                e
-            ))
-        })?;
-    Ok(vec![ANEKernel {
-        executable: exec,
-        name: "conv1x1_transpose_b".to_string(),
-    }])
+    let exec = g.compile(NSQualityOfService::UserInteractive).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "compile_conv1x1_transpose_b failed: {:?}",
+            e
+        ))
+    })?;
+    Ok(vec![ANEKernel { executable: exec, name: "conv1x1_transpose_b".to_string() }])
 }
 
 #[pyfunction]
 pub fn test_conv1x1(ic: usize, oc: usize, seq: usize) -> PyResult<String> {
     let mut g = Graph::new();
-    let acts = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: seq,
-    });
-    let wts = g.placeholder(Shape {
-        batch: 1,
-        channels: ic,
-        height: 1,
-        width: oc,
-    });
+    let acts = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: seq });
+    let wts = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: oc });
     let packed = g.concat(&[acts, wts], 3);
     let a = g.slice(packed, [0, 0, 0, 0], [1, ic, 1, seq]);
     let w = g.slice(packed, [0, 0, 0, seq], [1, ic, 1, oc]);
     let wt = g.transpose(w, [0, 3, 2, 1]);
-    let wc = g.reshape(
-        wt,
-        Shape {
-            batch: oc,
-            channels: ic,
-            height: 1,
-            width: 1,
-        },
-    );
+    let wc = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     let _out = g.convolution_2d_1x1_dynamic(a, wc);
 
     match g.compile(NSQualityOfService::UserInteractive) {
-        Ok(_) => Ok(format!(
-            "conv1x1(ic={}, oc={}, seq={}) compiled OK",
-            ic, oc, seq
-        )),
-        Err(e) => Ok(format!(
-            "conv1x1(ic={}, oc={}, seq={}) FAILED: {:?}",
-            ic, oc, seq, e
-        )),
+        Ok(_) => Ok(format!("conv1x1(ic={}, oc={}, seq={}) compiled OK", ic, oc, seq)),
+        Err(e) => Ok(format!("conv1x1(ic={}, oc={}, seq={}) FAILED: {:?}", ic, oc, seq, e)),
     }
 }
 
@@ -1037,10 +717,7 @@ pub fn test_dflash_nlayers(_n_layers: usize, seq_q: usize, ctx_len: usize) -> Py
             "fc_norm",
             dflash::build_fc_norm_kernel(w_ctx).compile(NSQualityOfService::UserInteractive),
         ),
-        (
-            "q_proj",
-            dflash::build_q_proj_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
-        ),
+        ("q_proj", dflash::build_q_proj_kernel(w_sq).compile(NSQualityOfService::UserInteractive)),
         (
             "k_proj_ctx",
             dflash::build_k_proj_ctx_kernel(w_ctx).compile(NSQualityOfService::UserInteractive),
@@ -1061,10 +738,7 @@ pub fn test_dflash_nlayers(_n_layers: usize, seq_q: usize, ctx_len: usize) -> Py
             "v_proj_noise",
             dflash::build_v_proj_noise_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
         ),
-        (
-            "rope_q",
-            dflash::build_rope_q_kernel(w_sq).compile(NSQualityOfService::UserInteractive),
-        ),
+        ("rope_q", dflash::build_rope_q_kernel(w_sq).compile(NSQualityOfService::UserInteractive)),
         (
             "rope_k",
             dflash::build_rope_k_kernel(w_sq, w_ctx).compile(NSQualityOfService::UserInteractive),

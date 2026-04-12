@@ -1,1 +1,6 @@
-ane/target
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+ane/target/

@@ -20,9 +20,6 @@ fn mirror_sd_ane(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wrapper::compile_conv1x1_concat, m)?)?;
     m.add_function(wrap_pyfunction!(wrapper::compile_conv1x1_transpose_b, m)?)?;
     m.add_function(wrap_pyfunction!(wrapper::test_input_pack_k, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        wrapper::compile_incremental_test_kernels,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(wrapper::compile_incremental_test_kernels, m)?)?;
     Ok(())
 }
