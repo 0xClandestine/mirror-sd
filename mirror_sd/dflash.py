@@ -355,6 +355,7 @@ class DFlashDraftModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = config.mask_token_id
+        self.num_draft_layers = config.num_hidden_layers
 
     def __call__(
         self,
@@ -366,7 +367,7 @@ class DFlashDraftModel(nn.Module):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
 
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self.layers[:self.num_draft_layers]):
             c = cache[i] if cache is not None else None
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -378,7 +379,7 @@ class DFlashDraftModel(nn.Module):
         return self.norm(hidden_states)
 
     def make_cache(self) -> list:
-        return [DFlashKVCache() for _ in range(self.config.num_hidden_layers)]
+        return [DFlashKVCache() for _ in range(self.num_draft_layers)]
 
     def sanitize(self, weights):
         return weights

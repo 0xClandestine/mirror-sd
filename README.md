@@ -312,3 +312,14 @@ The MLX target model loads in **bf16** (not f16!). When the draft was loaded in 
 ## License
 
 MIT
+
+
+
+
+
+
+
+
+
+The radical option
+7. No separate draft model — early-exit adapter. Since Apple Silicon has unified memory, we could add a small linear adapter to the target model's exit_layer (layer 17) and use that as the draft. No separate model to load, no KV injection needed (the hidden states are already there from the prefix pass). The target's early layers already "know the future" — we just need to decode it. This eliminates the draft model entirely and would be uniquely viable on Apple Silicon where the prefix pass is "free" (it's needed for Mirror-SD anyway).

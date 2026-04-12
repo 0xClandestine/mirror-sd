@@ -64,6 +64,8 @@ def cmd_generate(args):
         failfast=args.failfast,
         failfast_tau=args.failfast_tau,
         failfast_max_spec=args.failfast_max_spec,
+        num_draft_layers=args.num_draft_layers,
+        adaptive_block=args.adaptive_block,
     )
 
     text = tokenizer.decode(output_ids[0].tolist())
@@ -154,6 +156,8 @@ def cmd_bench(args):
         failfast=args.failfast,
         failfast_tau=args.failfast_tau,
         failfast_max_spec=args.failfast_max_spec,
+        num_draft_layers=args.num_draft_layers,
+        adaptive_block=args.adaptive_block,
     )
 
     print(f"\n{'='*60}")
@@ -185,6 +189,8 @@ def main():
     gen_parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length (extends draft in high-confidence regions)")
     gen_parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
     gen_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
+    gen_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
+    gen_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
 
     # convert
     conv_parser = subparsers.add_parser("convert", help="Convert DFlash model to MLX format")
@@ -203,6 +209,8 @@ def main():
     bench_parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length")
     bench_parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
     bench_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
+    bench_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
+    bench_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
 
     args = parser.parse_args()
 

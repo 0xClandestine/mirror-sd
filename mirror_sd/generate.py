@@ -75,6 +75,8 @@ def spec_generate(
     failfast: bool = False,
     failfast_tau: float = 0.4,
     failfast_max_spec: int = 64,
+    num_draft_layers: Optional[int] = None,
+    adaptive_block: bool = False,
 ) -> Tuple[mx.array, SpecDecodeStats]:
     from mlx_lm.models import cache as cache_module
 
@@ -96,10 +98,19 @@ def spec_generate(
     if target_layer_ids is None:
         target_layer_ids = draft_model.config.target_layer_ids
 
+    if num_draft_layers is not None and hasattr(draft_model, 'num_draft_layers'):
+        original = draft_model.num_draft_layers
+        draft_model.num_draft_layers = min(num_draft_layers, original)
+    elif num_draft_layers is not None:
+        original = None
+    else:
+        original = None
+
     stats = SpecDecodeStats()
     t_start = time.perf_counter()
 
-    block_size = draft_model.block_size
+    base_block_size = draft_model.block_size
+    block_size = base_block_size
     mask_token_id = draft_model.mask_token_id
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -128,150 +139,65 @@ def spec_generate(
 
     # --- Decode ---
     start = num_input_tokens + 1
-    repeat_window = []
-    max_repeat_window = 4
     while start < max_length:
         remaining = max_length - start
         current_block_size = min(block_size, remaining + 1)
 
-        if len(repeat_window) >= max_repeat_window:
-            recent = output_ids_list[-max_repeat_window:]
-            if len(set(recent)) == 1:
-                repeat_window = []
-                token_id = mx.array([[output_ids_list[-1]]], dtype=mx.int32)
-                logits = target_model(token_id, cache=target_cache)
-                mx.eval(logits)
-                mx.eval([c.state for c in target_cache])
-                next_token = sample(logits[:, -1:, :], temperature)
-                mx.eval(next_token)
-                output_ids_list.append(int(next_token[0, 0]))
-                start += 1
-                stats.total_tokens = len(output_ids_list) - num_input_tokens
-                continue
+        if current_block_size < 2:
+            break
 
         # --- Draft phase ---
-        # FailFast: dynamically extend speculation length based on confidence.
-        # Uses acceptance history as a secondary signal when draft confidence
-        # is too weak (common for DFlash's 5-layer diffusion model).
-        if failfast:
-            all_sampled_tokens = []
-            total_spec_len = 0
-            extension_first_token = output_ids_list[start - 1]
+        anchor_token = output_ids_list[-1]
+        block_tokens = [anchor_token] + [mask_token_id] * (current_block_size - 1)
+        block_ids = mx.array([block_tokens], dtype=mx.int32)
+        noise_embedding = target_model.model.embed_tokens(block_ids)
 
-            # Extend if the previous iteration had high acceptance.
-            # failfast_tau now acts as "acceptance length threshold for extension":
-            # if last iteration accepted >= tau tokens, we're in an easy region.
-            prev_accept = stats.acceptance_lengths[-1] if stats.acceptance_lengths else 0
-            do_extend = prev_accept >= failfast_tau
+        cache_len = draft_cache[0].offset
+        ctx_len = target_hidden.shape[1]
+        q_len = noise_embedding.shape[1]
+        draft_mask_val = make_draft_mask(q_len, ctx_len, cache_len)
 
-            for ext in range(failfast_max_spec // block_size + 1):
-                ext_block_size = min(block_size, max_length - start - total_spec_len + 1)
-                if ext_block_size <= 1:
-                    break
+        draft_hidden = draft_model(
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            mask=draft_mask_val,
+            cache=draft_cache,
+        )
+        draft_logits = target_model.lm_head(draft_hidden[:, -current_block_size + 1:, :])
+        sampled_tokens = sample(draft_logits, temperature)
 
-                if ext > 0 and not do_extend:
-                    break
+        # --- Verify phase: fused with draft via MLX array ops ---
+        # Build verify input using mx.concatenate (no .tolist round-trip to Python)
+        anchor_arr = mx.array([[anchor_token]], dtype=mx.int32)
+        verify_input = mx.concatenate([anchor_arr, sampled_tokens], axis=1)
 
-                if ext == 0:
-                    ext_tokens = [extension_first_token] + [mask_token_id] * (ext_block_size - 1)
-                else:
-                    ext_tokens = [all_sampled_tokens[-1]] + [mask_token_id] * (ext_block_size - 1)
-
-                ext_ids = mx.array([ext_tokens], dtype=mx.int32)
-                ne = target_model.model.embed_tokens(ext_ids)
-
-                cache_len = draft_cache[0].offset
-                ctx_len = target_hidden.shape[1]
-                q_len = ne.shape[1]
-                dm = make_draft_mask(q_len, ctx_len, cache_len)
-
-                dh = draft_model(
-                    noise_embedding=ne,
-                    target_hidden=target_hidden,
-                    mask=dm,
-                    cache=draft_cache,
-                )
-                dl = target_model.lm_head(dh[:, -(q_len - 1):, :])
-                st = sample(dl, temperature)
-                mx.eval(st)
-
-                new_tokens = st[0].tolist()
-                all_sampled_tokens.extend(new_tokens)
-                total_spec_len += len(new_tokens)
-
-                if total_spec_len >= failfast_max_spec:
-                    break
-
-            # Build the full block for verification
-            block_tokens = [output_ids_list[start - 1]] + all_sampled_tokens
-            current_block_size = len(block_tokens)
-            block_tokens_updated = block_tokens.copy()
-        else:
-            block_tokens = [output_ids_list[start - 1]]
-            block_tokens.extend([mask_token_id] * (current_block_size - 1))
-            block_output_ids = mx.array([block_tokens], dtype=mx.int32)
-
-            noise_embedding = target_model.model.embed_tokens(block_output_ids)
-
-            cache_len = draft_cache[0].offset
-            ctx_len = target_hidden.shape[1]
-            q_len = noise_embedding.shape[1]
-            draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
-
-            draft_hidden = draft_model(
-                noise_embedding=noise_embedding,
-                target_hidden=target_hidden,
-                mask=draft_mask,
-                cache=draft_cache,
-            )
-            draft_logits = target_model.lm_head(draft_hidden[:, -current_block_size + 1:, :])
-            sampled_tokens = sample(draft_logits, temperature)
-
-            mx.eval(sampled_tokens)
-
-            # Update block with draft predictions
-            block_tokens_updated = block_tokens.copy()
-            for i in range(sampled_tokens.shape[1]):
-                block_tokens_updated[i + 1] = int(sampled_tokens[0, i])
-
-        block_output_ids = mx.array([block_tokens_updated], dtype=mx.int32)
-
-        # --- Verify phase (lazy graph, sync once) ---
         verify_logits, _, verify_hidden = forward_with_hidden_states(
             target_model,
-            block_output_ids,
+            verify_input,
             cache=target_cache,
             capture_layers=target_layer_ids,
         )
         posterior = sample(verify_logits, temperature)
 
+        # Single eval for draft + verify
         mx.eval(posterior, *verify_hidden)
         mx.eval([c.state for c in target_cache])
 
-        # --- Accept/reject ---
-        draft_tokens = block_tokens_updated[1:]
-        target_tokens = posterior[0, :-1].tolist()
-        if isinstance(target_tokens, int):
-            target_tokens = [target_tokens]
+        # --- Accept/reject using MLX array ops ---
+        draft_arr = sampled_tokens[0]
+        target_arr = posterior[0, :-1]
+        matches = (draft_arr == target_arr)
+        match_cumsum = mx.cumsum(matches.astype(mx.int32))
+        positions = mx.arange(1, draft_arr.shape[0] + 1)
+        consecutive_mask = (match_cumsum == positions)
+        acceptance_length = int(mx.sum(consecutive_mask.astype(mx.int32)))
 
-        acceptance_length = 0
-        for i in range(len(draft_tokens)):
-            if draft_tokens[i] == target_tokens[i]:
-                acceptance_length += 1
-            else:
-                break
-
-        for i in range(acceptance_length):
-            output_ids_list.append(draft_tokens[i])
+        if acceptance_length > 0:
+            output_ids_list.extend(draft_arr[:acceptance_length].tolist())
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
 
         start += acceptance_length + 1
-
-        for tid in draft_tokens[:acceptance_length] + [correction_token]:
-            repeat_window.append(tid)
-            if len(repeat_window) > max_repeat_window:
-                repeat_window.pop(0)
 
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
@@ -282,8 +208,8 @@ def spec_generate(
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 
-        stats.acceptance_lengths.append(acceptance_length + 1)
         stats.spec_lengths.append(current_block_size - 1)
+        stats.acceptance_lengths.append(acceptance_length + 1)
         stats.accepted_tokens += acceptance_length
         stats.draft_steps += 1
         stats.total_tokens = len(output_ids_list) - num_input_tokens
@@ -297,6 +223,9 @@ def spec_generate(
             break
 
     stats.total_time = time.perf_counter() - t_start
+
+    if original is not None:
+        draft_model.num_draft_layers = original
 
     if stop_token_ids is not None:
         for i, tid in enumerate(output_ids_list[num_input_tokens:]):

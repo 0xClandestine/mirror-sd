@@ -62,7 +62,8 @@ def _eos_ids(tokenizer):
 
 
 PROMPTS = [
-    "The capital of France is",
+    # "The capital of France is",
+    "Why is the sky blue?",
     "Explain the theory of relativity in simple terms:",
     "Write a Python function to sort a list:",
     "What is the meaning of life?",
@@ -99,6 +100,8 @@ def main():
     parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length")
     parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
     parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
+    parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
+    parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -140,7 +143,7 @@ def main():
         p = prompts[0]
         tokens = tokenizer.encode(p)
         input_ids = mx.array(tokens)[None]
-        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids)
+        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block)
 
     # --- Baseline ---
     if args.no_baseline:
@@ -165,6 +168,10 @@ def main():
     mode = "MIRROR-SD" if args.mirror_sd else ("ANE" if args.ane else "DFLASH")
     if args.failfast:
         mode += "+FAILFAST"
+    if args.num_draft_layers is not None:
+        mode += f"+{args.num_draft_layers}L"
+    if args.adaptive_block:
+        mode += "+ADAPTIVE"
     print(f"\n{'='*60}")
     print(f"  {mode} (speculative decoding, block_size={config.block_size})")
     print(f"{'='*60}")
@@ -182,6 +189,8 @@ def main():
             failfast=args.failfast,
             failfast_tau=args.failfast_tau,
             failfast_max_spec=args.failfast_max_spec,
+            num_draft_layers=args.num_draft_layers,
+            adaptive_block=args.adaptive_block,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
@@ -205,7 +214,10 @@ def main():
     else:
         print(f"  {mode}:     {dflash_avg:6.1f} tok/s")
     print(f"  Avg accept: {dflash_accept_avg:.2f} tokens/block")
-    if args.failfast:
+    if args.adaptive_block:
+        dflash_spec_avg = sum(r[1].avg_spec_length for r in dflash_results) / len(dflash_results)
+        print(f"  Avg spec:   {dflash_spec_avg:.1f} tokens/block")
+    if args.failfast and not args.adaptive_block:
         dflash_spec_avg = sum(r[1].avg_spec_length for r in dflash_results) / len(dflash_results)
         print(f"  Avg spec:   {dflash_spec_avg:.1f} tokens/block")
     print(f"  Block size:  {config.block_size}")
