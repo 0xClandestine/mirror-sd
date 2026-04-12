@@ -185,7 +185,7 @@ def cmd_bench(args):
         formatted = format_prompt(state.tokenizer, p)
         tokens = state.tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
-        output_ids, stats = spec_generate(
+        output_ids, stats, _, _, _ = spec_generate(
             state.target_model, state.draft_model, input_ids,
             max_new_tokens=max_tokens, temperature=temperature,
             stop_token_ids=eos_ids,

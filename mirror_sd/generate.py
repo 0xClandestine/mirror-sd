@@ -128,7 +128,13 @@ def spec_generate(
     num_draft_layers: Optional[int] = None,
     adaptive_block: bool = True,
     kod: bool = False,
-) -> Tuple[mx.array, SpecDecodeStats]:
+    stream_callback=None,
+    prefill_step_size: int = 512,
+    prompt_cache=None,
+    cached_target_hidden=None,
+    cached_first_token=None,
+    prefill_callback=None,
+) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
     is_ane = hasattr(draft_model, 'ane')
@@ -170,30 +176,71 @@ def spec_generate(
     if isinstance(output_ids_list, int):
         output_ids_list = [output_ids_list]
 
-    target_cache = cache_module.make_prompt_cache(target_model)
+    if prompt_cache is not None:
+        target_cache = prompt_cache
+    else:
+        target_cache = cache_module.make_prompt_cache(target_model)
     draft_cache = draft_model.make_cache()
 
-    # Block size adaptation state
     recent_acceptances = []
     hybrid_window = 3
     min_block_size = 2
 
-    # KOD state: draft confidence tracking + cost model calibration
     kod_confs = []
     kod_accepts = []
     kod_obs = []
 
-    # --- Prefill ---
-    logits, embed, hidden_states = forward_with_hidden_states(
-        target_model, input_ids, cache=target_cache, capture_layers=target_layer_ids,
-    )
-    first_token = sample(logits[:, -1:, :], temperature)
+    num_input = input_ids.shape[1]
 
-    mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
+    if cached_target_hidden is not None and prompt_cache is not None:
+        # Full cache hit — skip prefill entirely
+        target_hidden = cached_target_hidden
+        if cached_first_token is not None:
+            first_token = mx.array([[cached_first_token]], dtype=mx.int32)
+        else:
+            last_ids = input_ids[:, -1:]
+            logits, _, _ = forward_with_hidden_states(
+                target_model, last_ids, cache=target_cache,
+                capture_layers=[],
+            )
+            first_token = sample(logits[:, -1:, :], temperature)
+            mx.eval(logits, first_token, *_flat_cache_states(target_cache))
+            cache_module.trim_prompt_cache(target_cache, 1)
+    elif num_input > prefill_step_size:
+        for start in range(0, num_input - prefill_step_size, prefill_step_size):
+            chunk = input_ids[:, start:start + prefill_step_size]
+            logits_chunk, _, _ = forward_with_hidden_states(
+                target_model, chunk, cache=target_cache, capture_layers=[],
+            )
+            mx.eval(logits_chunk, *_flat_cache_states(target_cache))
+            del logits_chunk
+        last_start = (num_input // prefill_step_size) * prefill_step_size
+        if last_start >= num_input:
+            last_start = max(0, num_input - prefill_step_size)
+        last_chunk = input_ids[:, last_start:]
+        logits, embed, hidden_states = forward_with_hidden_states(
+            target_model, last_chunk, cache=target_cache,
+            capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
+        target_hidden = extract_context_feature(hidden_states, target_layer_ids)
+    else:
+        logits, embed, hidden_states = forward_with_hidden_states(
+            target_model, input_ids, cache=target_cache,
+            capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
+        target_hidden = extract_context_feature(hidden_states, target_layer_ids)
 
-    output_ids_list.append(int(first_token[0, 0]))
+    first_tok = int(first_token[0, 0])
+    output_ids_list.append(first_tok)
+    if stream_callback is not None:
+        stream_callback(first_tok)
 
-    target_hidden = extract_context_feature(hidden_states, target_layer_ids)
+    if prefill_callback is not None:
+        prefill_callback(target_cache, target_hidden, first_tok)
 
     stats.prefill_time = time.perf_counter() - t_start
 
@@ -313,9 +360,15 @@ def spec_generate(
         acceptance_length = int(mx.sum(consecutive_mask.astype(mx.int32)))
 
         if acceptance_length > 0:
-            output_ids_list.extend(draft_arr[:acceptance_length].tolist())
+            accepted_toks = draft_arr[:acceptance_length].tolist()
+            output_ids_list.extend(accepted_toks)
+            if stream_callback is not None:
+                for t in accepted_toks:
+                    stream_callback(t)
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
+        if stream_callback is not None:
+            stream_callback(correction_token)
 
         start += acceptance_length + 1
 
@@ -361,7 +414,7 @@ def spec_generate(
 
     output_ids = mx.array([output_ids_list], dtype=mx.int32)
     stats.total_tokens = len(output_ids_list) - num_input_tokens
-    return output_ids, stats
+    return output_ids, stats, target_cache, draft_cache, target_hidden
 
 
 def _spec_generate_mirror_sd(

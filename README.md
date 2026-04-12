@@ -55,6 +55,31 @@ The 27B model uses a smaller block size because verify cost scales with block si
 | 8 | 5.33 | 22.8 | 0.92x |
 | 16 | 5.28 | 22.2 | 0.94x |
 
+## Kelly-Optimal Drafting (KOD)
+
+KOD selects the draft block size γ to maximize expected throughput, drawing on the [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) from gambling theory. In speculative decoding, each draft token is a "bet" costing compute; the "payout" is a verified token without running the target model. Fixed block size is flat betting — provably suboptimal when acceptance rate varies across contexts.
+
+KOD selects γ by maximizing:
+
+```
+throughput(γ) = E[accepted tokens | γ] / cost(γ)
+```
+
+Where:
+- `E[accepted tokens] = α(1 - α^(γ-1)) / (1 - α) + 1` (geometric series under iid acceptance)
+- `α` = observed acceptance rate (rolling window of last 8 iterations)
+- `cost(γ) = cost_a + cost_b × γ` (linear cost model auto-calibrated from iteration timing)
+
+The cost model is fitted via linear regression on observed `(block_size, iteration_time_ms)` pairs as they accumulate. This lets KOD adapt to any hardware/model combination without manual tuning.
+
+Key finding: draft model confidence (max softmax probability) is ~1.0 always for DFlash and provides no useful signal. KOD relies entirely on **observed acceptance rate** as the α estimate.
+
+| Mode | 8B speedup | 27B speedup |
+|---|---|---|
+| Fixed block | 3.25x | 0.94x |
+| Adaptive (heuristic thresholds) | 3.25x | 1.23x |
+| **KOD (Kelly-optimal)** | **3.55x** | **1.39x** |
+
 ## MLX Implementation
 
 The primary implementation runs both target and draft models on GPU via MLX.
@@ -219,6 +244,7 @@ references/         # Reference implementations and papers
 
 - [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036)
 - [Mirror Speculative Decoding](https://arxiv.org/abs/2510.13161)
+- [Token Wagering Model: Kelly-Optimal Drafting for Speculative Decoding](https://arxiv.org/abs/2504.08816)
 - [DFlash Models on HuggingFace](https://huggingface.co/collections/z-lab/dflash)
 
 ## License

@@ -52,7 +52,7 @@ def cmd_generate(args):
     stop_ids = get_stop_token_ids(tokenizer)
 
     print(f"\nGenerating (max {args.max_tokens} tokens, temperature={args.temperature})...")
-    output_ids, stats = spec_generate(
+    output_ids, stats, _, _, _ = spec_generate(
         target_model=target_model,
         draft_model=draft_model,
         input_ids=input_ids,
@@ -141,7 +141,7 @@ def cmd_bench(args):
 
     # Speculative decoding
     print("Running speculative decoding (DFlash)...")
-    output_ids, stats = spec_generate(
+    output_ids, stats, _, _, _ = spec_generate(
         target_model=target_model,
         draft_model=draft_model,
         input_ids=input_ids,

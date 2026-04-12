@@ -12,13 +12,11 @@ Usage:
 NO_THINK_SYSTEM = "/no_think"
 
 
-def format_prompt(tokenizer, user_message: str, system: str = NO_THINK_SYSTEM) -> str:
-    """Apply chat template with thinking disabled for DFlash compatibility.
+def format_prompt(tokenizer, user_message: str, system: str = NO_THINK_SYSTEM, enable_thinking: bool = False) -> str:
+    """Apply chat template.
 
-    The /no_think system prompt tells Qwen3/Qwen3.5 to skip thinking.
-    For Qwen3.5+, we also strip trailing think-end tags that
-    enable_thinking=False injects, since the DFlash draft model expects
-    the prompt to end at the assistant prefix.
+    By default thinking is disabled for DFlash compatibility.
+    Set enable_thinking=True to enable Qwen3/Qwen3.5 thinking mode.
     """
     messages = []
     if system:
@@ -28,17 +26,16 @@ def format_prompt(tokenizer, user_message: str, system: str = NO_THINK_SYSTEM) -
     try:
         result = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
         )
     except TypeError:
         result = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
 
-    # Strip trailing think tags that enable_thinking=False adds
-    # DFlash draft expects prompt to end at <|im_start|>assistant\n
-    import re
-    result = re.sub(r'(<\|im_start\|>assistant\n).*', r'\1', result)
+    if not enable_thinking:
+        import re
+        result = re.sub(r'(<\|im_start\|>assistant\n).*', r'\1', result)
     return result
 
 

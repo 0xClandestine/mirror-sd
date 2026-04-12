@@ -25,8 +25,8 @@ from .generate import spec_generate
 from .prompt import format_prompt, get_stop_token_ids
 
 
-def baseline_generate(model, tokenizer, prompt: str, max_tokens: int, temperature: float = 0.0, use_chat: bool = True):
-    formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
+def baseline_generate(model, tokenizer, prompt: str, max_tokens: int, temperature: float = 0.0, use_chat: bool = True, enable_thinking: bool = False):
+    formatted = format_prompt(tokenizer, prompt, enable_thinking=enable_thinking) if use_chat else prompt
     tokens = tokenizer.encode(formatted)
     input_ids = mx.array(tokens)[None]
     cache = cache_module.make_prompt_cache(model)
@@ -119,6 +119,7 @@ def main():
     parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
     parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate (now default)")
     parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompts without chat template (breaks DFlash acceptance)")
+    parser.add_argument("--think", action="store_true", help="Enable thinking mode (hurts DFlash acceptance)")
     parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8], help="Quantize draft model to N bits")
     parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size (use fixed block_size)")
     parser.add_argument("--kod", action="store_true", help="Kelly-Optimal Drafting: use draft confidence + cost model for block_size selection")
@@ -162,7 +163,7 @@ def main():
     # Warmup
     for _ in range(args.warmup):
         p = prompts[0]
-        formatted = format_prompt(tokenizer, p) if use_chat else p
+        formatted = format_prompt(tokenizer, p, enable_thinking=args.think) if use_chat else p
         tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
         spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block)
@@ -177,11 +178,10 @@ def main():
 
         baseline_results = []
         for prompt in prompts:
-            text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature, use_chat=use_chat)
+            text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature, use_chat=use_chat, enable_thinking=args.think)
             baseline_results.append((prompt, tps, text))
             short = prompt[:50] + "..." if len(prompt) > 50 else prompt
             print(f"  {short:55s} {tps:6.1f} tok/s")
-            print(f"    -> {text[:200]}")
 
         baseline_avg = sum(r[1] for r in baseline_results) / len(baseline_results)
         print(f"  {'AVERAGE':55s} {baseline_avg:6.1f} tok/s")
@@ -202,10 +202,10 @@ def main():
 
     dflash_results = []
     for prompt in prompts:
-        formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
+        formatted = format_prompt(tokenizer, prompt, enable_thinking=args.think) if use_chat else prompt
         tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
-        output_ids, stats = spec_generate(
+        output_ids, stats, _, _, _ = spec_generate(
             target_model, draft_model, input_ids,
             max_new_tokens=max_tokens,
             temperature=temperature,
@@ -223,7 +223,7 @@ def main():
         print(f"  {short:55s} {stats.tokens_per_sec:6.1f} tok/s  accept={stats.avg_acceptance_length:.2f}  steps={stats.draft_steps}")
         gen_only = output_ids[0, input_ids.shape[1]:].tolist() if output_ids.ndim == 2 else output_ids.tolist()
         gen_text = _strip_think(tokenizer.decode(gen_only, skip_special_tokens=True))
-        print(f"    -> {gen_text[:200]}")
+        print(f"    -> {gen_text}")
 
     dflash_avg = sum(r[1].tokens_per_sec for r in dflash_results) / len(dflash_results)
     dflash_accept_avg = sum(r[1].avg_acceptance_length for r in dflash_results) / len(dflash_results)
@@ -249,7 +249,7 @@ def main():
         print(f"  Avg spec:   {dflash_spec_avg:.1f} tokens/block")
     print(f"  Block size:  {config.block_size}")
     print(f"  Draft mode:  {'ANE' if args.ane else ('Mirror-SD' if args.mirror_sd else 'GPU')}")
-    print(f"  Chat fmt:    {'off (raw)' if args.raw_prompt else 'on (/no_think)'}")
+    print(f"  Chat fmt:    {'off (raw)' if args.raw_prompt else ('on (thinking)' if args.think else 'on (/no_think)')}")
 
     if (args.ane or args.mirror_sd) and dflash_results:
         stats0 = dflash_results[0][1]
