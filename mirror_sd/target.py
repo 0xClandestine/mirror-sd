@@ -18,6 +18,31 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def _get_inner_model(model):
+    """Get the inner model that has embed_tokens, layers, and norm.
+
+    Handles both Qwen3 (model.model) and Qwen3.5 (model.language_model.model).
+    """
+    inner = getattr(model, 'model', None) or getattr(model, 'language_model', None)
+    if inner is not None and not hasattr(inner, 'embed_tokens'):
+        inner = getattr(inner, 'model', inner)
+    return inner
+
+
+def get_embed_tokens(model):
+    """Get the embed_tokens layer from any model architecture."""
+    return _get_inner_model(model).embed_tokens
+
+
+def get_lm_head(model):
+    """Get the lm_head layer from any model architecture."""
+    if hasattr(model, 'lm_head') and model.lm_head is not None:
+        return model.lm_head
+    if hasattr(model, 'language_model') and hasattr(model.language_model, 'lm_head'):
+        return model.language_model.lm_head
+    return _get_inner_model(model).embed_tokens.as_linear
+
+
 def forward_with_hidden_states(
     model,
     inputs: mx.array,
@@ -45,15 +70,19 @@ def forward_with_hidden_states(
     if capture_layers is None:
         capture_layers = []
 
-    inner = model.model
+    inner = _get_inner_model(model)
     h = inner.embed_tokens(inputs)
     embed = h
 
     if cache is None:
-        cache = [None] * len(inner.layers)
+        from mlx_lm.models import cache as cache_module
+        cache = cache_module.make_prompt_cache(model)
 
-    from mlx_lm.models.base import create_attention_mask
-    mask = create_attention_mask(h, cache[0])
+    try:
+        from mlx_lm.models.base import create_attention_mask
+        mask = create_attention_mask(h, cache[0])
+    except TypeError:
+        mask = cache[0].make_mask(h.shape[1])
 
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
@@ -65,6 +94,8 @@ def forward_with_hidden_states(
 
     if hasattr(model, 'lm_head') and model.lm_head is not None:
         logits = model.lm_head(h)
+    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'lm_head'):
+        logits = model.language_model.lm_head(h)
     else:
         logits = inner.embed_tokens.as_linear(h)
 
@@ -102,15 +133,18 @@ def forward_prefix(
     if capture_layers is None:
         capture_layers = []
 
-    inner = model.model
+    inner = _get_inner_model(model)
     h = inner.embed_tokens(inputs)
     embed = h
 
     if cache is None:
         cache = [None] * len(inner.layers)
 
-    from mlx_lm.models.base import create_attention_mask
-    mask = create_attention_mask(h, cache[0])
+    try:
+        from mlx_lm.models.base import create_attention_mask
+        mask = create_attention_mask(h, cache[0])
+    except TypeError:
+        mask = cache[0].make_mask(h.shape[1])
 
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
@@ -154,7 +188,7 @@ def forward_suffix(
     if capture_layers is None:
         capture_layers = []
 
-    inner = model.model
+    inner = _get_inner_model(model)
 
     if cache is None:
         cache = [None] * len(inner.layers)

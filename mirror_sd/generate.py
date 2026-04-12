@@ -24,7 +24,18 @@ from .dflash import (
     DFlashKVCache,
     extract_context_feature, sample, make_draft_mask,
 )
-from .target import forward_with_hidden_states, forward_prefix, forward_suffix
+from .target import forward_with_hidden_states, forward_prefix, forward_suffix, get_embed_tokens, get_lm_head
+
+
+def _flat_cache_states(cache):
+    out = []
+    for c in cache:
+        s = c.state
+        if isinstance(s, list):
+            out.extend(s)
+        else:
+            out.append(s)
+    return out
 
 
 @dataclass
@@ -76,7 +87,7 @@ def spec_generate(
     failfast_tau: float = 0.4,
     failfast_max_spec: int = 64,
     num_draft_layers: Optional[int] = None,
-    adaptive_block: bool = False,
+    adaptive_block: bool = True,
 ) -> Tuple[mx.array, SpecDecodeStats]:
     from mlx_lm.models import cache as cache_module
 
@@ -122,15 +133,19 @@ def spec_generate(
     target_cache = cache_module.make_prompt_cache(target_model)
     draft_cache = draft_model.make_cache()
 
+    # Hybrid mode: adaptively adjust block size based on recent acceptance
+    recent_acceptances = []
+    hybrid_window = 3
+    min_block_size = 2
+
     # --- Prefill ---
     logits, embed, hidden_states = forward_with_hidden_states(
         target_model, input_ids, cache=target_cache, capture_layers=target_layer_ids,
     )
-    mx.eval(logits, embed, *hidden_states)
-    mx.eval([c.state for c in target_cache])
-
     first_token = sample(logits[:, -1:, :], temperature)
-    mx.eval(first_token)
+
+    mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
+
     output_ids_list.append(int(first_token[0, 0]))
 
     target_hidden = extract_context_feature(hidden_states, target_layer_ids)
@@ -141,7 +156,19 @@ def spec_generate(
     start = num_input_tokens
     while start < max_length:
         remaining = max_length - start
-        current_block_size = min(block_size, remaining + 1)
+
+        if adaptive_block and len(recent_acceptances) >= hybrid_window:
+            avg_accept = sum(recent_acceptances[-hybrid_window:]) / hybrid_window
+            if avg_accept < 1.0:
+                current_block_size = min_block_size
+            elif avg_accept < 2.0:
+                current_block_size = min(3, base_block_size)
+            else:
+                current_block_size = base_block_size
+        else:
+            current_block_size = base_block_size
+
+        current_block_size = min(current_block_size, remaining + 1)
 
         if current_block_size < 2:
             break
@@ -150,7 +177,7 @@ def spec_generate(
         anchor_token = output_ids_list[-1]
         block_tokens = [anchor_token] + [mask_token_id] * (current_block_size - 1)
         block_ids = mx.array([block_tokens], dtype=mx.int32)
-        noise_embedding = target_model.model.embed_tokens(block_ids)
+        noise_embedding = get_embed_tokens(target_model)(block_ids)
 
         cache_len = draft_cache[0].offset
         ctx_len = target_hidden.shape[1]
@@ -163,12 +190,10 @@ def spec_generate(
             mask=draft_mask_val,
             cache=draft_cache,
         )
-        draft_logits = target_model.lm_head(draft_hidden[:, -current_block_size + 1:, :])
+        draft_logits = get_lm_head(target_model)(draft_hidden[:, -current_block_size + 1:, :])
         sampled_tokens = sample(draft_logits, temperature)
 
         # --- Crop draft cache BEFORE start increment ---
-        # Matches PyTorch reference: past_key_values_draft.crop(start)
-        # Removes unverified draft noise K/V, keeping only verified prefix
         for c in draft_cache:
             c.crop(start)
 
@@ -184,8 +209,8 @@ def spec_generate(
         )
         posterior = sample(verify_logits, temperature)
 
-        mx.eval(posterior, *verify_hidden)
-        mx.eval([c.state for c in target_cache])
+        # Combined eval: posterior + hidden states + cache states in one call
+        mx.eval(posterior, *verify_hidden, *_flat_cache_states(target_cache))
 
         # --- Accept/reject using MLX array ops ---
         draft_arr = sampled_tokens[0]
@@ -208,6 +233,10 @@ def spec_generate(
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
+
+        recent_acceptances.append(acceptance_length)
+        if len(recent_acceptances) > hybrid_window * 2:
+            recent_acceptances = recent_acceptances[-hybrid_window:]
 
         stats.spec_lengths.append(current_block_size - 1)
         stats.acceptance_lengths.append(acceptance_length + 1)
@@ -273,7 +302,8 @@ def _spec_generate_mirror_sd(
     if target_layer_ids is None:
         target_layer_ids = draft_model.config.target_layer_ids
 
-    num_target_layers = len(target_model.model.layers)
+    from .target import _get_inner_model as _gim
+    num_target_layers = len(_gim(target_model).layers)
     exit_layer = _pick_exit_layer(target_layer_ids, num_target_layers)
 
     is_ane = hasattr(draft_model, 'ane')
@@ -329,7 +359,7 @@ def _spec_generate_mirror_sd(
             mask=draft_mask,
             cache=dc,
         )
-        draft_logits = target_model.lm_head(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         draft_result = sampled_tokens
@@ -359,7 +389,7 @@ def _spec_generate_mirror_sd(
             mask=draft_mask,
             cache=dc_active,
         )
-        draft_logits = target_model.lm_head(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         if use_gpu:
@@ -379,7 +409,7 @@ def _spec_generate_mirror_sd(
     # After this, target_hidden is current and draft_cache is consistent.
     if start < max_length:
         block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-        noise_embedding = target_model.model.embed_tokens(mx.array([block_tokens], dtype=mx.int32))
+        noise_embedding = get_embed_tokens(target_model)(mx.array([block_tokens], dtype=mx.int32))
 
         cache_len = draft_cache[0].offset
         ctx_len = target_hidden.shape[1]
@@ -391,7 +421,7 @@ def _spec_generate_mirror_sd(
             mask=draft_mask,
             cache=draft_cache,
         )
-        draft_logits = target_model.lm_head(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
 
@@ -451,7 +481,7 @@ def _spec_generate_mirror_sd(
     # and cropped draft_cache from the serial first iteration)
     if start < max_length and draft_result is None:
         draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-        noise_embedding_seed = target_model.model.embed_tokens(
+        noise_embedding_seed = get_embed_tokens(target_model)(
             mx.array([draft_block_tokens], dtype=mx.int32)
         )
         mx.eval(noise_embedding_seed)
@@ -585,7 +615,7 @@ def _spec_generate_mirror_sd(
                 else:
                     ext_tokens = [all_sampled[-1]] + [mask_token_id] * (ext_bs - 1)
 
-                ne = target_model.model.embed_tokens(mx.array([ext_tokens], dtype=mx.int32))
+                ne = get_embed_tokens(target_model)(mx.array([ext_tokens], dtype=mx.int32))
                 mx.eval(ne)
 
                 cl = draft_cache[0].offset
@@ -594,7 +624,7 @@ def _spec_generate_mirror_sd(
                 dm = make_draft_mask(ql, ctx, cl)
 
                 dh = draft_model(noise_embedding=ne, target_hidden=target_hidden, mask=dm, cache=draft_cache)
-                dl = target_model.lm_head(dh[:, -(ql - 1):, :])
+                dl = get_lm_head(target_model)(dh[:, -(ql - 1):, :])
                 st = sample(dl, temperature)
                 mx.eval(st)
 
@@ -609,7 +639,7 @@ def _spec_generate_mirror_sd(
             next_spec_len = total_spec_len
         else:
             draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
-            noise_embedding = target_model.model.embed_tokens(
+            noise_embedding = get_embed_tokens(target_model)(
                 mx.array([draft_block_tokens], dtype=mx.int32)
             )
             mx.eval(noise_embedding)
@@ -762,7 +792,7 @@ def _spec_generate_parallel(
             mask=draft_mask,
             cache=dc_active,
         )
-        draft_logits = target_model.lm_head(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         if use_gpu:
@@ -774,7 +804,7 @@ def _spec_generate_parallel(
 
     # Kick off first draft
     block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-    noise_embedding = target_model.model.embed_tokens(mx.array([block_tokens], dtype=mx.int32))
+    noise_embedding = get_embed_tokens(target_model)(mx.array([block_tokens], dtype=mx.int32))
     mx.eval(noise_embedding)
     t_draft_start = time.perf_counter()
     draft_thread = threading.Thread(target=_run_draft, args=(target_hidden, noise_embedding, draft_cache, 0))
@@ -885,7 +915,7 @@ def _spec_generate_parallel(
                 # Start next draft in parallel with upcoming verify
                 if start < max_length:
                     next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-                    next_noise_embedding = target_model.model.embed_tokens(
+                    next_noise_embedding = get_embed_tokens(target_model)(
                         mx.array([next_block_tokens], dtype=mx.int32)
                     )
                     mx.eval(next_noise_embedding)
@@ -902,7 +932,7 @@ def _spec_generate_parallel(
         # Start next draft in parallel with upcoming verify
         if start < max_length:
             next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-            next_noise_embedding = target_model.model.embed_tokens(
+            next_noise_embedding = get_embed_tokens(target_model)(
                 mx.array([next_block_tokens], dtype=mx.int32)
             )
             mx.eval(next_noise_embedding)

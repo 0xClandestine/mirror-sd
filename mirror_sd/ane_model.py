@@ -228,7 +228,7 @@ class ANEDraftModel:
             )
         k = self.kernels
         self._write_mlx_2d(self.b_hidden, noise_embedding)
-        self._write_mlx_2d(self.b_target, target_hidden)
+        self._write_mlx_2d(self.b_target, target_hidden / 2048.0)
 
         self._compute_rope(rope_offset, ctx_len)
         self._compute_attn_mask(ctx_len)

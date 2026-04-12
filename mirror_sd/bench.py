@@ -54,7 +54,9 @@ def baseline_generate(model, tokenizer, prompt: str, max_tokens: int, temperatur
 
     elapsed = time.perf_counter() - t0
     n_gen = len(generated)
-    return tokenizer.decode(generated), n_gen / max(elapsed, 1e-9)
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    text = _strip_think(text)
+    return text, n_gen / max(elapsed, 1e-9)
 
 
 def _eos_ids(tokenizer):
@@ -67,8 +69,16 @@ def _eos_ids(tokenizer):
     return ids
 
 
+def _strip_think(text: str) -> str:
+    """Strip Qwen3 thinking blocks and assistant prefix from decoded text."""
+    import re
+    text = re.sub(r'^\s*assistant\s*', '', text)
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
 PROMPTS = [
-    # "The capital of France is",
+    "The capital of France is",
     "Why is the sky blue?",
     "Explain the theory of relativity in simple terms:",
     "Write a Python function to sort a list:",
@@ -78,13 +88,13 @@ PROMPTS = [
 
 MATH_CODE_PROMPTS = [
     "What is 15% of 200?",
-    # "If a train travels 60 mph for 2.5 hours, how far does it go?",
-    # "Solve for x: 3x + 7 = 22",
-    # "Write a Python function to compute the Fibonacci sequence:",
-    # "Write a Python function to check if a string is a palindrome:",
-    # "Implement binary search in Python:",
-    # "What is the time complexity of merge sort?",
-    # "Find the derivative of f(x) = x^3 + 2x^2 - 5x + 1",
+    "If a train travels 60 mph for 2.5 hours, how far does it go?",
+    "Solve for x: 3x + 7 = 22",
+    "Write a Python function to compute the Fibonacci sequence:",
+    "Write a Python function to check if a string is a palindrome:",
+    "Implement binary search in Python:",
+    "What is the time complexity of merge sort?",
+    "Find the derivative of f(x) = x^3 + 2x^2 - 5x + 1",
 ]
 
 
@@ -107,14 +117,16 @@ def main():
     parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
     parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
-    parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
+    parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate (now default)")
     parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompts without chat template (breaks DFlash acceptance)")
+    parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8], help="Quantize draft model to N bits")
+    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size (use fixed block_size)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
     target_model, tokenizer = mlx_load(args.model)
     print(f"Loading draft:  {args.draft}")
-    draft_model, config = load_dflash_model(args.draft)
+    draft_model, config = load_dflash_model(args.draft, quantize=args.quantize_draft)
     if args.block_size is not None:
         config.block_size = args.block_size
         draft_model.block_size = args.block_size
@@ -179,7 +191,7 @@ def main():
         mode += "+FAILFAST"
     if args.num_draft_layers is not None:
         mode += f"+{args.num_draft_layers}L"
-    if args.adaptive_block:
+    if not args.no_adaptive:
         mode += "+ADAPTIVE"
     print(f"\n{'='*60}")
     print(f"  {mode} (speculative decoding, block_size={config.block_size})")
@@ -200,13 +212,13 @@ def main():
             failfast_tau=args.failfast_tau,
             failfast_max_spec=args.failfast_max_spec,
             num_draft_layers=args.num_draft_layers,
-            adaptive_block=args.adaptive_block,
+            adaptive_block=not args.no_adaptive,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
         print(f"  {short:55s} {stats.tokens_per_sec:6.1f} tok/s  accept={stats.avg_acceptance_length:.2f}  steps={stats.draft_steps}")
         gen_only = output_ids[0, input_ids.shape[1]:].tolist() if output_ids.ndim == 2 else output_ids.tolist()
-        gen_text = tokenizer.decode(gen_only)
+        gen_text = _strip_think(tokenizer.decode(gen_only, skip_special_tokens=True))
         print(f"    -> {gen_text[:200]}")
 
     dflash_avg = sum(r[1].tokens_per_sec for r in dflash_results) / len(dflash_results)

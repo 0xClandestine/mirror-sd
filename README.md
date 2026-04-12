@@ -20,25 +20,53 @@ DECODE LOOP:
   5. Crop caches, update target_hidden
 ```
 
+## Benchmarks
+
+M4 Pro (64GB), MLX, greedy decoding (`temperature=0.0`), `/no_think` chat template, 8 math/code prompts, 256 tokens each.
+
+### Qwen3-8B
+
+| Metric | Value |
+|--------|-------|
+| Baseline (autoregressive) | 27.0 tok/s |
+| DFlash speculative | 87.6 tok/s |
+| **Speedup** | **3.25x** |
+| Avg acceptance length | 9.31 |
+| Block size | 16 |
+
+### Qwen3.5-27B-4bit
+
+| Metric | Value |
+|--------|-------|
+| Baseline (autoregressive) | 25.0 tok/s |
+| DFlash speculative | 30.8 tok/s |
+| **Speedup** | **1.23x** |
+| Avg acceptance length | 3.05 |
+| Block size | 4 (adaptive) |
+
+The 27B model uses a smaller block size because verify cost scales with block size (~20ms/tok for 4 tokens vs ~37ms for single-token decode). With block_size=16, verify is too expensive for the acceptance rate, resulting in a net slowdown. Adaptive block sizing automatically shrinks the block when recent acceptance drops, avoiding wasted verify compute.
+
+### Block size sweep (Qwen3.5-27B-4bit, 128 tokens)
+
+| Block Size | Avg Accept | tok/s | Speedup |
+|---|---|---|---|
+| 2 | 1.89 | 22.2 | 0.90x |
+| **4** | **3.33** | **29.0** | **1.17x** |
+| 8 | 5.33 | 22.8 | 0.92x |
+| 16 | 5.28 | 22.2 | 0.94x |
+
 ## MLX Implementation
 
 The primary implementation runs both target and draft models on GPU via MLX.
 
-<!--### Benchmarks (Qwen3-8B, M4 Pro)
-
-| Metric | Value |
-|--------|-------|
-| Baseline (autoregressive) | 12.4 tok/s |
-| DFlash speculative | 15.8 tok/s |
-| Speedup | **1.27x** |
-| Avg acceptance length | 3.01 |-->
-
 ### Key implementation details
 
 - Draft model loads in **bf16** to match the target model's dtype — this was the single biggest acceptance rate improvement (+50%)
-- DFlash generates blocks of 16 tokens per forward pass via non-causal attention
+- DFlash generates blocks of tokens per forward pass via non-causal attention (block_size=16 for 8B, block_size=4 for 27B)
 - 5 target hidden features extracted from layers uniformly distributed through the target model, injected into K/V of every draft layer
 - Draft model shares embedding and `lm_head` with target (only transformer layers trained)
+- **Combined eval** — draft, verify, and cache state updates are fused into a single `mx.eval()` call, eliminating redundant GPU sync points
+- **Adaptive block sizing** — block size shrinks when recent acceptance is low (avg <1.0 → block 2, avg <2.0 → block 3), avoiding wasted verify compute on rejected drafts
 - Repetition detection prevents degenerate accept/reject loops
 
 ## ANE Execution Path
@@ -168,10 +196,11 @@ print(f"Speed: {stats.tokens_per_sec:.1f} tok/s, "
 ```
 mirror_sd/          # MLX implementation
 ├── dflash.py       # DFlash draft model (target-aware attention + block diffusion)
-├── target.py       # Target model integration (hidden state capture)
-├── generate.py     # Speculative decoding loop
-├── loader.py       # Weight loading + HuggingFace conversion
+├── target.py       # Target model integration (hidden state capture + Qwen3.5 support)
+├── generate.py     # Speculative decoding loop (combined eval + adaptive block)
+├── loader.py       # Weight loading + quantization support
 ├── bench.py        # Benchmark: baseline vs DFlash
+├── prompt.py       # Chat template formatting (/no_think for DFlash compatibility)
 └── cli.py          # CLI entry point
 
 ane/                # ANE implementation (Rust + PyO3)

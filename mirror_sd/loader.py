@@ -21,6 +21,7 @@ def load_dflash_model(
     model_path: str,
     config_overrides: Optional[Dict] = None,
     dtype: mx.Dtype = mx.bfloat16,
+    quantize: Optional[int] = None,
 ) -> Tuple[DFlashDraftModel, DFlashConfig]:
     """Load a DFlash draft model from a HuggingFace model directory.
 
@@ -28,6 +29,7 @@ def load_dflash_model(
         model_path: Path to local model directory or HuggingFace repo ID
         config_overrides: Optional config overrides
         dtype: Target dtype for model weights
+        quantize: If set, quantize the model to this many bits (4 or 8)
 
     Returns:
         draft_model: DFlashDraftModel with loaded weights
@@ -46,6 +48,10 @@ def load_dflash_model(
     weights = draft_model.sanitize(weights)
     draft_model.load_weights(list(weights.items()))
     mx.eval(draft_model.parameters())
+
+    if quantize is not None:
+        nn.quantize(draft_model, group_size=64, bits=quantize)
+        mx.eval(draft_model.parameters())
 
     return draft_model, config
 
