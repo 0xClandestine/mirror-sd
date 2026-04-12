@@ -4,6 +4,10 @@ Usage:
     python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
     python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --ane
     python -m mirror_sd.bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --prompt "Explain quantum computing:" --max-tokens 256
+
+By default, prompts are wrapped in the Qwen3 chat template with /no_think
+to disable thinking mode (required for good DFlash acceptance).
+Use --raw-prompt to pass raw text without chat formatting.
 """
 
 import argparse
@@ -18,10 +22,12 @@ from .dflash import sample, make_draft_mask
 from .loader import load_dflash_model
 from .target import forward_with_hidden_states, extract_context_feature
 from .generate import spec_generate
+from .prompt import format_prompt, get_stop_token_ids
 
 
-def baseline_generate(model, tokenizer, prompt: str, max_tokens: int, temperature: float = 0.0):
-    tokens = tokenizer.encode(prompt)
+def baseline_generate(model, tokenizer, prompt: str, max_tokens: int, temperature: float = 0.0, use_chat: bool = True):
+    formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
+    tokens = tokenizer.encode(formatted)
     input_ids = mx.array(tokens)[None]
     cache = cache_module.make_prompt_cache(model)
 
@@ -102,6 +108,7 @@ def main():
     parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
     parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
+    parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompts without chat template (breaks DFlash acceptance)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -136,12 +143,14 @@ def main():
         prompts = PROMPTS
     max_tokens = args.max_tokens
     temperature = args.temperature
-    eos_ids = list(_eos_ids(tokenizer)) or None
+    use_chat = not args.raw_prompt
+    eos_ids = get_stop_token_ids(tokenizer) or None
 
     # Warmup
     for _ in range(args.warmup):
         p = prompts[0]
-        tokens = tokenizer.encode(p)
+        formatted = format_prompt(tokenizer, p) if use_chat else p
+        tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
         spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block)
 
@@ -155,7 +164,7 @@ def main():
 
         baseline_results = []
         for prompt in prompts:
-            text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature)
+            text, tps = baseline_generate(target_model, tokenizer, prompt, max_tokens, temperature, use_chat=use_chat)
             baseline_results.append((prompt, tps, text))
             short = prompt[:50] + "..." if len(prompt) > 50 else prompt
             print(f"  {short:55s} {tps:6.1f} tok/s")
@@ -178,7 +187,8 @@ def main():
 
     dflash_results = []
     for prompt in prompts:
-        tokens = tokenizer.encode(prompt)
+        formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
+        tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
         output_ids, stats = spec_generate(
             target_model, draft_model, input_ids,
@@ -195,7 +205,8 @@ def main():
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
         print(f"  {short:55s} {stats.tokens_per_sec:6.1f} tok/s  accept={stats.avg_acceptance_length:.2f}  steps={stats.draft_steps}")
-        gen_text = tokenizer.decode(output_ids.tolist() if hasattr(output_ids, 'tolist') else list(output_ids))
+        gen_only = output_ids[0, input_ids.shape[1]:].tolist() if output_ids.ndim == 2 else output_ids.tolist()
+        gen_text = tokenizer.decode(gen_only)
         print(f"    -> {gen_text[:200]}")
 
     dflash_avg = sum(r[1].tokens_per_sec for r in dflash_results) / len(dflash_results)
@@ -222,6 +233,7 @@ def main():
         print(f"  Avg spec:   {dflash_spec_avg:.1f} tokens/block")
     print(f"  Block size:  {config.block_size}")
     print(f"  Draft mode:  {'ANE' if args.ane else ('Mirror-SD' if args.mirror_sd else 'GPU')}")
+    print(f"  Chat fmt:    {'off (raw)' if args.raw_prompt else 'on (/no_think)'}")
 
     if (args.ane or args.mirror_sd) and dflash_results:
         stats0 = dflash_results[0][1]

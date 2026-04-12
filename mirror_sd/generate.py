@@ -138,7 +138,7 @@ def spec_generate(
     stats.prefill_time = time.perf_counter() - t_start
 
     # --- Decode ---
-    start = num_input_tokens + 1
+    start = num_input_tokens
     while start < max_length:
         remaining = max_length - start
         current_block_size = min(block_size, remaining + 1)
@@ -166,8 +166,13 @@ def spec_generate(
         draft_logits = target_model.lm_head(draft_hidden[:, -current_block_size + 1:, :])
         sampled_tokens = sample(draft_logits, temperature)
 
+        # --- Crop draft cache BEFORE start increment ---
+        # Matches PyTorch reference: past_key_values_draft.crop(start)
+        # Removes unverified draft noise K/V, keeping only verified prefix
+        for c in draft_cache:
+            c.crop(start)
+
         # --- Verify phase: fused with draft via MLX array ops ---
-        # Build verify input using mx.concatenate (no .tolist round-trip to Python)
         anchor_arr = mx.array([[anchor_token]], dtype=mx.int32)
         verify_input = mx.concatenate([anchor_arr, sampled_tokens], axis=1)
 
@@ -179,7 +184,6 @@ def spec_generate(
         )
         posterior = sample(verify_logits, temperature)
 
-        # Single eval for draft + verify
         mx.eval(posterior, *verify_hidden)
         mx.eval([c.state for c in target_cache])
 
@@ -202,9 +206,6 @@ def spec_generate(
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
-
-        for c in draft_cache:
-            c.crop(start)
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 
@@ -309,7 +310,7 @@ def _spec_generate_mirror_sd(
     stats.prefill_time = time.perf_counter() - t_start
 
     # --- Decode with Mirror-SD early-exit ---
-    start = num_input_tokens + 1
+    start = num_input_tokens
     repeat_window = []
     max_repeat_window = 4
 
@@ -377,7 +378,7 @@ def _spec_generate_mirror_sd(
     #    draft_cache (precomputed draft adds entries, then first-iter draft adds more)
     # After this, target_hidden is current and draft_cache is consistent.
     if start < max_length:
-        block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (block_size - 1)
+        block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
         noise_embedding = target_model.model.embed_tokens(mx.array([block_tokens], dtype=mx.int32))
 
         cache_len = draft_cache[0].offset
@@ -423,6 +424,10 @@ def _spec_generate_mirror_sd(
             output_ids_list.append(draft_tokens[i])
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
+
+        for c in draft_cache:
+            c.crop(start)
+
         start += acceptance_length + 1
 
         for tid in draft_tokens[:acceptance_length] + [correction_token]:
@@ -433,9 +438,6 @@ def _spec_generate_mirror_sd(
         n_to_trim_target = block_size - acceptance_length - 1
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
-
-        for c in draft_cache:
-            c.crop(start)
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 
@@ -448,7 +450,7 @@ def _spec_generate_mirror_sd(
     # Seed draft_result for the Mirror-SD loop (uses updated target_hidden
     # and cropped draft_cache from the serial first iteration)
     if start < max_length and draft_result is None:
-        draft_block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (block_size - 1)
+        draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
         noise_embedding_seed = target_model.model.embed_tokens(
             mx.array([draft_block_tokens], dtype=mx.int32)
         )
@@ -484,7 +486,7 @@ def _spec_generate_mirror_sd(
             draft_thread = None
 
         sampled_tokens = draft_result
-        block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (current_block_size - 1)
+        block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
         block_tokens_updated = block_tokens.copy()
 
         if sampled_tokens is not None:
@@ -542,6 +544,9 @@ def _spec_generate_mirror_sd(
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
 
+        for c in draft_cache:
+            c.crop(start)
+
         start += acceptance_length + 1
 
         for tid in draft_tokens[:acceptance_length] + [correction_token]:
@@ -552,9 +557,6 @@ def _spec_generate_mirror_sd(
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
-
-        for c in draft_cache:
-            c.crop(start)
 
         target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 
@@ -579,7 +581,7 @@ def _spec_generate_mirror_sd(
                     break
 
                 if ext == 0:
-                    ext_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (ext_bs - 1)
+                    ext_tokens = [output_ids_list[-1]] + [mask_token_id] * (ext_bs - 1)
                 else:
                     ext_tokens = [all_sampled[-1]] + [mask_token_id] * (ext_bs - 1)
 
@@ -606,7 +608,7 @@ def _spec_generate_mirror_sd(
             draft_result = mx.array([all_sampled], dtype=mx.int32)
             next_spec_len = total_spec_len
         else:
-            draft_block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (current_block_size - 1)
+            draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
             noise_embedding = target_model.model.embed_tokens(
                 mx.array([draft_block_tokens], dtype=mx.int32)
             )
@@ -726,7 +728,7 @@ def _spec_generate_parallel(
     stats.prefill_time = time.perf_counter() - t_start
 
     # --- Decode with pipelined ANE||GPU ---
-    start = num_input_tokens + 1
+    start = num_input_tokens
     repeat_window = []
     max_repeat_window = 4
 
@@ -771,7 +773,7 @@ def _spec_generate_parallel(
         draft_result = sampled_tokens
 
     # Kick off first draft
-    block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (block_size - 1)
+    block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
     noise_embedding = target_model.model.embed_tokens(mx.array([block_tokens], dtype=mx.int32))
     mx.eval(noise_embedding)
     t_draft_start = time.perf_counter()
@@ -809,7 +811,7 @@ def _spec_generate_parallel(
         draft_time = t_draft_done - t_draft_start
 
         sampled_tokens = draft_result
-        block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (current_block_size - 1)
+        block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
         block_tokens_updated = block_tokens.copy()
         n_sampled = sampled_tokens.shape[1] if sampled_tokens.ndim > 1 else 1
         for i in range(min(n_sampled, current_block_size - 1)):
@@ -847,6 +849,9 @@ def _spec_generate_parallel(
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
 
+        for c in draft_cache:
+            c.crop(start)
+
         start += acceptance_length + 1
 
         for tid in draft_tokens[:acceptance_length] + [correction_token]:
@@ -857,9 +862,6 @@ def _spec_generate_parallel(
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
-
-        for c in draft_cache:
-            c.crop(start)
 
         new_target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
 
@@ -882,7 +884,7 @@ def _spec_generate_parallel(
             else:
                 # Start next draft in parallel with upcoming verify
                 if start < max_length:
-                    next_block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (block_size - 1)
+                    next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
                     next_noise_embedding = target_model.model.embed_tokens(
                         mx.array([next_block_tokens], dtype=mx.int32)
                     )
@@ -899,7 +901,7 @@ def _spec_generate_parallel(
 
         # Start next draft in parallel with upcoming verify
         if start < max_length:
-            next_block_tokens = [output_ids_list[start - 1]] + [mask_token_id] * (block_size - 1)
+            next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
             next_noise_embedding = target_model.model.embed_tokens(
                 mx.array([next_block_tokens], dtype=mx.int32)
             )

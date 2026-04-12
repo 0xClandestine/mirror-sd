@@ -26,25 +26,21 @@ def forward_with_hidden_states(
 ) -> Tuple[mx.array, mx.array, List[mx.array]]:
     """Run the target model forward pass while capturing hidden states.
 
-    Captures **pre-layer** activations (the hidden state BEFORE each
-    specified layer processes it), matching the DFlash training convention.
-
-    Works with any mlx-lm model that has:
-      - model.model.embed_tokens
-      - model.model.layers
-      - model.model.norm
-      - model.lm_head (or model.model.embed_tokens.as_linear for tied weights)
+    Captures **post-layer** activations (the hidden state AFTER each
+    specified layer processes it), matching the HuggingFace convention
+    where output.hidden_states[layer_id + 1] = output of layer layer_id.
+    This matches the DFlash training convention used in the PyTorch reference.
 
     Args:
         model: The mlx-lm model
         inputs: Token IDs [B, L]
         cache: KV cache list
-        capture_layers: Which layer indices to capture pre-layer hidden states from
+        capture_layers: Which layer indices to capture post-layer hidden states from
 
     Returns:
         logits: [B, L, vocab_size]
         embed: Token embeddings [B, L, hidden_size]
-        hidden_states: List of pre-layer hidden state tensors, one per capture_layer
+        hidden_states: List of post-layer hidden state tensors, one per capture_layer
     """
     if capture_layers is None:
         capture_layers = []
@@ -61,9 +57,9 @@ def forward_with_hidden_states(
 
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
+        h = layer(h, mask, cache=c)
         if i in capture_layers:
             captured[i] = h
-        h = layer(h, mask, cache=c)
 
     h = inner.norm(h)
 
@@ -95,12 +91,12 @@ def forward_prefix(
         cache: KV cache list
         exit_layer: Layer index at which to stop (inclusive). Hidden state
                     AFTER this layer is the early-exit hidden state.
-        capture_layers: Additional layers to capture pre-layer hidden states from
+        capture_layers: Additional layers to capture post-layer hidden states from
 
     Returns:
         h: Hidden state after exit_layer [B, L, hidden_size]
         embed: Token embeddings [B, L, hidden_size]
-        captured: List of pre-layer hidden state tensors for capture_layers
+        captured: List of post-layer hidden state tensors for capture_layers
         mask: Attention mask (needed for suffix continuation)
     """
     if capture_layers is None:
@@ -118,9 +114,9 @@ def forward_prefix(
 
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
+        h = layer(h, mask, cache=c)
         if i in capture_layers:
             captured[i] = h
-        h = layer(h, mask, cache=c)
         if i == exit_layer:
             break
 
@@ -149,11 +145,11 @@ def forward_suffix(
         cache: KV cache list (must already have prefix layers cached)
         start_layer: First layer to run (exit_layer + 1)
         mask: Attention mask (from forward_prefix)
-        capture_layers: Additional layers to capture pre-layer hidden states from
+        capture_layers: Additional layers to capture post-layer hidden states from
 
     Returns:
         logits: [B, L, vocab_size]
-        hidden_states: List of pre-layer hidden state tensors for capture_layers
+        hidden_states: List of post-layer hidden state tensors for capture_layers
     """
     if capture_layers is None:
         capture_layers = []
@@ -165,9 +161,9 @@ def forward_suffix(
 
     captured = {}
     for i in range(start_layer, len(inner.layers)):
+        h = inner.layers[i](h, mask, cache=cache[i])
         if i in capture_layers:
             captured[i] = h
-        h = inner.layers[i](h, mask, cache=cache[i])
 
     h = inner.norm(h)
 

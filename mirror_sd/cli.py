@@ -13,6 +13,8 @@ from typing import Optional
 
 import mlx.core as mx
 
+from .prompt import format_prompt, get_stop_token_ids
+
 
 def cmd_generate(args):
     from mlx_lm import load as mlx_load
@@ -42,15 +44,12 @@ def cmd_generate(args):
     print(f"DFlash config: hidden={config.hidden_size}, layers={config.num_hidden_layers}, "
           f"block_size={config.block_size}, target_layers={config.target_layer_ids}")
 
-    tokens = tokenizer.encode(args.prompt)
+    use_chat = not args.raw_prompt
+    formatted = format_prompt(tokenizer, args.prompt) if use_chat else args.prompt
+    tokens = tokenizer.encode(formatted)
     input_ids = mx.array(tokens)[None]
 
-    stop_ids = []
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        if isinstance(tokenizer.eos_token_id, list):
-            stop_ids = tokenizer.eos_token_id
-        else:
-            stop_ids = [tokenizer.eos_token_id]
+    stop_ids = get_stop_token_ids(tokenizer)
 
     print(f"\nGenerating (max {args.max_tokens} tokens, temperature={args.temperature})...")
     output_ids, stats = spec_generate(
@@ -104,16 +103,13 @@ def cmd_bench(args):
         ane_model.gpu_fallback = draft_model
         draft_model = ane_model
 
+    use_chat = not args.raw_prompt
     prompt = args.prompt or "The meaning of life is"
-    tokens = tokenizer.encode(prompt)
+    formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
+    tokens = tokenizer.encode(formatted)
     input_ids = mx.array(tokens)[None]
 
-    stop_ids = []
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        if isinstance(tokenizer.eos_token_id, list):
-            stop_ids = tokenizer.eos_token_id
-        else:
-            stop_ids = [tokenizer.eos_token_id]
+    stop_ids = get_stop_token_ids(tokenizer)
 
     # Baseline (autoregressive)
     print("\nRunning baseline (autoregressive)...")
@@ -191,6 +187,7 @@ def main():
     gen_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     gen_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
     gen_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
+    gen_parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompt without chat template (breaks DFlash acceptance)")
 
     # convert
     conv_parser = subparsers.add_parser("convert", help="Convert DFlash model to MLX format")
@@ -211,6 +208,7 @@ def main():
     bench_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     bench_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
     bench_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
+    bench_parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompt without chat template (breaks DFlash acceptance)")
 
     args = parser.parse_args()
 
