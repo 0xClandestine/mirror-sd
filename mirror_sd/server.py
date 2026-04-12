@@ -60,10 +60,17 @@ class SpecServer:
         target_cache, rest_tokens, cache_count = self._fetch_cache(tokens)
         self._log_cache()
 
-        if target_cache is not None and len(rest_tokens) > 0:
+        if target_cache is not None and len(rest_tokens) == 0:
+            # Full cache hit — pass last prefill_step_size tokens so spec_generate
+            # can capture target_hidden from capture_layers forward.
+            # These tokens are already in the KV cache, so this re-prefills them,
+            # but it's the only way to get target_hidden for the draft model.
+            # After generation, LRUPromptCache will store the longer entry and
+            # evict the old shorter one (since caches are trimmable).
+            last_n = min(self.args.prefill_step_size, len(tokens))
+            input_ids = mx.array(tokens[-last_n:])[None]
+        elif target_cache is not None and len(rest_tokens) > 0:
             input_ids = mx.array(rest_tokens)[None]
-        elif target_cache is not None and len(rest_tokens) == 0:
-            input_ids = mx.array(tokens)[None]
         else:
             target_cache = None
             input_ids = mx.array(tokens)[None]
@@ -80,7 +87,7 @@ class SpecServer:
 
         all_tokens = tokens + output_ids[0, len(tokens):].tolist()
         self.prompt_cache.insert_cache(
-            self.model_key, all_tokens, final_cache, cache_type="system"
+            self.model_key, all_tokens, final_cache
         )
 
         return output_ids, stats

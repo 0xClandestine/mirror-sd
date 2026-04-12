@@ -133,9 +133,7 @@ def extract_context_feature(
 def sample(logits: mx.array, temperature: float = 0.0) -> mx.array:
     if temperature < 1e-5:
         return mx.argmax(logits, axis=-1)
-    logits = logits / temperature
-    probs = mx.softmax(logits, axis=-1)
-    return mx.argmax(probs, axis=-1)
+    return mx.random.categorical(logits / temperature, axis=-1)
 
 
 class DFlashKVCache:
@@ -253,19 +251,17 @@ class Qwen3DFlashAttention(nn.Module):
         B, q_len, _ = hidden_states.shape
         ctx_len = target_hidden.shape[1]
 
+        kv_input = mx.concatenate([target_hidden, hidden_states], axis=1)
+        kv_len = ctx_len + q_len
+
         q = self.q_proj(hidden_states)
         q = self.q_norm(q.reshape(B, q_len, self.n_heads, -1)).transpose(0, 2, 1, 3)
 
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
+        k = self.k_proj(kv_input)
+        v = self.v_proj(kv_input)
 
-        k = mx.concatenate([k_ctx, k_noise], axis=1)
-        v = mx.concatenate([v_ctx, v_noise], axis=1)
-
-        k = self.k_norm(k.reshape(B, ctx_len + q_len, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
-        v = v.reshape(B, ctx_len + q_len, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        k = self.k_norm(k.reshape(B, kv_len, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        v = v.reshape(B, kv_len, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             rope_offset = cache.offset
@@ -273,12 +269,7 @@ class Qwen3DFlashAttention(nn.Module):
             rope_offset = 0
 
         q = self._apply_rope(q, offset=rope_offset + ctx_len)
-
-        k_ctx = k[:, :, :ctx_len, :]
-        k_noise = k[:, :, ctx_len:, :]
-        k_ctx = self._apply_rope(k_ctx, offset=rope_offset)
-        k_noise = self._apply_rope(k_noise, offset=rope_offset + ctx_len)
-        k = mx.concatenate([k_ctx, k_noise], axis=2)
+        k = self._apply_rope(k, offset=rope_offset)
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)

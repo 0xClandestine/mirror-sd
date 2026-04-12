@@ -7,15 +7,13 @@ hidden states are the key input to the DFlash draft model.
 Provides forward_split() for Mirror-SD early-exit: runs prefix layers,
 emits hidden states for the draft model, then continues suffix layers.
 This enables parallel ANE draft || GPU suffix execution (Eq. 10).
-
-Also provides extract_context_feature() for fusing multi-layer hidden
-states into a single tensor for the draft model's fc layer.
 """
 
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
-import mlx.nn as nn
+
+from mlx_lm.models.base import create_attention_mask
 
 
 def _get_inner_model(model):
@@ -70,6 +68,7 @@ def forward_with_hidden_states(
     if capture_layers is None:
         capture_layers = []
 
+    capture_set = set(capture_layers)
     inner = _get_inner_model(model)
     h = inner.embed_tokens(inputs)
     embed = h
@@ -79,7 +78,6 @@ def forward_with_hidden_states(
         cache = cache_module.make_prompt_cache(model)
 
     try:
-        from mlx_lm.models.base import create_attention_mask
         mask = create_attention_mask(h, cache[0])
     except TypeError:
         mask = cache[0].make_mask(h.shape[1])
@@ -87,7 +85,7 @@ def forward_with_hidden_states(
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
         h = layer(h, mask, cache=c)
-        if i in capture_layers:
+        if i in capture_set:
             captured[i] = h
 
     h = inner.norm(h)
@@ -133,6 +131,7 @@ def forward_prefix(
     if capture_layers is None:
         capture_layers = []
 
+    capture_set = set(capture_layers)
     inner = _get_inner_model(model)
     h = inner.embed_tokens(inputs)
     embed = h
@@ -141,7 +140,6 @@ def forward_prefix(
         cache = [None] * len(inner.layers)
 
     try:
-        from mlx_lm.models.base import create_attention_mask
         mask = create_attention_mask(h, cache[0])
     except TypeError:
         mask = cache[0].make_mask(h.shape[1])
@@ -149,7 +147,7 @@ def forward_prefix(
     captured = {}
     for i, (layer, c) in enumerate(zip(inner.layers, cache)):
         h = layer(h, mask, cache=c)
-        if i in capture_layers:
+        if i in capture_set:
             captured[i] = h
         if i == exit_layer:
             break
@@ -188,6 +186,7 @@ def forward_suffix(
     if capture_layers is None:
         capture_layers = []
 
+    capture_set = set(capture_layers)
     inner = _get_inner_model(model)
 
     if cache is None:
@@ -196,7 +195,7 @@ def forward_suffix(
     captured = {}
     for i in range(start_layer, len(inner.layers)):
         h = inner.layers[i](h, mask, cache=cache[i])
-        if i in capture_layers:
+        if i in capture_set:
             captured[i] = h
 
     h = inner.norm(h)
@@ -209,20 +208,3 @@ def forward_suffix(
     hidden_states = [captured[i] for i in capture_layers if i >= start_layer]
 
     return logits, hidden_states
-
-
-def extract_context_feature(
-    hidden_states: List[mx.array],
-    layer_ids: List[int],
-) -> mx.array:
-    """Fuse multi-layer hidden states for the draft model.
-
-    If hidden_states length matches layer_ids length (captured-only mode),
-    concatenates all directly. Otherwise, uses layer_ids as indices into
-    a full hidden_states list (HuggingFace convention with offset=1).
-    """
-    if len(hidden_states) == len(layer_ids):
-        return mx.concatenate(hidden_states, axis=-1)
-    offset = 1
-    selected = [hidden_states[lid + offset] for lid in layer_ids]
-    return mx.concatenate(selected, axis=-1)

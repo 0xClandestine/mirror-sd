@@ -22,7 +22,7 @@ import mlx.core as mx
 
 from .dflash import (
     DFlashKVCache,
-    extract_context_feature, sample, make_draft_mask,
+    extract_context_feature, sample,
 )
 from .target import forward_with_hidden_states, forward_prefix, forward_suffix, get_embed_tokens, get_lm_head
 
@@ -131,8 +131,6 @@ def spec_generate(
     stream_callback=None,
     prefill_step_size: int = 512,
     prompt_cache=None,
-    cached_target_hidden=None,
-    cached_first_token=None,
     prefill_callback=None,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
@@ -166,6 +164,9 @@ def spec_generate(
     stats = SpecDecodeStats()
     t_start = time.perf_counter()
 
+    embed_fn = get_embed_tokens(target_model)
+    lm_head_fn = get_lm_head(target_model)
+
     base_block_size = draft_model.block_size
     block_size = base_block_size
     mask_token_id = draft_model.mask_token_id
@@ -192,21 +193,7 @@ def spec_generate(
 
     num_input = input_ids.shape[1]
 
-    if cached_target_hidden is not None and prompt_cache is not None:
-        # Full cache hit — skip prefill entirely
-        target_hidden = cached_target_hidden
-        if cached_first_token is not None:
-            first_token = mx.array([[cached_first_token]], dtype=mx.int32)
-        else:
-            last_ids = input_ids[:, -1:]
-            logits, _, _ = forward_with_hidden_states(
-                target_model, last_ids, cache=target_cache,
-                capture_layers=[],
-            )
-            first_token = sample(logits[:, -1:, :], temperature)
-            mx.eval(logits, first_token, *_flat_cache_states(target_cache))
-            cache_module.trim_prompt_cache(target_cache, 1)
-    elif num_input > prefill_step_size:
+    if num_input > prefill_step_size:
         for start in range(0, num_input - prefill_step_size, prefill_step_size):
             chunk = input_ids[:, start:start + prefill_step_size]
             logits_chunk, _, _ = forward_with_hidden_states(
@@ -305,20 +292,14 @@ def spec_generate(
         anchor_token = output_ids_list[-1]
         block_tokens = [anchor_token] + [mask_token_id] * (current_block_size - 1)
         block_ids = mx.array([block_tokens], dtype=mx.int32)
-        noise_embedding = get_embed_tokens(target_model)(block_ids)
-
-        cache_len = draft_cache[0].offset
-        ctx_len = target_hidden.shape[1]
-        q_len = noise_embedding.shape[1]
-        draft_mask_val = make_draft_mask(q_len, ctx_len, cache_len)
+        noise_embedding = embed_fn(block_ids)
 
         draft_hidden = draft_model(
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
-            mask=draft_mask_val,
             cache=draft_cache,
         )
-        draft_logits = get_lm_head(target_model)(draft_hidden[:, -current_block_size + 1:, :])
+        draft_logits = lm_head_fn(draft_hidden[:, -current_block_size + 1:, :])
         sampled_tokens = sample(draft_logits, temperature)
 
         # --- Crop draft cache BEFORE start increment ---
@@ -351,16 +332,20 @@ def spec_generate(
             kod_confs.append(avg_conf)
 
         # --- Accept/reject using MLX array ops ---
-        draft_arr = sampled_tokens[0]
-        target_arr = posterior[0, :-1]
-        matches = (draft_arr == target_arr)
-        match_cumsum = mx.cumsum(matches.astype(mx.int32))
-        positions = mx.arange(1, draft_arr.shape[0] + 1)
-        consecutive_mask = (match_cumsum == positions)
-        acceptance_length = int(mx.sum(consecutive_mask.astype(mx.int32)))
+        draft_toks = sampled_tokens[0].tolist()
+        target_toks = posterior[0, :-1].tolist()
+        if isinstance(target_toks, int):
+            target_toks = [target_toks]
+
+        acceptance_length = 0
+        for i in range(len(draft_toks)):
+            if draft_toks[i] == target_toks[i]:
+                acceptance_length += 1
+            else:
+                break
 
         if acceptance_length > 0:
-            accepted_toks = draft_arr[:acceptance_length].tolist()
+            accepted_toks = draft_toks[:acceptance_length]
             output_ids_list.extend(accepted_toks)
             if stream_callback is not None:
                 for t in accepted_toks:
@@ -376,7 +361,7 @@ def spec_generate(
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
-        target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
+        target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
         recent_acceptances.append(acceptance_length)
         if len(recent_acceptances) > hybrid_window * 2:
@@ -461,6 +446,9 @@ def _spec_generate_mirror_sd(
     stats = SpecDecodeStats(parallel_mode=True)
     t_start = time.perf_counter()
 
+    embed_fn = get_embed_tokens(target_model)
+    lm_head_fn = get_lm_head(target_model)
+
     block_size = draft_model.block_size
     mask_token_id = draft_model.mask_token_id
     num_input_tokens = input_ids.shape[1]
@@ -498,17 +486,13 @@ def _spec_generate_mirror_sd(
 
     def _run_draft_gpu(th, ne, dc):
         nonlocal draft_result
-        cache_len = dc[0].offset
-        ctx_len = th.shape[1]
         q_len = ne.shape[1]
-        draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
         draft_hidden = draft_model(
             noise_embedding=ne,
             target_hidden=th,
-            mask=draft_mask,
             cache=dc,
         )
-        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         draft_result = sampled_tokens
@@ -529,16 +513,13 @@ def _spec_generate_mirror_sd(
                     c_old.offset = c_new.offset
         else:
             dc_active = dc
-        cache_len = dc_active[0].offset
         q_len = ne.shape[1]
-        draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
         draft_hidden = active_draft(
             noise_embedding=ne,
             target_hidden=th,
-            mask=draft_mask,
             cache=dc_active,
         )
-        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         if use_gpu:
@@ -558,19 +539,15 @@ def _spec_generate_mirror_sd(
     # After this, target_hidden is current and draft_cache is consistent.
     if start < max_length:
         block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-        noise_embedding = get_embed_tokens(target_model)(mx.array([block_tokens], dtype=mx.int32))
+        noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
 
-        cache_len = draft_cache[0].offset
-        ctx_len = target_hidden.shape[1]
         q_len = noise_embedding.shape[1]
-        draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
         draft_hidden = draft_model(
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
-            mask=draft_mask,
             cache=draft_cache,
         )
-        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
 
@@ -618,7 +595,7 @@ def _spec_generate_mirror_sd(
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
-        target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
+        target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
         stats.acceptance_lengths.append(acceptance_length + 1)
         stats.spec_lengths.append(block_size - 1)
@@ -630,7 +607,7 @@ def _spec_generate_mirror_sd(
     # and cropped draft_cache from the serial first iteration)
     if start < max_length and draft_result is None:
         draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-        noise_embedding_seed = get_embed_tokens(target_model)(
+        noise_embedding_seed = embed_fn(
             mx.array([draft_block_tokens], dtype=mx.int32)
         )
         mx.eval(noise_embedding_seed)
@@ -737,7 +714,7 @@ def _spec_generate_mirror_sd(
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
-        target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
+        target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
         # --- Draft for next iteration ---
         # Runs AFTER accept/reject + crop + target_hidden update so it uses
@@ -764,16 +741,13 @@ def _spec_generate_mirror_sd(
                 else:
                     ext_tokens = [all_sampled[-1]] + [mask_token_id] * (ext_bs - 1)
 
-                ne = get_embed_tokens(target_model)(mx.array([ext_tokens], dtype=mx.int32))
+                ne = embed_fn(mx.array([ext_tokens], dtype=mx.int32))
                 mx.eval(ne)
 
-                cl = draft_cache[0].offset
-                ctx = target_hidden.shape[1]
                 ql = ne.shape[1]
-                dm = make_draft_mask(ql, ctx, cl)
 
-                dh = draft_model(noise_embedding=ne, target_hidden=target_hidden, mask=dm, cache=draft_cache)
-                dl = get_lm_head(target_model)(dh[:, -(ql - 1):, :])
+                dh = draft_model(noise_embedding=ne, target_hidden=target_hidden, cache=draft_cache)
+                dl = lm_head_fn(dh[:, -(ql - 1):, :])
                 st = sample(dl, temperature)
                 mx.eval(st)
 
@@ -788,7 +762,7 @@ def _spec_generate_mirror_sd(
             next_spec_len = total_spec_len
         else:
             draft_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
-            noise_embedding = get_embed_tokens(target_model)(
+            noise_embedding = embed_fn(
                 mx.array([draft_block_tokens], dtype=mx.int32)
             )
             mx.eval(noise_embedding)
@@ -879,6 +853,9 @@ def _spec_generate_parallel(
     stats = SpecDecodeStats(parallel_mode=True)
     t_start = time.perf_counter()
 
+    embed_fn = get_embed_tokens(target_model)
+    lm_head_fn = get_lm_head(target_model)
+
     block_size = draft_model.block_size
     mask_token_id = draft_model.mask_token_id
     num_input_tokens = input_ids.shape[1]
@@ -932,16 +909,13 @@ def _spec_generate_parallel(
                     c_new.offset = c_old.offset
         else:
             dc_active = dc
-        cache_len = dc_active[0].offset
         q_len = ne.shape[1]
-        draft_mask = make_draft_mask(q_len, ctx_len, cache_len)
         draft_hidden = active_draft(
             noise_embedding=ne,
             target_hidden=th,
-            mask=draft_mask,
             cache=dc_active,
         )
-        draft_logits = get_lm_head(target_model)(draft_hidden[:, -(q_len - 1):, :])
+        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
         sampled_tokens = sample(draft_logits, temperature)
         mx.eval(sampled_tokens)
         if use_gpu:
@@ -953,7 +927,7 @@ def _spec_generate_parallel(
 
     # Kick off first draft
     block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-    noise_embedding = get_embed_tokens(target_model)(mx.array([block_tokens], dtype=mx.int32))
+    noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
     mx.eval(noise_embedding)
     t_draft_start = time.perf_counter()
     draft_thread = threading.Thread(target=_run_draft, args=(target_hidden, noise_embedding, draft_cache, 0))
@@ -1042,7 +1016,7 @@ def _spec_generate_parallel(
         if n_to_trim_target > 0:
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
-        new_target_hidden = extract_context_feature(verify_hidden, target_layer_ids)[:, :acceptance_length + 1, :]
+        new_target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
         t_verify_done = time.perf_counter()
         verify_time = t_verify_done - t_verify_start
@@ -1064,7 +1038,7 @@ def _spec_generate_parallel(
                 # Start next draft in parallel with upcoming verify
                 if start < max_length:
                     next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-                    next_noise_embedding = get_embed_tokens(target_model)(
+                    next_noise_embedding = embed_fn(
                         mx.array([next_block_tokens], dtype=mx.int32)
                     )
                     mx.eval(next_noise_embedding)
@@ -1081,7 +1055,7 @@ def _spec_generate_parallel(
         # Start next draft in parallel with upcoming verify
         if start < max_length:
             next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-            next_noise_embedding = get_embed_tokens(target_model)(
+            next_noise_embedding = embed_fn(
                 mx.array([next_block_tokens], dtype=mx.int32)
             )
             mx.eval(next_noise_embedding)
