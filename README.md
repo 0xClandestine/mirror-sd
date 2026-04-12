@@ -29,20 +29,20 @@ M4 Pro (64GB), MLX, greedy decoding (`temperature=0.0`), `/no_think` chat templa
 | Metric | Value |
 |--------|-------|
 | Baseline (autoregressive) | 27.0 tok/s |
-| DFlash speculative | 87.6 tok/s |
-| **Speedup** | **3.25x** |
-| Avg acceptance length | 9.31 |
-| Block size | 16 |
+| DFlash + KOD | 95.8 tok/s |
+| **Speedup** | **3.55x** |
+| Avg acceptance length | 8.29 |
+| Block size | 16 (KOD-adapted) |
 
 ### Qwen3.5-27B-4bit
 
 | Metric | Value |
 |--------|-------|
 | Baseline (autoregressive) | 25.0 tok/s |
-| DFlash speculative | 30.8 tok/s |
-| **Speedup** | **1.23x** |
-| Avg acceptance length | 3.05 |
-| Block size | 4 (adaptive) |
+| DFlash + KOD | 34.7 tok/s |
+| **Speedup** | **1.39x** |
+| Avg acceptance length | 3.89 |
+| Block size | 4 (KOD-adapted) |
 
 The 27B model uses a smaller block size because verify cost scales with block size (~20ms/tok for 4 tokens vs ~37ms for single-token decode). With block_size=16, verify is too expensive for the acceptance rate, resulting in a net slowdown. Adaptive block sizing automatically shrinks the block when recent acceptance drops, avoiding wasted verify compute.
 

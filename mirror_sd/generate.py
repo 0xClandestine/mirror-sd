@@ -38,6 +38,45 @@ def _flat_cache_states(cache):
     return out
 
 
+def _kod_optimal_gamma(alpha, cost_a, cost_b, min_gamma=2, max_gamma=16):
+    """KOD: find block_size that maximizes expected throughput.
+
+    Kelly-Optimal Drafting selects the block size gamma that maximizes
+    expected tokens per millisecond, given an estimated per-token
+    acceptance probability alpha and a linear cost model.
+
+    Cost model: cost(gamma) = cost_a + cost_b * gamma  (ms)
+    Expected tokens: alpha*(1-alpha^(gamma-1))/(1-alpha) + 1
+
+    The expected tokens formula assumes iid acceptance with probability
+    alpha, forming a geometric series that models the consecutive-match
+    acceptance rule of speculative decoding.
+
+    Args:
+        alpha: estimated per-token acceptance probability
+        cost_a: fixed cost per iteration (ms)
+        cost_b: marginal cost per block_size unit (ms)
+        min_gamma, max_gamma: search range for block_size
+    Returns:
+        Optimal block_size (gamma)
+    """
+    best_gamma = min_gamma
+    best_tp = 0.0
+    for gamma in range(min_gamma, max_gamma + 1):
+        n = gamma - 1
+        if alpha > 0.999:
+            ea = float(n)
+        elif alpha < 0.001:
+            ea = 0.0
+        else:
+            ea = alpha * (1.0 - alpha ** n) / (1.0 - alpha)
+        tp = (ea + 1.0) / (cost_a + cost_b * gamma)
+        if tp > best_tp:
+            best_tp = tp
+            best_gamma = gamma
+    return best_gamma
+
+
 @dataclass
 class SpecDecodeStats:
     total_tokens: int = 0
@@ -88,6 +127,7 @@ def spec_generate(
     failfast_max_spec: int = 64,
     num_draft_layers: Optional[int] = None,
     adaptive_block: bool = True,
+    kod: bool = False,
 ) -> Tuple[mx.array, SpecDecodeStats]:
     from mlx_lm.models import cache as cache_module
 
@@ -133,10 +173,15 @@ def spec_generate(
     target_cache = cache_module.make_prompt_cache(target_model)
     draft_cache = draft_model.make_cache()
 
-    # Hybrid mode: adaptively adjust block size based on recent acceptance
+    # Block size adaptation state
     recent_acceptances = []
     hybrid_window = 3
     min_block_size = 2
+
+    # KOD state: draft confidence tracking + cost model calibration
+    kod_confs = []
+    kod_accepts = []
+    kod_obs = []
 
     # --- Prefill ---
     logits, embed, hidden_states = forward_with_hidden_states(
@@ -157,7 +202,41 @@ def spec_generate(
     while start < max_length:
         remaining = max_length - start
 
-        if adaptive_block and len(recent_acceptances) >= hybrid_window:
+        if kod and len(kod_obs) >= 2:
+            # KOD: Kelly-Optimal Drafting block_size selection
+            # Uses observed acceptance rate as alpha estimate (draft confidence
+            # is poorly calibrated for DFlash — max softmax ~1.0 always)
+            window = min(8, len(kod_accepts))
+            alpha_est = sum(kod_accepts[-window:]) / window
+
+            # Auto-calibrate cost model from observed (block_size, time) pairs
+            # Need at least 2 different block_sizes for a meaningful fit
+            unique_gammas = len(set(g for g, _ in kod_obs[-16:]))
+            if unique_gammas >= 2 and len(kod_obs) >= 4:
+                gammas = [g for g, _ in kod_obs[-16:]]
+                times = [t for _, t in kod_obs[-16:]]
+                n_obs = len(gammas)
+                sum_g = sum(gammas)
+                sum_t = sum(times)
+                sum_gg = sum(g * g for g in gammas)
+                sum_gt = sum(g * t for g, t in zip(gammas, times))
+                denom = n_obs * sum_gg - sum_g ** 2
+                if abs(denom) > 0.001:
+                    cost_b = (n_obs * sum_gt - sum_g * sum_t) / denom
+                    cost_a = (sum_t - cost_b * sum_g) / n_obs
+                    cost_a = max(cost_a, 1.0)
+                    cost_b = max(cost_b, 0.1)
+                else:
+                    cost_a, cost_b = 47.0, 8.7
+            else:
+                cost_a, cost_b = 47.0, 8.7
+
+            current_block_size = _kod_optimal_gamma(
+                alpha_est, cost_a, cost_b,
+                min_gamma=min_block_size,
+                max_gamma=min(base_block_size * 2, 16),
+            )
+        elif adaptive_block and len(recent_acceptances) >= hybrid_window:
             avg_accept = sum(recent_acceptances[-hybrid_window:]) / hybrid_window
             if avg_accept < 1.0:
                 current_block_size = min_block_size
@@ -172,6 +251,8 @@ def spec_generate(
 
         if current_block_size < 2:
             break
+
+        t_iter_start = time.perf_counter()
 
         # --- Draft phase ---
         anchor_token = output_ids_list[-1]
@@ -212,6 +293,16 @@ def spec_generate(
         # Combined eval: posterior + hidden states + cache states in one call
         mx.eval(posterior, *verify_hidden, *_flat_cache_states(target_cache))
 
+        t_iter_end = time.perf_counter()
+        iter_time_ms = (t_iter_end - t_iter_start) * 1000
+
+        # KOD: extract draft confidence from draft_logits
+        if kod:
+            draft_probs = mx.softmax(draft_logits, axis=-1)
+            draft_max_probs = mx.max(draft_probs, axis=-1)
+            avg_conf = float(mx.mean(draft_max_probs))
+            kod_confs.append(avg_conf)
+
         # --- Accept/reject using MLX array ops ---
         draft_arr = sampled_tokens[0]
         target_arr = posterior[0, :-1]
@@ -237,6 +328,11 @@ def spec_generate(
         recent_acceptances.append(acceptance_length)
         if len(recent_acceptances) > hybrid_window * 2:
             recent_acceptances = recent_acceptances[-hybrid_window:]
+
+        if kod:
+            accept_rate = acceptance_length / max(current_block_size - 1, 1)
+            kod_accepts.append(accept_rate)
+            kod_obs.append((current_block_size, iter_time_ms))
 
         stats.spec_lengths.append(current_block_size - 1)
         stats.acceptance_lengths.append(acceptance_length + 1)

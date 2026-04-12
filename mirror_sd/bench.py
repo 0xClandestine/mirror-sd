@@ -121,6 +121,7 @@ def main():
     parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompts without chat template (breaks DFlash acceptance)")
     parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8], help="Quantize draft model to N bits")
     parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size (use fixed block_size)")
+    parser.add_argument("--kod", action="store_true", help="Kelly-Optimal Drafting: use draft confidence + cost model for block_size selection")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -191,7 +192,9 @@ def main():
         mode += "+FAILFAST"
     if args.num_draft_layers is not None:
         mode += f"+{args.num_draft_layers}L"
-    if not args.no_adaptive:
+    if args.kod:
+        mode += "+KOD"
+    elif not args.no_adaptive:
         mode += "+ADAPTIVE"
     print(f"\n{'='*60}")
     print(f"  {mode} (speculative decoding, block_size={config.block_size})")
@@ -213,6 +216,7 @@ def main():
             failfast_max_spec=args.failfast_max_spec,
             num_draft_layers=args.num_draft_layers,
             adaptive_block=not args.no_adaptive,
+            kod=args.kod,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt
