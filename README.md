@@ -22,7 +22,7 @@ DECODE LOOP:
 
 ## Benchmarks
 
-M4 Pro (64GB), MLX, Qwen3.5-27B-4bit, llama-benchy with prompt caching (3 runs per depth).
+M4 Max (64GB), MLX, Qwen3.5-27B-4bit, llama-benchy with prompt caching (3 runs per depth).
 
 ![DFlash vs Baseline](benchmarks/fixed_vs_baseline.png)
 
