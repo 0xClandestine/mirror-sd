@@ -461,26 +461,10 @@ def _advance_gated_delta_states(initial_state, keys, values, g, beta):
     token using its (k, v, g, beta) values. Used for rollback: advance
     through only the accepted tokens to reconstruct the correct SSM state.
 
-    Shapes:
-        initial_state: [B, Hv, Dv, Dk]
-        keys:          [B, T, Hk, Dk]  (already repeated if repeat_factor > 1)
-        values:        [B, T, Hv, Dv]
-        g:             [B, T, Hv]
-        beta:          [B, T, Hv]
+    Uses custom Metal kernel when available, falls back to Python loop.
     """
-    state = initial_state.astype(mx.float32)
-    keys_f = keys.astype(mx.float32)
-    values_f = values.astype(mx.float32)
-    g_f = g.astype(mx.float32)
-    beta_f = beta.astype(mx.float32)
-
-    for t in range(keys.shape[1]):
-        state = state * g_f[:, t, :, None, None]
-        kv_mem = mx.sum(state * keys_f[:, t, :, None, :], axis=-1)
-        delta = (values_f[:, t] - kv_mem) * beta_f[:, t, :, None]
-        state = state + delta[..., None] * keys_f[:, t, :, None, :]
-
-    return state.astype(initial_state.dtype)
+    from .ssm_kernel import advance_gated_delta_states_metal
+    return advance_gated_delta_states_metal(initial_state, keys, values, g, beta)
 
 
 def get_compiled_linear_verify_fn(layer):
