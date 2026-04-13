@@ -125,6 +125,7 @@ def main():
     parser.add_argument("--kod", action="store_true", help="Kelly-Optimal Drafting: use draft confidence + cost model for block_size selection")
     parser.add_argument("--lazy-logits", action="store_true", help="Use lazy logits: compute lm_head in chunks, stopping at rejection")
     parser.add_argument("--logit-chunk-size", type=int, default=1, help="Chunk size for lazy logits (default: 1)")
+    parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -168,7 +169,7 @@ def main():
         formatted = format_prompt(tokenizer, p, enable_thinking=args.think) if use_chat else p
         tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
-        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block, lazy_logits=args.lazy_logits, logit_chunk_size=args.logit_chunk_size)
+        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block, lazy_logits=args.lazy_logits, logit_chunk_size=args.logit_chunk_size, turboquant_bits=args.turboquant_bits)
 
     # --- Baseline ---
     if args.no_baseline:
@@ -221,6 +222,7 @@ def main():
             kod=args.kod,
             lazy_logits=args.lazy_logits,
             logit_chunk_size=args.logit_chunk_size,
+            turboquant_bits=args.turboquant_bits,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt

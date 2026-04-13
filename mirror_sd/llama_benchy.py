@@ -122,6 +122,7 @@ def main():
     parser.add_argument("--baseline-only", action="store_true", help="Only benchmark baseline server")
     parser.add_argument("--no-baseline", action="store_true", help="Skip baseline benchmarking")
     parser.add_argument("--tokenizer", type=str, default=None, help="HuggingFace tokenizer name (defaults to model)")
+    parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
@@ -166,6 +167,8 @@ def main():
                 spec_cmd.extend(["--block-size", str(args.block_size)])
             if args.quantize_draft:
                 spec_cmd.extend(["--quantize-draft", str(args.quantize_draft)])
+            if args.turboquant_bits > 0:
+                spec_cmd.extend(["--turboquant-bits", str(args.turboquant_bits)])
 
             print(f"Starting spec server: {' '.join(spec_cmd)}")
             spec_proc = subprocess.Popen(spec_cmd, stderr=subprocess.PIPE)

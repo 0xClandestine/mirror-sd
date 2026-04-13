@@ -146,6 +146,7 @@ def spec_generate(
     lazy_logits: bool = False,
     logit_chunk_size: int = 1,
     accept_all_first: bool = False,
+    turboquant_bits: float = 0.0,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
@@ -194,6 +195,9 @@ def spec_generate(
 
     if prompt_cache is not None:
         target_cache = prompt_cache
+    elif turboquant_bits > 0:
+        from .turboquant import make_turboquant_cache
+        target_cache = make_turboquant_cache(target_model, bits=turboquant_bits)
     else:
         target_cache = cache_module.make_prompt_cache(target_model)
     draft_cache = draft_model.make_cache()

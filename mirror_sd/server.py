@@ -86,6 +86,7 @@ class SpecServer:
             lazy_logits=self.args.lazy_logits,
             logit_chunk_size=self.args.logit_chunk_size,
             compile_full=self.args.compile_full,
+            turboquant_bits=self.args.turboquant_bits,
         )
 
         all_tokens = tokens + output_ids[0, len(tokens):].tolist()
@@ -271,6 +272,7 @@ def main():
     parser.add_argument("--lazy-logits", action="store_true", help="Use lazy logits: compute lm_head in chunks, stopping at rejection")
     parser.add_argument("--logit-chunk-size", type=int, default=1, help="Chunk size for lazy logits (1=token-by-token)")
     parser.add_argument("--compile-full", action="store_true", help="Use mx.compile for full-attention layers during verify")
+    parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
