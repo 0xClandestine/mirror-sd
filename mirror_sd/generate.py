@@ -143,6 +143,7 @@ def spec_generate(
     prefill_callback=None,
     use_compiled: bool = False,
     compile_full: bool = False,
+    compiled_whole: bool = False,
     lazy_logits: bool = False,
     logit_chunk_size: int = 1,
     accept_all_first: bool = False,
@@ -394,7 +395,15 @@ def spec_generate(
                     break
         else:
             if q35:
-                if use_compiled:
+                if compiled_whole:
+                    from mirror_sd.target import forward_with_hidden_states_compiled_whole
+                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_compiled_whole(
+                        target_model,
+                        verify_input,
+                        cache=target_cache,
+                        capture_layers=target_layer_ids,
+                    )
+                elif use_compiled:
                     verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_compiled(
                         target_model,
                         verify_input,

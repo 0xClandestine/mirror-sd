@@ -24,6 +24,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache
 
 _COMPILED_LINEAR_VERIFY_FNS: Dict[int, Any] = {}
 _COMPILED_FULL_ATTENTION_VERIFY_FNS: Dict[int, Any] = {}
+_COMPILED_WHOLE_MODEL_VERIFY_FNS: Dict[tuple, Any] = {}
 
 
 def _is_qwen35_full_attn(layer):
@@ -486,6 +487,325 @@ def _advance_gated_delta_states(initial_state, keys, values, g, beta):
     """
     from .ssm_kernel import advance_gated_delta_states_metal
     return advance_gated_delta_states_metal(initial_state, keys, values, g, beta)
+
+
+def _forward_linear_layer_explicit(layer, hidden_states, initial_conv_state, initial_ssm_state):
+    """Forward linear layer with explicit cache inputs, returning all rollback data."""
+    from mlx_lm.models.gated_delta import compute_g, gated_delta_update
+
+    linear = layer.linear_attn
+    residual = hidden_states
+    inputs = layer.input_layernorm(hidden_states)
+    B, S, _ = inputs.shape
+
+    qkv = linear.in_proj_qkv(inputs)
+    z = linear.in_proj_z(inputs).reshape(B, S, linear.num_v_heads, linear.head_v_dim)
+    b_raw = linear.in_proj_b(inputs)
+    a_raw = linear.in_proj_a(inputs)
+
+    conv_input = mx.concatenate([initial_conv_state, qkv], axis=1)
+    n_keep = linear.conv_kernel_size - 1
+    new_conv_state = mx.contiguous(conv_input[:, -n_keep:, :])
+    conv_out = nn.silu(linear.conv1d(conv_input))
+
+    queries, keys, values = [
+        t.reshape(B, S, h, d)
+        for t, h, d in zip(
+            mx.split(conv_out, [linear.key_dim, 2 * linear.key_dim], -1),
+            [linear.num_k_heads, linear.num_k_heads, linear.num_v_heads],
+            [linear.head_k_dim, linear.head_k_dim, linear.head_v_dim],
+        )
+    ]
+
+    inv_scale = keys.shape[-1] ** -0.5
+    queries = (inv_scale**2) * mx.fast.rms_norm(queries, None, 1e-6)
+    keys = inv_scale * mx.fast.rms_norm(keys, None, 1e-6)
+
+    beta = mx.sigmoid(b_raw)
+    g = compute_g(linear.A_log, a_raw, linear.dt_bias)
+
+    out, new_ssm_state = gated_delta_update(
+        queries, keys, values, a_raw, b_raw, linear.A_log, linear.dt_bias,
+        initial_ssm_state, None, use_kernel=True,
+    )
+
+    out = linear.norm(out, z)
+    out = linear.out_proj(out.reshape(B, S, -1))
+    hidden_states = residual + out
+    residual = hidden_states
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    hidden_states = residual + layer.mlp(hidden_states)
+
+    return hidden_states, new_conv_state, new_ssm_state, qkv, keys, values, g, beta
+
+
+def _forward_full_attention_layer_explicit(layer, hidden_states, old_keys, old_values, offset):
+    """Forward full-attention layer with explicit KV cache arrays."""
+    attn = layer.self_attn
+    n_heads, n_kv_heads, head_dim = _get_attn_dims(attn)
+    has_qk_norm = hasattr(attn, 'q_norm') and hasattr(attn, 'k_norm')
+    q_out_dim = attn.q_proj.weight.shape[0]
+    has_gate = (q_out_dim != n_heads * head_dim)
+
+    residual = hidden_states
+    inputs = layer.input_layernorm(hidden_states)
+    B, L, _ = inputs.shape
+
+    q_proj_out = attn.q_proj(inputs)
+    if has_gate:
+        queries, gate = mx.split(
+            q_proj_out.reshape(B, L, n_heads, -1), 2, axis=-1,
+        )
+        gate = gate.reshape(B, L, -1)
+    else:
+        queries = q_proj_out.reshape(B, L, n_heads, -1)
+
+    new_keys = attn.k_proj(inputs)
+    new_values = attn.v_proj(inputs)
+
+    if has_qk_norm:
+        queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+        new_keys = attn.k_norm(new_keys.reshape(B, L, n_kv_heads, -1)).transpose(0, 2, 1, 3)
+    else:
+        queries = queries.transpose(0, 2, 1, 3)
+        new_keys = new_keys.reshape(B, L, n_kv_heads, -1).transpose(0, 2, 1, 3)
+    new_values = new_values.reshape(B, L, n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+    queries = attn.rope(queries, offset=offset)
+    new_keys = attn.rope(new_keys, offset=offset)
+
+    keys = mx.concatenate([old_keys[..., :offset, :], new_keys], axis=2)
+    values = mx.concatenate([old_values[..., :offset, :], new_values], axis=2)
+    output = mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=attn.scale, mask="causal",
+    )
+    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+    if has_gate:
+        output = attn.o_proj(output * mx.sigmoid(gate))
+    else:
+        output = attn.o_proj(output)
+
+    hidden_states = residual + output
+    residual = hidden_states
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    hidden_states = residual + layer.mlp(hidden_states)
+    return hidden_states, new_keys, new_values
+
+
+def get_compiled_whole_model_verify_fn(model, capture_layers, seq_len):
+    """Get or create a compiled whole-model verify function for Qwen3.5.
+
+    Compiles the entire 64-layer forward pass into a single mx.compile graph.
+    All cache state is passed as explicit arrays, eliminating Python dispatch
+    overhead between layers.
+    """
+    inner = _get_inner_model(model)
+    n_layers = len(inner.layers)
+    key = (id(inner), tuple(capture_layers), seq_len)
+    compiled = _COMPILED_WHOLE_MODEL_VERIFY_FNS.get(key)
+    if compiled is not None:
+        return compiled
+
+    capture_set = set(capture_layers)
+    linear_layers = []
+    fa_layers = []
+    linear_indices = []
+    fa_indices = []
+    for i, layer in enumerate(inner.layers):
+        if getattr(layer, 'is_linear', False):
+            linear_layers.append(layer)
+            linear_indices.append(i)
+        else:
+            fa_layers.append(layer)
+            fa_indices.append(i)
+
+    n_linear = len(linear_layers)
+    n_fa = len(fa_layers)
+    lm_head = get_lm_head(model)
+
+    @mx.compile
+    def compiled_whole_model_verify(
+        inputs: mx.array,
+        fa_offset: int,
+        full_keys: list,
+        full_values: list,
+        linear_conv_states: list,
+        linear_ssm_states: list,
+    ):
+        hidden_states = inner.embed_tokens(inputs)
+        selected_hidden = []
+        new_full_keys = []
+        new_full_values = []
+        new_conv_states = []
+        new_ssm_states = []
+        record_qkv = []
+        record_k = []
+        record_v = []
+        record_g = []
+        record_beta = []
+
+        fa_idx = 0
+        lin_idx = 0
+
+        for layer_idx in range(n_layers):
+            if getattr(inner.layers[layer_idx], 'is_linear', False):
+                h, nc, ns, qkv, k, v, g, b = _forward_linear_layer_explicit(
+                    inner.layers[layer_idx],
+                    hidden_states,
+                    linear_conv_states[lin_idx],
+                    linear_ssm_states[lin_idx],
+                )
+                hidden_states = h
+                new_conv_states.append(nc)
+                new_ssm_states.append(ns)
+                record_qkv.append(qkv)
+                record_k.append(k)
+                record_v.append(v)
+                record_g.append(g)
+                record_beta.append(b)
+                lin_idx += 1
+            else:
+                h, nk, nv = _forward_full_attention_layer_explicit(
+                    inner.layers[layer_idx],
+                    hidden_states,
+                    full_keys[fa_idx],
+                    full_values[fa_idx],
+                    fa_offset,
+                )
+                hidden_states = h
+                new_full_keys.append(nk)
+                new_full_values.append(nv)
+                fa_idx += 1
+
+            if layer_idx in capture_set:
+                selected_hidden.append(hidden_states)
+
+        norm_h = inner.norm(hidden_states)
+        logits = lm_head(norm_h)
+
+        target_hidden = mx.concatenate(selected_hidden, axis=-1) if selected_hidden else mx.zeros((inputs.shape[0], inputs.shape[1], 0))
+
+        return (
+            logits,
+            target_hidden,
+            norm_h,
+            new_full_keys,
+            new_full_values,
+            new_conv_states,
+            new_ssm_states,
+            mx.concatenate(record_qkv, axis=0) if record_qkv else mx.zeros((0,)),
+            mx.concatenate(record_k, axis=0) if record_k else mx.zeros((0,)),
+            mx.concatenate(record_v, axis=0) if record_v else mx.zeros((0,)),
+            mx.concatenate(record_g, axis=0) if record_g else mx.zeros((0,)),
+            mx.concatenate(record_beta, axis=0) if record_beta else mx.zeros((0,)),
+        )
+
+    _COMPILED_WHOLE_MODEL_VERIFY_FNS[key] = compiled_whole_model_verify
+    return compiled_whole_model_verify
+
+
+def forward_with_hidden_states_compiled_whole(
+    model,
+    inputs: mx.array,
+    cache,
+    capture_layers: Optional[List[int]] = None,
+) -> Tuple[mx.array, mx.array, List[mx.array], Dict[int, Dict[str, mx.array]]]:
+    """Qwen3.5 compiled whole-model verify. All 64 layers in one mx.compile graph."""
+    if capture_layers is None:
+        capture_layers = []
+
+    inner = _get_inner_model(model)
+    seq_len = inputs.shape[1]
+    compiled = get_compiled_whole_model_verify_fn(model, capture_layers, seq_len)
+
+    full_keys = []
+    full_values = []
+    linear_conv_states = []
+    linear_ssm_states = []
+    fa_offsets = []
+
+    fa_idx = 0
+    for c in cache:
+        if isinstance(c, KVCache):
+            if c.keys is not None:
+                full_keys.append(c.keys)
+                full_values.append(c.values)
+                fa_offsets.append(c.offset)
+            else:
+                full_keys.append(mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
+                full_values.append(mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
+                fa_offsets.append(0)
+            fa_idx += 1
+        elif isinstance(c, ArraysCache):
+            conv = c[0] if c[0] is not None else mx.zeros(
+                (1, getattr(c, '_conv_kernel_size', 4) - 1, 1), dtype=mx.bfloat16
+            )
+            ssm = c[1] if c[1] is not None else mx.zeros(
+                (1, 48, 128, 128), dtype=mx.bfloat16
+            )
+            linear_conv_states.append(conv)
+            linear_ssm_states.append(ssm)
+
+    fa_offset = fa_offsets[0] if fa_offsets else 0
+
+    results = compiled(
+        inputs,
+        fa_offset,
+        full_keys,
+        full_values,
+        linear_conv_states,
+        linear_ssm_states,
+    )
+
+    logits = results[0]
+    target_hidden = results[1]
+    norm_h = results[2]
+    new_full_keys = results[3]
+    new_full_values = results[4]
+    new_conv_states = results[5]
+    new_ssm_states = results[6]
+    batch_qkv = results[7]
+    batch_k = results[8]
+    batch_v = results[9]
+    batch_g = results[10]
+    batch_beta = results[11]
+
+    # Write back cache state
+    fa_idx = 0
+    lin_idx = 0
+    for i, c in enumerate(cache):
+        if isinstance(c, KVCache):
+            c.update_and_fetch(new_full_keys[fa_idx], new_full_values[fa_idx])
+            fa_idx += 1
+        elif isinstance(c, ArraysCache):
+            c[0] = new_conv_states[lin_idx]
+            c[1] = new_ssm_states[lin_idx]
+            c.advance(seq_len)
+            lin_idx += 1
+
+    # Reconstruct rollback records
+    rollback_records = {}
+    lin_layer_idx = 0
+    for i, layer in enumerate(inner.layers):
+        if getattr(layer, 'is_linear', False):
+            linear = layer.linear_attn
+            rollback_records[i] = {
+                'initial_conv_state': linear_conv_states[lin_layer_idx],
+                'initial_ssm_state': linear_ssm_states[lin_layer_idx],
+                'qkv': batch_qkv[lin_layer_idx:lin_layer_idx+1],
+                'k': batch_k[lin_layer_idx:lin_layer_idx+1],
+                'v': batch_v[lin_layer_idx:lin_layer_idx+1],
+                'g': batch_g[lin_layer_idx:lin_layer_idx+1],
+                'beta': batch_beta[lin_layer_idx:lin_layer_idx+1],
+                'repeat_factor': linear.num_v_heads // linear.num_k_heads,
+            }
+            lin_layer_idx += 1
+
+    embed = inner.embed_tokens(inputs)
+    hidden_states = [target_hidden]
+
+    return logits, embed, hidden_states, rollback_records
 
 
 def get_compiled_linear_verify_fn(layer):
