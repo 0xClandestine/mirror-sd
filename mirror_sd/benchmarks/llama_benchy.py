@@ -194,7 +194,7 @@ def main():
         tmp = os.path.join(BENCHMARKS_DIR, "_tmp_baseline.json")
         try:
             baseline_cmd = [
-                sys.executable, "-m", "mlx_lm.server",
+                sys.executable, "-m", "mlx_lm", "server",
                 "--model", model_path,
                 "--port", str(args.baseline_port),
             ]
