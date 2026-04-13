@@ -163,8 +163,8 @@ def main():
     model_name = args.model_name or os.path.basename(model_path)
     tokenizer = args.tokenizer or args.model
 
-    spec_url = f"http://localhost:{args.spec_port}/v1"
-    baseline_url = f"http://localhost:{args.baseline_port}/v1"
+    spec_url = f"http://localhost:{args.spec_port}"
+    baseline_url = f"http://localhost:{args.baseline_port}"
 
     results = []
 
