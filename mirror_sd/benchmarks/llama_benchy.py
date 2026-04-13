@@ -33,11 +33,13 @@ SPEC_CONFIGS = [
 ]
 
 
-def wait_for_server(url, timeout=180):
+def wait_for_server(url, proc, timeout=60):
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
+        if proc.poll() is not None:
+            return False
         try:
-            urllib.request.urlopen(f"{url}/v1/models", timeout=3)
+            urllib.request.urlopen(f"{url}/v1/models", timeout=2)
             return True
         except Exception:
             time.sleep(1)
@@ -168,10 +170,13 @@ def main():
 
     def start_server(cmd, url, label):
         print(f"\n  Starting {label} server...")
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
-        if not wait_for_server(url):
-            print(f"ERROR: {label} server failed to start")
-            proc.kill()
+        proc = subprocess.Popen(cmd)
+        if not wait_for_server(url, proc):
+            if proc.poll() is not None:
+                print(f"ERROR: {label} server crashed (exit code {proc.returncode})")
+            else:
+                print(f"ERROR: {label} server did not respond within 60s")
+                proc.kill()
             sys.exit(1)
         print(f"  {label} server ready.")
         return proc
