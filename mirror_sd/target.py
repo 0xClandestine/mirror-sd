@@ -422,12 +422,17 @@ def rollback_linear_caches(cache, rollback_records, accepted_inputs):
     Restores conv_state and SSM state to what they would be after processing
     only the first accepted_inputs tokens from the block.
 
-    Args:
-        cache: The model's cache list
-        rollback_records: Dict mapping layer index to rollback record
-        accepted_inputs: Number of accepted input tokens from the block
-                        (including the anchor token)
+    Batches all SSM state updates into a single Metal kernel call by
+    concatenating layer states along the batch dimension, then scattering
+    the results back.
     """
+    layer_indices = []
+    initial_states = []
+    all_keys = []
+    all_values = []
+    all_g = []
+    all_beta = []
+
     for idx, record in rollback_records.items():
         layer_cache = cache[idx]
 
@@ -448,10 +453,26 @@ def rollback_linear_caches(cache, rollback_records, accepted_inputs):
         record_g = record['g'][:, :accepted_inputs]
         record_beta = record['beta'][:, :accepted_inputs]
 
-        layer_cache[1] = _advance_gated_delta_states(
-            record['initial_ssm_state'],
-            record_keys, record_values, record_g, record_beta,
-        )
+        layer_indices.append(idx)
+        initial_states.append(record['initial_ssm_state'])
+        all_keys.append(record_keys)
+        all_values.append(record_values)
+        all_g.append(record_g)
+        all_beta.append(record_beta)
+
+    if not layer_indices:
+        return
+
+    rebuilt_states = _advance_gated_delta_states(
+        mx.concatenate(initial_states, axis=0),
+        mx.concatenate(all_keys, axis=0),
+        mx.concatenate(all_values, axis=0),
+        mx.concatenate(all_g, axis=0),
+        mx.concatenate(all_beta, axis=0),
+    )
+
+    for offset, idx in enumerate(layer_indices):
+        cache[idx][1] = rebuilt_states[offset:offset + 1]
 
 
 def _advance_gated_delta_states(initial_state, keys, values, g, beta):
