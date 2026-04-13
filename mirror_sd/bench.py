@@ -20,7 +20,7 @@ from mlx_lm.models import cache as cache_module
 
 from .dflash import sample, make_draft_mask
 from .loader import load_dflash_model
-from .target import forward_with_hidden_states, extract_context_feature
+from .target import forward_with_hidden_states
 from .generate import spec_generate
 from .prompt import format_prompt, get_stop_token_ids
 
@@ -123,6 +123,8 @@ def main():
     parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8], help="Quantize draft model to N bits")
     parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size (use fixed block_size)")
     parser.add_argument("--kod", action="store_true", help="Kelly-Optimal Drafting: use draft confidence + cost model for block_size selection")
+    parser.add_argument("--lazy-logits", action="store_true", help="Use lazy logits: compute lm_head in chunks, stopping at rejection")
+    parser.add_argument("--logit-chunk-size", type=int, default=1, help="Chunk size for lazy logits (default: 1)")
     args = parser.parse_args()
 
     print(f"Loading target: {args.model}")
@@ -166,7 +168,7 @@ def main():
         formatted = format_prompt(tokenizer, p, enable_thinking=args.think) if use_chat else p
         tokens = tokenizer.encode(formatted)
         input_ids = mx.array(tokens)[None]
-        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block)
+        spec_generate(target_model, draft_model, input_ids, max_new_tokens=16, temperature=temperature, stop_token_ids=eos_ids, num_draft_layers=args.num_draft_layers, adaptive_block=args.adaptive_block, lazy_logits=args.lazy_logits, logit_chunk_size=args.logit_chunk_size)
 
     # --- Baseline ---
     if args.no_baseline:
@@ -217,6 +219,8 @@ def main():
             num_draft_layers=args.num_draft_layers,
             adaptive_block=not args.no_adaptive,
             kod=args.kod,
+            lazy_logits=args.lazy_logits,
+            logit_chunk_size=args.logit_chunk_size,
         )
         dflash_results.append((prompt, stats, output_ids))
         short = prompt[:50] + "..." if len(prompt) > 50 else prompt

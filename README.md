@@ -22,27 +22,28 @@ DECODE LOOP:
 
 ## Benchmarks
 
-M4 Max (64GB), MLX, Qwen3.5-27B-4bit, llama-benchy with prompt caching (3 runs per depth).
+### Qwen3.5-27B-4bit (M4 Max 64GB, correct causal masking)
 
-![DFlash vs Baseline](benchmarks/fixed_vs_baseline.png)
+Previous benchmarks for this model were **invalid**: a mask bug caused bidirectional
+attention in full-attention layers, producing degenerate outputs with artificially
+inflated acceptance rates. With the correct causal mask, the model produces
+proper output but the current DFlash draft model has low acceptance for Qwen3.5,
+making speculative decoding slower than baseline for most prompts.
 
 | Context Depth | Baseline (tok/s) | DFlash bs=4 (tok/s) | Speedup |
 |--------------:|-----------------:|--------------------:|--------:|
-| 0             | 26.3             | 32.4                | 1.23x   |
-| 512           | 26.6             | 47.5                | 1.78x   |
-| 2048          | 17.6             | 38.5                | 2.19x   |
-| 8192          | 18.1             | 25.0                | 1.38x   |
-| 16384         | 15.9             | 31.1                | 1.96x   |
+| Short prompt  | ~27              | ~20                 | 0.74x   |
 
-Fixed block_size=4 outperforms KOD (Kelly-Optimal Drafting) at every depth for this model. KOD's cost model overestimates the penalty of wasted draft compute, causing it to shrink block sizes too aggressively. With bs=4, the draft+verify pipeline consistently wins despite moderate acceptance rates.
+For highly predictable outputs (e.g., "List the first 5 prime numbers"), acceptance
+rates can reach 3+ and speedup 1.8x, but average across diverse prompts is <1.0x.
 
 ### Qwen3-8B (informal benchmark)
 
 | Metric | Value |
 |--------|-------|
-| Baseline (autoregressive) | 27.0 tok/s |
-| DFlash bs=16 | 95.8 tok/s |
-| **Speedup** | **3.55x** |
+| Baseline (autoregressive) | ~28 tok/s |
+| DFlash bs=16 | ~50 tok/s (predictable prompts) |
+| **Speedup** | **1.7x** (varies widely by prompt) |
 
 ## MLX Implementation
 

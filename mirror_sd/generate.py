@@ -24,7 +24,16 @@ from .dflash import (
     DFlashKVCache,
     extract_context_feature, sample,
 )
-from .target import forward_with_hidden_states, forward_prefix, forward_suffix, get_embed_tokens, get_lm_head
+from .target import (
+    forward_with_hidden_states, forward_with_hidden_states_and_rollback,
+    forward_with_hidden_states_compiled,
+    forward_verifier_states, forward_verifier_states_compiled,
+    forward_accept_all_block, forward_accept_all_block_compiled,
+    forward_prefix, forward_suffix,
+    get_embed_tokens, get_lm_head,
+    is_qwen35, rollback_linear_caches, _apply_lm_head,
+    _forward_full_attention_layer_compiled,
+)
 
 
 def _flat_cache_states(cache):
@@ -132,6 +141,11 @@ def spec_generate(
     prefill_step_size: int = 512,
     prompt_cache=None,
     prefill_callback=None,
+    use_compiled: bool = False,
+    compile_full: bool = False,
+    lazy_logits: bool = False,
+    logit_chunk_size: int = 1,
+    accept_all_first: bool = False,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
@@ -164,6 +178,7 @@ def spec_generate(
     stats = SpecDecodeStats()
     t_start = time.perf_counter()
 
+    q35 = is_qwen35(target_model)
     embed_fn = get_embed_tokens(target_model)
     lm_head_fn = get_lm_head(target_model)
 
@@ -306,43 +321,121 @@ def spec_generate(
         for c in draft_cache:
             c.crop(start)
 
-        # --- Verify phase: fused with draft via MLX array ops ---
+        # --- Verify phase ---
         anchor_arr = mx.array([[anchor_token]], dtype=mx.int32)
         verify_input = mx.concatenate([anchor_arr, sampled_tokens], axis=1)
+        draft_toks = sampled_tokens[0].tolist()
+        block_size_actual = len(draft_toks) + 1
 
-        verify_logits, _, verify_hidden = forward_with_hidden_states(
-            target_model,
-            verify_input,
-            cache=target_cache,
-            capture_layers=target_layer_ids,
+        prev_full_accept = (
+            accept_all_first
+            and len(stats.acceptance_lengths) > 0
+            and stats.acceptance_lengths[-1] >= block_size_actual - 1
         )
-        posterior = sample(verify_logits, temperature)
 
-        # Combined eval: posterior + hidden states + cache states in one call
-        mx.eval(posterior, *verify_hidden, *_flat_cache_states(target_cache))
+        if lazy_logits or prev_full_accept:
+            if q35:
+                if use_compiled:
+                    norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states_compiled(
+                        target_model,
+                        verify_input,
+                        cache=target_cache,
+                        capture_layers=target_layer_ids,
+                    )
+                else:
+                    norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states(
+                        target_model,
+                        verify_input,
+                        cache=target_cache,
+                        capture_layers=target_layer_ids,
+                    )
+            else:
+                norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states(
+                    target_model,
+                    verify_input,
+                    cache=target_cache,
+                    capture_layers=target_layer_ids,
+                    compile_full=compile_full,
+                )
+
+            mx.eval(norm_hidden, *verify_hidden, *_flat_cache_states(target_cache))
+
+            acceptance_length = 0
+            correction_token = None
+            chunk_size = max(1, logit_chunk_size)
+
+            if prev_full_accept:
+                chunk_size = block_size_actual - 1
+
+            for chunk_start in range(0, block_size_actual, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, block_size_actual)
+                logits_chunk = _apply_lm_head(target_model, norm_hidden[:, chunk_start:chunk_end, :])
+                posterior_chunk = sample(logits_chunk, temperature)
+                mx.eval(posterior_chunk)
+
+                chunk_tokens = posterior_chunk[0].tolist()
+
+                for local_idx, tok in enumerate(chunk_tokens):
+                    pos = chunk_start + local_idx
+                    if pos == block_size_actual - 1:
+                        correction_token = tok
+                        break
+                    if tok == draft_toks[pos]:
+                        acceptance_length += 1
+                    else:
+                        correction_token = tok
+                        break
+
+                if correction_token is not None:
+                    break
+        else:
+            if q35:
+                if use_compiled:
+                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_compiled(
+                        target_model,
+                        verify_input,
+                        cache=target_cache,
+                        capture_layers=target_layer_ids,
+                    )
+                else:
+                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_and_rollback(
+                        target_model,
+                        verify_input,
+                        cache=target_cache,
+                        capture_layers=target_layer_ids,
+                    )
+            else:
+                verify_logits, _, verify_hidden = forward_with_hidden_states(
+                    target_model,
+                    verify_input,
+                    cache=target_cache,
+                    capture_layers=target_layer_ids,
+                    compile_full=compile_full,
+                )
+                rollback_records = None
+            posterior = sample(verify_logits, temperature)
+            mx.eval(posterior, *verify_hidden, *_flat_cache_states(target_cache))
+
+            target_toks = posterior[0, :-1].tolist()
+            if isinstance(target_toks, int):
+                target_toks = [target_toks]
+
+            acceptance_length = 0
+            for i in range(len(draft_toks)):
+                if draft_toks[i] == target_toks[i]:
+                    acceptance_length += 1
+                else:
+                    break
+            correction_token = int(posterior[0, acceptance_length])
 
         t_iter_end = time.perf_counter()
         iter_time_ms = (t_iter_end - t_iter_start) * 1000
 
-        # KOD: extract draft confidence from draft_logits
         if kod:
             draft_probs = mx.softmax(draft_logits, axis=-1)
             draft_max_probs = mx.max(draft_probs, axis=-1)
             avg_conf = float(mx.mean(draft_max_probs))
             kod_confs.append(avg_conf)
-
-        # --- Accept/reject using MLX array ops ---
-        draft_toks = sampled_tokens[0].tolist()
-        target_toks = posterior[0, :-1].tolist()
-        if isinstance(target_toks, int):
-            target_toks = [target_toks]
-
-        acceptance_length = 0
-        for i in range(len(draft_toks)):
-            if draft_toks[i] == target_toks[i]:
-                acceptance_length += 1
-            else:
-                break
 
         if acceptance_length > 0:
             accepted_toks = draft_toks[:acceptance_length]
@@ -350,7 +443,6 @@ def spec_generate(
             if stream_callback is not None:
                 for t in accepted_toks:
                     stream_callback(t)
-        correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
         if stream_callback is not None:
             stream_callback(correction_token)
@@ -359,7 +451,17 @@ def spec_generate(
 
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
-            cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
+            if q35 and rollback_records is not None:
+                accepted_inputs = acceptance_length + 1
+                rollback_tensors = [
+                    v for r in rollback_records.values()
+                    for v in r.values() if isinstance(v, mx.array)
+                ]
+                if rollback_tensors:
+                    mx.eval(*rollback_tensors)
+                rollback_linear_caches(target_cache, rollback_records, accepted_inputs)
+            else:
+                cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
         target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 

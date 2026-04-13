@@ -83,6 +83,9 @@ class SpecServer:
             stream_callback=stream_callback,
             prefill_step_size=self.args.prefill_step_size,
             prompt_cache=target_cache,
+            lazy_logits=self.args.lazy_logits,
+            logit_chunk_size=self.args.logit_chunk_size,
+            compile_full=self.args.compile_full,
         )
 
         all_tokens = tokens + output_ids[0, len(tokens):].tolist()
@@ -92,10 +95,17 @@ class SpecServer:
 
         return output_ids, stats
 
+    def _format_prompt(self, messages):
+        kwargs = {"add_generation_prompt": True, "tokenize": False}
+        if self.args.no_think:
+            try:
+                kwargs["enable_thinking"] = False
+            except TypeError:
+                pass
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
+
     def generate_streaming(self, messages, max_tokens=128, temperature=0.0, write_fn=None):
-        prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False,
-        )
+        prompt = self._format_prompt(messages)
         tokens = self.tokenizer.encode(prompt)
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -128,9 +138,7 @@ class SpecServer:
         })
 
     def generate(self, messages, max_tokens=128, temperature=0.0):
-        prompt = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False,
-        )
+        prompt = self._format_prompt(messages)
         tokens = self.tokenizer.encode(prompt)
 
         output_ids, stats = self._do_spec(tokens, max_tokens, temperature)
@@ -217,6 +225,11 @@ class Handler(BaseHTTPRequestHandler):
         temperature = body.get("temperature", 0.0)
         stream = body.get("stream", False)
 
+        if srv.args.no_think:
+            has_system = any(m.get("role") == "system" for m in messages)
+            if not has_system:
+                messages = [{"role": "system", "content": "/no_think"}] + messages
+
         if stream:
             self.send_response(200)
             self.send_header("Content-type", "text/event-stream")
@@ -254,6 +267,10 @@ def main():
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--prefill-step-size", type=int, default=512, help="Chunk size for prompt prefill")
     parser.add_argument("--cache-size", type=int, default=10, help="Max prompt cache entries")
+    parser.add_argument("--no-think", action="store_true", help="Inject /no_think system prompt for Qwen3 thinking mode")
+    parser.add_argument("--lazy-logits", action="store_true", help="Use lazy logits: compute lm_head in chunks, stopping at rejection")
+    parser.add_argument("--logit-chunk-size", type=int, default=1, help="Chunk size for lazy logits (1=token-by-token)")
+    parser.add_argument("--compile-full", action="store_true", help="Use mx.compile for full-attention layers during verify")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
