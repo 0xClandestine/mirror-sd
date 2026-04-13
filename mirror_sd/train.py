@@ -41,7 +41,7 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten
 
 from .dflash import DFlashConfig, DFlashDraftModel, build_target_layer_ids
 

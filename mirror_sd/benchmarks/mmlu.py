@@ -4,7 +4,7 @@ Evaluates accuracy and throughput on the MMLU (Massive Multitask Language
 Understanding) benchmark using 5-shot prompting.
 
 Usage:
-    python -m mirror_sd.mmlu --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
+    python -m mirror_sd.benchmarks.mmlu --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
     python -m mirror_sd.mmlu --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --subjects abstract_algebra,anatomy
     python -m mirror_sd.mmlu --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --baseline-only
 """
@@ -17,9 +17,9 @@ from datasets import load_dataset
 from mlx_lm import load as mlx_load
 from mlx_lm.models import cache as cache_module
 
-from .generate import spec_generate
-from .loader import load_dflash_model
-from .prompt import format_prompt, get_stop_token_ids
+from ..generate import spec_generate
+from ..loader import load_dflash_model
+from ..prompt import format_prompt, get_stop_token_ids
 
 
 MMLU_CHOICES = ["A", "B", "C", "D"]

@@ -3,12 +3,10 @@
 Usage:
     mirror-sd generate --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --prompt "Hello"
     mirror-sd convert --source z-lab/Qwen3-8B-DFlash-b16 --output ./dflash-mlx
-    mirror-sd bench --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
 """
 
 import argparse
 import sys
-import time
 from typing import Optional
 
 import mlx.core as mx
@@ -83,87 +81,6 @@ def cmd_convert(args):
     convert_dflash_to_mlx(args.source, args.output)
 
 
-def cmd_bench(args):
-    from mlx_lm import load as mlx_load
-    from .dflash import DFlashDraftModel, DFlashConfig
-    from .generate import spec_generate
-    from .loader import load_dflash_model
-
-    print(f"Loading target model: {args.model}")
-    target_model, tokenizer = mlx_load(args.model)
-
-    print(f"Loading DFlash draft model: {args.draft}")
-    draft_model, config = load_dflash_model(args.draft)
-
-    if args.ane:
-        from .ane_model import ANEDraftModel
-        print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
-        ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
-        ane_model.load_weights(draft_model, target_model)
-        ane_model.gpu_fallback = draft_model
-        draft_model = ane_model
-
-    use_chat = not args.raw_prompt
-    prompt = args.prompt or "The meaning of life is"
-    formatted = format_prompt(tokenizer, prompt) if use_chat else prompt
-    tokens = tokenizer.encode(formatted)
-    input_ids = mx.array(tokens)[None]
-
-    stop_ids = get_stop_token_ids(tokenizer)
-
-    # Baseline (autoregressive)
-    print("\nRunning baseline (autoregressive)...")
-    from mlx_lm.models import cache as cache_module
-    t0 = time.perf_counter()
-    baseline_cache = cache_module.make_prompt_cache(target_model)
-    logits = target_model(input_ids, cache=baseline_cache)
-    mx.eval(logits)
-    mx.eval([c.state for c in baseline_cache])
-
-    next_token = mx.argmax(logits[:, -1:, :], axis=-1)
-    mx.eval(next_token)
-    generated = [next_token.item()]
-    prefill_time = time.perf_counter() - t0
-
-    for _ in range(args.max_tokens - 1):
-        if generated[-1] in stop_ids:
-            break
-        token_input = mx.array([[generated[-1]]])
-        logits = target_model(token_input, cache=baseline_cache)
-        mx.eval(logits)
-        next_token = mx.argmax(logits[:, -1:, :], axis=-1)
-        mx.eval(next_token)
-        generated.append(next_token.item())
-
-    baseline_time = time.perf_counter() - t0
-    baseline_gen_time = baseline_time - prefill_time
-    baseline_tps = len(generated) / max(baseline_gen_time, 1e-9)
-
-    # Speculative decoding
-    print("Running speculative decoding (DFlash)...")
-    output_ids, stats, _, _, _ = spec_generate(
-        target_model=target_model,
-        draft_model=draft_model,
-        input_ids=input_ids,
-        max_new_tokens=args.max_tokens,
-        stop_token_ids=stop_ids,
-        temperature=0.0,
-        mirror_sd=args.mirror_sd,
-        failfast=args.failfast,
-        failfast_tau=args.failfast_tau,
-        failfast_max_spec=args.failfast_max_spec,
-        num_draft_layers=args.num_draft_layers,
-        adaptive_block=args.adaptive_block,
-    )
-
-    print(f"\n{'='*60}")
-    print(f"Results:")
-    print(f"  Baseline:  {baseline_tps:.1f} tok/s")
-    print(f"  DFlash:    {stats.tokens_per_sec:.1f} tok/s")
-    print(f"  Speedup:   {stats.tokens_per_sec / baseline_tps:.2f}x")
-    print(f"  Avg acceptance length: {stats.avg_acceptance_length:.2f}")
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="mirror-sd",
@@ -194,30 +111,12 @@ def main():
     conv_parser.add_argument("--source", type=str, required=True, help="HuggingFace repo ID")
     conv_parser.add_argument("--output", type=str, required=True, help="Output directory")
 
-    # bench
-    bench_parser = subparsers.add_parser("bench", help="Benchmark speculative vs autoregressive decoding")
-    bench_parser.add_argument("--model", type=str, required=True, help="Target model")
-    bench_parser.add_argument("--draft", type=str, required=True, help="DFlash draft model path")
-    bench_parser.add_argument("--prompt", type=str, default=None, help="Benchmark prompt")
-    bench_parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens for benchmark")
-    bench_parser.add_argument("--ane", action="store_true", help="Run draft model on Apple Neural Engine")
-    bench_parser.add_argument("--ane-ctx-len", type=int, default=64, help="Max context length for ANE draft (default: 64)")
-    bench_parser.add_argument("--mirror-sd", action="store_true", help="Use Mirror-SD early-exit (prefix/suffix split + parallel draft)")
-    bench_parser.add_argument("--failfast", action="store_true", help="Enable FailFast dynamic speculation length")
-    bench_parser.add_argument("--failfast-tau", type=float, default=0.4, help="FailFast confidence threshold (default: 0.4)")
-    bench_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
-    bench_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
-    bench_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
-    bench_parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompt without chat template (breaks DFlash acceptance)")
-
     args = parser.parse_args()
 
     if args.command == "generate":
         cmd_generate(args)
     elif args.command == "convert":
         cmd_convert(args)
-    elif args.command == "bench":
-        cmd_bench(args)
     else:
         parser.print_help()
         sys.exit(1)

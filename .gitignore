@@ -6,3 +6,4 @@ build/
 ane/target/
 uv.lock
 .venv
+.DS_Store

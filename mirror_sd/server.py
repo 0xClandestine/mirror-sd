@@ -17,7 +17,6 @@ import json
 import os
 import time
 import uuid
-from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
@@ -88,6 +87,8 @@ class SpecServer:
             compile_full=self.args.compile_full,
             compiled_whole=self.args.compiled_whole,
             turboquant_bits=self.args.turboquant_bits,
+            auto_ar=self.args.auto_ar,
+            auto_ar_threshold=self.args.auto_ar_threshold,
         )
 
         all_tokens = tokens + output_ids[0, len(tokens):].tolist()
@@ -275,6 +276,8 @@ def main():
     parser.add_argument("--compile-full", action="store_true", help="Use mx.compile for full-attention layers during verify")
     parser.add_argument("--compiled-whole", action="store_true", help="Use mx.compile for entire 64-layer verify pass")
     parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
+    parser.add_argument("--auto-ar", action="store_true", help="Auto fallback to AR when acceptance rate is below breakeven")
+    parser.add_argument("--auto-ar-threshold", type=float, default=0.35, help="Auto-AR per-token acceptance threshold (default: 0.35)")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)

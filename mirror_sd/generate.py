@@ -20,15 +20,15 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 
+from mlx_lm.models.cache import KVCache
+
 from .dflash import (
-    DFlashKVCache,
     extract_context_feature, sample,
 )
 from .target import (
     forward_with_hidden_states, forward_with_hidden_states_and_rollback,
     forward_with_hidden_states_compiled,
     forward_verifier_states, forward_verifier_states_compiled,
-    forward_accept_all_block, forward_accept_all_block_compiled,
     forward_prefix, forward_suffix,
     get_embed_tokens, get_lm_head,
     is_qwen35, rollback_linear_caches, _apply_lm_head,
@@ -98,6 +98,8 @@ class SpecDecodeStats:
     parallel_mode: bool = False
     total_draft_time: float = 0.0
     total_verify_time: float = 0.0
+    total_rollback_time: float = 0.0
+    total_misc_time: float = 0.0
     total_overlap_time: float = 0.0
 
     @property
@@ -122,6 +124,96 @@ class SpecDecodeStats:
         return self.total_tokens / max(gen_time, 1e-9)
 
 
+def ar_generate(
+    target_model,
+    input_ids: mx.array,
+    max_new_tokens: int,
+    stop_token_ids=None,
+    temperature: float = 0.0,
+    target_layer_ids=None,
+    prefill_step_size: int = 512,
+    stream_callback=None,
+) -> Tuple[mx.array, SpecDecodeStats]:
+    from mlx_lm.models import cache as cache_module
+
+    if target_layer_ids is None:
+        target_layer_ids = []
+
+    stats = SpecDecodeStats()
+    t_start = time.perf_counter()
+
+    target_cache = cache_module.make_prompt_cache(target_model)
+    output_ids_list = input_ids.tolist()[0] if input_ids.ndim == 2 else input_ids.tolist()
+    if isinstance(output_ids_list, int):
+        output_ids_list = [output_ids_list]
+
+    num_input = input_ids.shape[1]
+
+    if num_input > prefill_step_size:
+        for start in range(0, num_input - prefill_step_size, prefill_step_size):
+            chunk = input_ids[:, start:start + prefill_step_size]
+            logits_chunk, _, _ = forward_with_hidden_states(
+                target_model, chunk, cache=target_cache, capture_layers=[],
+            )
+            mx.eval(logits_chunk, *_flat_cache_states(target_cache))
+            del logits_chunk
+        last_start = (num_input // prefill_step_size) * prefill_step_size
+        if last_start >= num_input:
+            last_start = max(0, num_input - prefill_step_size)
+        last_chunk = input_ids[:, last_start:]
+        logits, _, hidden_states = forward_with_hidden_states(
+            target_model, last_chunk, cache=target_cache,
+            capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, *hidden_states, first_token, *_flat_cache_states(target_cache))
+    else:
+        logits, _, hidden_states = forward_with_hidden_states(
+            target_model, input_ids, cache=target_cache,
+            capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, *hidden_states, first_token, *_flat_cache_states(target_cache))
+
+    first_tok = int(first_token[0, 0])
+    output_ids_list.append(first_tok)
+    if stream_callback is not None:
+        stream_callback(first_tok)
+
+    stats.prefill_time = time.perf_counter() - t_start
+
+    start = num_input + 1
+    max_length = num_input + max_new_tokens
+
+    while start < max_length:
+        last_tok = mx.array([[output_ids_list[-1]]], dtype=mx.int32)
+        logits, _, _ = forward_with_hidden_states(
+            target_model, last_tok, cache=target_cache,
+            capture_layers=[],
+        )
+        next_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(next_token, *_flat_cache_states(target_cache))
+        next_tok = int(next_token[0, 0])
+        output_ids_list.append(next_tok)
+        if stream_callback is not None:
+            stream_callback(next_tok)
+        start += 1
+        stats.total_tokens += 1
+        if stop_token_ids is not None:
+            for stop_id in stop_token_ids:
+                if stop_id in output_ids_list[num_input + 1:]:
+                    break
+            else:
+                continue
+            break
+
+    stats.total_time = time.perf_counter() - t_start
+    stats.draft_steps = stats.total_tokens
+
+    output_ids = mx.array([output_ids_list])
+    return output_ids, stats
+
+
 def spec_generate(
     target_model,
     draft_model,
@@ -135,7 +227,7 @@ def spec_generate(
     failfast_tau: float = 0.4,
     failfast_max_spec: int = 64,
     num_draft_layers: Optional[int] = None,
-    adaptive_block: bool = True,
+    adaptive_block: bool = False,
     kod: bool = False,
     stream_callback=None,
     prefill_step_size: int = 512,
@@ -148,6 +240,10 @@ def spec_generate(
     logit_chunk_size: int = 1,
     accept_all_first: bool = False,
     turboquant_bits: float = 0.0,
+    auto_ar: bool = False,
+    auto_ar_window: int = 6,
+    auto_ar_threshold: float = 0.35,
+    auto_ar_min_steps: int = 8,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
@@ -306,7 +402,43 @@ def spec_generate(
         if current_block_size < 2:
             break
 
-        t_iter_start = time.perf_counter()
+        use_ar_fallback = False
+        if auto_ar and len(stats.acceptance_lengths) >= auto_ar_min_steps and len(stats.acceptance_lengths) >= auto_ar_window:
+            recent = stats.acceptance_lengths[-auto_ar_window:]
+            recent_alpha = sum(a - 1 for a in recent) / (auto_ar_window * (base_block_size - 1))
+            if recent_alpha < auto_ar_threshold:
+                use_ar_fallback = True
+
+        if use_ar_fallback:
+            t_ar_start = time.perf_counter()
+            last_tok = mx.array([[output_ids_list[-1]]], dtype=mx.int32)
+            ar_logits, _, ar_hidden = forward_with_hidden_states(
+                target_model, last_tok, cache=target_cache,
+                capture_layers=target_layer_ids,
+            )
+            ar_next = sample(ar_logits[:, -1:, :], temperature)
+            mx.eval(ar_next, *ar_hidden, *_flat_cache_states(target_cache))
+            target_hidden = extract_context_feature(ar_hidden, target_layer_ids)
+            next_tok = int(ar_next[0, 0])
+            output_ids_list.append(next_tok)
+            if stream_callback is not None:
+                stream_callback(next_tok)
+            start += 1
+            stats.total_verify_time += time.perf_counter() - t_ar_start
+            stats.acceptance_lengths.append(1)
+            stats.spec_lengths.append(0)
+            stats.draft_steps += 1
+            stats.total_tokens += 1
+            if stop_token_ids is not None:
+                for stop_id in stop_token_ids:
+                    if stop_id in output_ids_list[num_input_tokens:]:
+                        break
+                else:
+                    continue
+                break
+            continue
+
+        t_draft_start = time.perf_counter()
 
         # --- Draft phase ---
         anchor_token = output_ids_list[-1]
@@ -322,11 +454,14 @@ def spec_generate(
         draft_logits = lm_head_fn(draft_hidden[:, -current_block_size + 1:, :])
         sampled_tokens = sample(draft_logits, temperature)
 
-        # --- Crop draft cache BEFORE start increment ---
         for c in draft_cache:
-            c.crop(start)
+            c.trim(current_block_size)
+
+        t_draft_end = time.perf_counter()
+        stats.total_draft_time += t_draft_end - t_draft_start
 
         # --- Verify phase ---
+        t_verify_start = time.perf_counter()
         anchor_arr = mx.array([[anchor_token]], dtype=mx.int32)
         verify_input = mx.concatenate([anchor_arr, sampled_tokens], axis=1)
         draft_toks = sampled_tokens[0].tolist()
@@ -441,8 +576,10 @@ def spec_generate(
                     break
             correction_token = int(posterior[0, acceptance_length])
 
-        t_iter_end = time.perf_counter()
-        iter_time_ms = (t_iter_end - t_iter_start) * 1000
+        t_verify_end = time.perf_counter()
+        stats.total_verify_time += t_verify_end - t_verify_start
+
+        t_rollback_start = time.perf_counter()
 
         if kod:
             draft_probs = mx.softmax(draft_logits, axis=-1)
@@ -473,8 +610,14 @@ def spec_generate(
                 if rollback_tensors:
                     mx.eval(*rollback_tensors)
                 rollback_linear_caches(target_cache, rollback_records, accepted_inputs)
+                for c in target_cache:
+                    if isinstance(c, KVCache):
+                        c.trim(n_to_trim_target)
             else:
                 cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
+
+        t_rollback_end = time.perf_counter()
+        stats.total_rollback_time += t_rollback_end - t_rollback_start
 
         target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
@@ -485,6 +628,7 @@ def spec_generate(
         if kod:
             accept_rate = acceptance_length / max(current_block_size - 1, 1)
             kod_accepts.append(accept_rate)
+            iter_time_ms = (t_rollback_end - t_draft_start) * 1000
             kod_obs.append((current_block_size, iter_time_ms))
 
         stats.spec_lengths.append(current_block_size - 1)
@@ -502,6 +646,8 @@ def spec_generate(
             break
 
     stats.total_time = time.perf_counter() - t_start
+    gen_time = stats.total_time - stats.prefill_time
+    stats.total_misc_time = max(0, gen_time - stats.total_draft_time - stats.total_verify_time - stats.total_rollback_time)
 
     if original is not None:
         draft_model.num_draft_layers = original
@@ -697,7 +843,7 @@ def _spec_generate_mirror_sd(
         output_ids_list.append(correction_token)
 
         for c in draft_cache:
-            c.crop(start)
+            c.trim(block_size)
 
         start += acceptance_length + 1
 
@@ -816,7 +962,7 @@ def _spec_generate_mirror_sd(
         output_ids_list.append(correction_token)
 
         for c in draft_cache:
-            c.crop(start)
+            c.trim(block_size)
 
         start += acceptance_length + 1
 
@@ -1118,7 +1264,7 @@ def _spec_generate_parallel(
         output_ids_list.append(correction_token)
 
         for c in draft_cache:
-            c.crop(start)
+            c.trim(block_size)
 
         start += acceptance_length + 1
 

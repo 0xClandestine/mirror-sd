@@ -165,9 +165,16 @@ class DFlashKVCache:
         self.offset = self.keys.shape[2]
         return self.keys, self.values
 
-    def crop(self, new_length: int):
-        """Crop the cache to retain only the first new_length positions."""
-        if self.keys is not None and new_length < self.offset:
+    def trim(self, n: int):
+        """Remove the last n positions from the cache.
+
+        After each draft step, trim(n) removes the noise positions (the
+        speculative draft tokens) while keeping the context positions from
+        the verified prefix. This matches dflash-mlx's
+        trim_draft_cache(cache, block_size).
+        """
+        if self.keys is not None and n > 0:
+            new_length = max(self.offset - n, 0)
             self.keys = self.keys[..., :new_length, :]
             self.values = self.values[..., :new_length, :]
             self.offset = new_length
@@ -181,7 +188,6 @@ class DFlashKVCache:
 def make_draft_mask(
     q_len: int,
     ctx_len: int,
-    cache_len: int = 0,
     dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
     """Create a non-causal (bidirectional) attention mask for DFlash draft.
