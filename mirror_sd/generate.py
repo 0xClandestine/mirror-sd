@@ -80,7 +80,12 @@ def _install_split_attention_hooks(inner_model):
     from mlx_lm.models.base import scaled_dot_product_attention
 
     _EXACT_KV_THRESHOLD = 1024
-    _PAD_M = 16
+
+    try:
+        from dflash_mlx.kernels import batched_sdpa_2pass_exact
+        _has_2pass = True
+    except ImportError:
+        _has_2pass = False
 
     for layer in inner_model.layers:
         if getattr(layer, 'is_linear', False):
@@ -98,7 +103,7 @@ def _install_split_attention_hooks(inner_model):
         if not has_qk_norm:
             continue
 
-        def _make_split_call(orig):
+        def _make_split_call(orig, has_2pass):
             def split_call(self, x, mask=None, cache=None):
                 if not getattr(self, '_mirror_sd_split_enabled', False):
                     return orig(self, x, mask=mask, cache=cache)
@@ -139,7 +144,27 @@ def _install_split_attention_hooks(inner_model):
                     and (mask is None or mask == "causal" or isinstance(mask, mx.array))
                 )
 
-                if should_split:
+                can_2pass = (
+                    has_2pass
+                    and should_split
+                    and L == 16
+                    and queries.dtype in (mx.bfloat16, mx.float16)
+                    and int(queries.shape[-1]) in (128, 256)
+                    and int(values.shape[-1]) in (128, 256)
+                )
+
+                if can_2pass:
+                    output = batched_sdpa_2pass_exact(
+                        queries=queries,
+                        keys=keys,
+                        values=values,
+                        scale=self.scale,
+                        mask=mask if isinstance(mask, mx.array) else None,
+                    )
+                    if output is None:
+                        can_2pass = False
+
+                if should_split and not can_2pass:
                     outputs = []
                     for qi in range(L):
                         chunk_mask = None
@@ -154,7 +179,7 @@ def _install_split_attention_hooks(inner_model):
                             mask=chunk_mask,
                         ))
                     output = mx.concatenate(outputs, axis=2)
-                else:
+                elif not can_2pass:
                     output = scaled_dot_product_attention(
                         queries, keys, values, cache=cache, scale=self.scale, mask=mask
                     )
@@ -165,7 +190,7 @@ def _install_split_attention_hooks(inner_model):
 
             return split_call
 
-        cls.__call__ = _make_split_call(original_call)
+        cls.__call__ = _make_split_call(original_call, _has_2pass)
         cls._mirror_sd_split_installed = True
         attn._mirror_sd_split_enabled = True
 
@@ -478,14 +503,9 @@ def spec_generate(
         remaining = max_length - start
 
         if kod and len(kod_obs) >= 2:
-            # KOD: Kelly-Optimal Drafting block_size selection
-            # Uses observed acceptance rate as alpha estimate (draft confidence
-            # is poorly calibrated for DFlash — max softmax ~1.0 always)
             window = min(8, len(kod_accepts))
             alpha_est = sum(kod_accepts[-window:]) / window
 
-            # Auto-calibrate cost model from observed (block_size, time) pairs
-            # Need at least 2 different block_sizes for a meaningful fit
             unique_gammas = len(set(g for g, _ in kod_obs[-16:]))
             if unique_gammas >= 2 and len(kod_obs) >= 4:
                 gammas = [g for g, _ in kod_obs[-16:]]
