@@ -33,6 +33,21 @@ pub fn rmsnorm_with_eps(g: &mut Graph, x: Tensor, weight: Tensor, eps: f32) -> T
     g.multiplication(normed, weight)
 }
 
+fn rmsnorm_per_head(g: &mut Graph, x: Tensor, weight: Tensor, eps: f32) -> Tensor {
+    let inv_s =
+        g.constant_with_scalar(1.0 / 128.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let x_scaled = g.multiplication(x, inv_s);
+    let sq = g.multiplication(x_scaled, x_scaled);
+    let mean_sq = g.reduce_mean(sq, 2);
+    let eps_t = g.constant_with_scalar(eps, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let mean_sq_eps = g.addition(mean_sq, eps_t);
+    let neg_half =
+        g.constant_with_scalar(-0.5, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let inv_std = g.power(mean_sq_eps, neg_half);
+    let normed = g.multiplication(x_scaled, inv_std);
+    g.multiplication(normed, weight)
+}
+
 fn tile_kv_heads(
     g: &mut Graph,
     kv: Tensor,
@@ -113,15 +128,10 @@ pub fn build_mega_qkv_kernel(w_sq: usize, w_ctx: usize) -> Graph {
     let k_all = conv1x1_proj(&mut g, packed, wk, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
     let k_4d =
         g.reshape(k_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
-    let k_t = g.transpose(k_4d, [0, 2, 1, 3]);
-    let k_for_norm =
-        g.reshape(k_t, Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_KV_HEADS * w_kv });
     let k_norm_w =
-        g.placeholder(Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_KV_HEADS * w_kv });
-    let k_normed = rmsnorm(&mut g, k_for_norm, k_norm_w);
-    let k_norm_4d = g
-        .reshape(k_normed, Shape { batch: 1, channels: HEAD_DIM, height: N_KV_HEADS, width: w_kv });
-    let k_norm_t = g.transpose(k_norm_4d, [0, 2, 3, 1]);
+        g.placeholder(Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let k_normed = rmsnorm_per_head(&mut g, k_4d, k_norm_w, 1e-6);
+    let k_norm_t = g.transpose(k_normed, [0, 1, 3, 2]);
     let cos_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
     let sin_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
     let _k_rope = apply_rope(&mut g, k_norm_t, cos_k, sin_k, N_KV_HEADS, w_kv, HEAD_DIM);
@@ -144,15 +154,10 @@ pub fn build_mega_qkv_kernel(w_sq: usize, w_ctx: usize) -> Graph {
     let q_out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
     let q_4d =
         g.reshape(q_out, Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
-    let q_t = g.transpose(q_4d, [0, 2, 1, 3]);
-    let q_for_norm =
-        g.reshape(q_t, Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_HEADS * w_sq });
     let q_norm_w =
-        g.placeholder(Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_HEADS * w_sq });
-    let q_normed = rmsnorm(&mut g, q_for_norm, q_norm_w);
-    let q_norm_4d =
-        g.reshape(q_normed, Shape { batch: 1, channels: HEAD_DIM, height: N_HEADS, width: w_sq });
-    let q_norm_t = g.transpose(q_norm_4d, [0, 2, 3, 1]);
+        g.placeholder(Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
+    let q_normed = rmsnorm_per_head(&mut g, q_4d, q_norm_w, 1e-6);
+    let q_norm_t = g.transpose(q_normed, [0, 1, 3, 2]);
     let cos_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
     let sin_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
     let _q_rope = apply_rope(&mut g, q_norm_t, cos_q, sin_q, N_HEADS, w_sq, HEAD_DIM);

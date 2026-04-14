@@ -122,7 +122,7 @@ class ANEDraftModel:
         arr = mx.broadcast_to(arr, (channels, w))
         return self.ane.ANETensor.from_buffer(1, channels, 1, w, memoryview(arr))
 
-    def _make_4d_norm_weight(self, head_weight_list, n_heads, width):
+    def _make_per_head_norm_weight(self, head_weight_list, n_heads, width):
         w = align_width(width)
         head_dim = len(head_weight_list)
         half = head_dim // 2
@@ -130,9 +130,9 @@ class ANEDraftModel:
         for k in range(half):
             il.append(head_weight_list[k])
             il.append(head_weight_list[k + half])
-        il_arr = mx.array(il, dtype=mx.float32).reshape(head_dim, 1)
-        arr = mx.broadcast_to(il_arr, (head_dim, n_heads * w))
-        return self.ane.ANETensor.from_buffer(1, head_dim, 1, n_heads * w, memoryview(arr))
+        il_arr = mx.array(il, dtype=mx.float32).reshape(1, 1, head_dim, 1)
+        arr = mx.broadcast_to(il_arr, (1, n_heads, head_dim, w))
+        return self.ane.ANETensor.from_buffer(1, n_heads, head_dim, w, memoryview(arr))
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
         self._load_fc_weights(draft_model)
@@ -180,14 +180,14 @@ class ANEDraftModel:
         setattr(self, f"w_{p}q_proj", self._make_weight_buf(q_proj_w_il, N_HEADS * HEAD_DIM, HIDDEN))
 
         q_norm_w = self._mlx_to_f32_list(layer.self_attn.q_norm.weight)
-        setattr(self, f"w_{p}q_norm_4d", self._make_4d_norm_weight(q_norm_w, N_HEADS, self.w_sq))
+        setattr(self, f"w_{p}q_norm_4d", self._make_per_head_norm_weight(q_norm_w, N_HEADS, self.w_sq))
 
         k_proj_w = layer.self_attn.k_proj.weight.astype(mx.float32)
         k_proj_w_il = _interleave_head_dims_mx(k_proj_w, N_KV_HEADS, HEAD_DIM)
         setattr(self, f"w_{p}k_proj", self._make_weight_buf(k_proj_w_il, N_KV_HEADS * HEAD_DIM, HIDDEN))
 
         k_norm_w = self._mlx_to_f32_list(layer.self_attn.k_norm.weight)
-        setattr(self, f"w_{p}k_norm_4d", self._make_4d_norm_weight(k_norm_w, N_KV_HEADS, self.w_kv))
+        setattr(self, f"w_{p}k_norm_4d", self._make_per_head_norm_weight(k_norm_w, N_KV_HEADS, self.w_kv))
 
         v_proj_w = layer.self_attn.v_proj.weight.astype(mx.float32)
         setattr(self, f"w_{p}v_proj", self._make_weight_buf(v_proj_w, N_KV_HEADS * HEAD_DIM, HIDDEN))
