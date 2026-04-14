@@ -1,11 +1,4 @@
-"""Weight loading and model conversion for DFlash on MLX.
-
-Handles:
-1. Loading DFlash draft model weights from HuggingFace safetensors
-2. Converting PyTorch dtype tensors to MLX-compatible float16
-3. Mapping HuggingFace weight names to MLX module structure
-4. Auto-detecting configuration from HuggingFace config.json
-"""
+"""Weight loading and model conversion for DFlash on MLX."""
 
 import json
 from pathlib import Path
@@ -14,7 +7,7 @@ from typing import Optional, Tuple, Dict
 import mlx.core as mx
 import mlx.nn as nn
 
-from .dflash import DFlashDraftModel, DFlashConfig
+from .model import DFlashDraftModel, DFlashConfig
 
 
 def load_dflash_model(
@@ -23,18 +16,7 @@ def load_dflash_model(
     dtype: mx.Dtype = mx.bfloat16,
     quantize: Optional[int] = None,
 ) -> Tuple[DFlashDraftModel, DFlashConfig]:
-    """Load a DFlash draft model from a HuggingFace model directory.
-
-    Args:
-        model_path: Path to local model directory or HuggingFace repo ID
-        config_overrides: Optional config overrides
-        dtype: Target dtype for model weights
-        quantize: If set, quantize the model to this many bits (4 or 8)
-
-    Returns:
-        draft_model: DFlashDraftModel with loaded weights
-        config: DFlashConfig used to create the model
-    """
+    """Load a DFlash draft model from a HuggingFace model directory."""
     from huggingface_hub import snapshot_download
 
     model_path = Path(model_path)
@@ -57,7 +39,6 @@ def load_dflash_model(
 
 
 def _load_config(model_path: Path, overrides: Optional[Dict] = None) -> DFlashConfig:
-    """Load DFlashConfig from a HuggingFace config.json."""
     config_path = model_path / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"No config.json found at {config_path}")
@@ -75,11 +56,6 @@ def _load_safetensors(
     model_path: Path,
     dtype: mx.Dtype = mx.bfloat16,
 ) -> Dict[str, mx.array]:
-    """Load weights from safetensors files using MLX native loader.
-    
-    Handles both single file and sharded (model-00001-of-000NN.safetensors) formats.
-    Converts to the specified dtype (default bfloat16 to match target model).
-    """
     weights = {}
 
     single = model_path / "model.safetensors"
@@ -121,16 +97,7 @@ def convert_dflash_to_mlx(
     output_dir: str,
     dtype: mx.Dtype = mx.bfloat16,
 ):
-    """Convert a DFlash model from HuggingFace format to MLX format.
-
-    Downloads the model from HuggingFace, converts weights to float16,
-    and saves in MLX-compatible safetensors format.
-
-    Args:
-        source_path: HuggingFace repo ID (e.g., "z-lab/Qwen3-8B-DFlash-b16")
-        output_dir: Local directory to save converted model
-        dtype: Target dtype for conversion
-    """
+    """Convert a DFlash model from HuggingFace format to MLX format."""
     from huggingface_hub import snapshot_download
 
     output_dir = Path(output_dir)

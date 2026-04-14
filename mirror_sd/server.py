@@ -1,15 +1,4 @@
-"""OpenAI-compatible server wrapping DFlash speculative decoding.
-
-Serves /v1/chat/completions (streaming + non-streaming) and /v1/models
-so that llama-benchy can benchmark our speculative decoding pipeline.
-
-Supports KV prompt cache persistence (like mlx_lm.server) so prefix-cached
-benchmarking tools get correct decode-only tg measurements.
-
-Usage:
-    python -m mirror_sd.server --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16
-    python -m mirror_sd.server --model ~/.omlx/models/Qwen3.5-27B-4bit --draft z-lab/Qwen3.5-27B-DFlash --kod
-"""
+"""OpenAI-compatible server wrapping DFlash speculative decoding."""
 
 import argparse
 import copy
@@ -25,8 +14,8 @@ import mlx.core as mx
 from mlx_lm import load as mlx_load
 from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache
 
-from .loader import load_dflash_model
-from .generate import spec_generate
+from .dflash.loader import load_dflash_model
+from .dflash.runtime import spec_generate
 from .prompt import get_stop_token_ids
 
 
@@ -60,12 +49,6 @@ class SpecServer:
         self._log_cache()
 
         if target_cache is not None and len(rest_tokens) == 0:
-            # Full cache hit — pass last prefill_step_size tokens so spec_generate
-            # can capture target_hidden from capture_layers forward.
-            # These tokens are already in the KV cache, so this re-prefills them,
-            # but it's the only way to get target_hidden for the draft model.
-            # After generation, LRUPromptCache will store the longer entry and
-            # evict the old shorter one (since caches are trimmable).
             last_n = min(self.args.prefill_step_size, len(tokens))
             input_ids = mx.array(tokens[-last_n:])[None]
         elif target_cache is not None and len(rest_tokens) > 0:

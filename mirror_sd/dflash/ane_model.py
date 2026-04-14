@@ -1,22 +1,4 @@
-"""DFlash draft model running on Apple Neural Engine.
-
-Uses mega_qkv kernel (input-pack approach) to fuse Q/K/V projections +
-per-head norms + RoPE into a single ANE dispatch per layer, eliminating
-3 Python round-trips per layer.
-
-Key innovation (ANE rule #22): Instead of separate k_proj_ctx + k_proj_noise
-+ concat (which fails at runtime due to concat→reshape→transpose pattern),
-we pack context + normed into one tensor [1, HIDDEN, 1, w_kv] and do ONE
-conv1x1 for K (and V). This is mathematically equivalent and avoids the
-problematic output concat pattern.
-
-The attention computation (GQA tile + SDPA + o_proj) uses separate kernels
-because the mega_qkv + GQA tile exceeds the ANE's per-dispatch operation limit.
-
-Data flow per layer (7 kernels → 4 kernels + 1 Python round-trip):
-  hidden ──┬──→ mega_qkv ──→ (k_rope_4d, v_4d_t, q_rope_4d) ──→ gqa_tile ──→ attn_out ──→ (Python 4D→flat) ──→ o_proj_residual ──→ ffn_residual
-  context ─┘
-"""
+"""DFlash draft model running on Apple Neural Engine."""
 
 import time
 from typing import Optional
@@ -24,7 +6,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .dflash import DFlashConfig
+from .model import DFlashConfig
+from .cache import DFlashKVCache
 
 
 HIDDEN = 4096
@@ -96,12 +79,10 @@ class ANEDraftModel:
         self.b_context = ane.ANETensor(1, HIDDEN, 1, w_ctx)
         self.b_hidden = ane.ANETensor(1, HIDDEN, 1, w_sq)
 
-        # mega_qkv outputs
         self.b_k_rope_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
         self.b_v_4d_t = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
         self.b_q_rope_4d = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
 
-        # Attention path intermediates
         self.b_kv_tiled = ane.ANETensor(1, 2 * N_HEADS, w_kv, HEAD_DIM)
         self.b_attn_out = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
         self.b_attn_flat = ane.ANETensor(1, N_HEADS * HEAD_DIM, 1, w_sq)
@@ -217,6 +198,7 @@ class ANEDraftModel:
     def _load_final_norm_weights(self, model: nn.Module):
         norm_w = self._mlx_to_f32_list(model.norm.weight)
         self.w_final_norm = self._make_norm_weight_expanded(norm_w, HIDDEN, self.w_sq)
+
     def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
                 rope_offset: int = 0, ctx_len: int = None) -> mx.array:
         if ctx_len is None:
@@ -257,7 +239,6 @@ class ANEDraftModel:
                            ctx_len=target_hidden.shape[1])
 
     def make_cache(self):
-        from .dflash import DFlashKVCache
         return [DFlashKVCache() for _ in range(N_DFLASH_LAYERS)]
 
     def _write_mlx_2d(self, buf, arr: mx.array):
@@ -291,9 +272,6 @@ class ANEDraftModel:
     def _run_layer(self, k, layer_idx: int):
         p = f"l{layer_idx}_"
 
-        # --- mega_qkv: in_norm + Q/K/V projections + per-head norms + RoPE ---
-        # Input-pack approach: concat(context, normed) → one conv1x1 for K/V
-        # 3 outputs: k_rope_4d, v_4d_t, q_rope_4d
         k['mega_qkv'].run_uncached(
             [self.b_hidden, getattr(self, f"w_{p}in_norm"),
              self.b_context,
@@ -307,7 +285,6 @@ class ANEDraftModel:
             [self.b_k_rope_4d, self.b_v_4d_t, self.b_q_rope_4d],
         )
 
-        # --- GQA tile + attention + o_proj ---
         k['gqa_tile'].run_uncached(
             [self.b_k_rope_4d, self.b_v_4d_t],
             [self.b_kv_tiled],

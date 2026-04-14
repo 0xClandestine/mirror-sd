@@ -13,12 +13,15 @@ import argparse
 import time
 
 import mlx.core as mx
-from datasets import load_dataset
+try:
+    from datasets import load_dataset
+except ImportError:
+    load_dataset = None
 from mlx_lm import load as mlx_load
 from mlx_lm.models import cache as cache_module
 
-from ..generate import spec_generate
-from ..loader import load_dflash_model
+from ..dflash.runtime import spec_generate
+from ..dflash.loader import load_dflash_model
 from ..prompt import format_prompt, get_stop_token_ids
 
 
@@ -131,6 +134,9 @@ def run_mmlu(args):
     use_chat = not args.raw_prompt
     eos_ids = get_stop_token_ids(tokenizer) or None
 
+    if load_dataset is None:
+        print("Error: 'datasets' package is required for MMLU. Install with: pip install mirror-sd[bench]")
+        return
     print("Loading MMLU dataset...")
     test_ds = load_dataset("cais/mmlu", "all", split="test")
     dev_ds = load_dataset("cais/mmlu", "all", split="dev")

@@ -1,9 +1,4 @@
-"""CLI for Mirror-SD: DFlash speculative decoding on Apple Silicon.
-
-Usage:
-    mirror-sd generate --model Qwen/Qwen3-8B --draft z-lab/Qwen3-8B-DFlash-b16 --prompt "Hello"
-    mirror-sd convert --source z-lab/Qwen3-8B-DFlash-b16 --output ./dflash-mlx
-"""
+"""CLI for Mirror-SD: DFlash speculative decoding on Apple Silicon."""
 
 import argparse
 import sys
@@ -17,8 +12,8 @@ from .prompt import format_prompt, get_stop_token_ids
 def cmd_generate(args):
     from mlx_lm import load as mlx_load
     from .dflash import DFlashDraftModel, DFlashConfig
-    from .generate import spec_generate
-    from .loader import load_dflash_model
+    from .dflash.runtime import spec_generate
+    from .dflash.loader import load_dflash_model
 
     print(f"Loading target model: {args.model}")
     target_model, tokenizer = mlx_load(args.model)
@@ -27,7 +22,7 @@ def cmd_generate(args):
     draft_model, config = load_dflash_model(args.draft)
 
     if args.ane:
-        from .ane_model import ANEDraftModel
+        from .dflash.ane_model import ANEDraftModel
         print(f"[ANE] Initializing ANE draft model (ctx_len={args.ane_ctx_len})...")
         ane_model = ANEDraftModel(seq_q=config.block_size, ctx_len=args.ane_ctx_len)
         ane_model.load_weights(draft_model, target_model)
@@ -77,7 +72,7 @@ def cmd_generate(args):
 
 
 def cmd_convert(args):
-    from .loader import convert_dflash_to_mlx
+    from .dflash.loader import convert_dflash_to_mlx
     convert_dflash_to_mlx(args.source, args.output)
 
 
@@ -88,7 +83,6 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # generate
     gen_parser = subparsers.add_parser("generate", help="Generate text with speculative decoding")
     gen_parser.add_argument("--model", type=str, required=True, help="Target model (mlx-lm path or HF repo)")
     gen_parser.add_argument("--draft", type=str, required=True, help="DFlash draft model path")
@@ -106,7 +100,6 @@ def main():
     gen_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
     gen_parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompt without chat template (breaks DFlash acceptance)")
 
-    # convert
     conv_parser = subparsers.add_parser("convert", help="Convert DFlash model to MLX format")
     conv_parser.add_argument("--source", type=str, required=True, help="HuggingFace repo ID")
     conv_parser.add_argument("--output", type=str, required=True, help="Output directory")
