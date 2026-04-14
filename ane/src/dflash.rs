@@ -159,6 +159,72 @@ pub fn build_qk_rope_kernel(w_sq: usize, w_kv: usize) -> Graph {
     g
 }
 
+/// Projections + per-head Q/K norm, NO RoPE.
+/// Diagnostic kernel to isolate whether norm or RoPE destroys Q/K cosine.
+/// Outputs: k_norm_4d [1, N_KV_HEADS, w_kv, HEAD_DIM], v_4d_t [1, N_KV_HEADS, w_kv, HEAD_DIM],
+///          q_norm_4d [1, N_HEADS, w_sq, HEAD_DIM]
+pub fn build_mega_proj_qknorm_kernel(w_sq: usize, w_ctx: usize) -> Graph {
+    let mut g = Graph::new();
+    let w_kv = w_ctx + w_sq;
+
+    let hidden = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let in_norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, hidden, in_norm_w);
+
+    let context = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
+    let packed = g.concat(&[context, normed], 3);
+
+    // K path: proj + per-head norm, no RoPE
+    let wk = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: N_KV_HEADS * HEAD_DIM,
+    });
+    let k_all = conv1x1_proj(&mut g, packed, wk, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
+    let k_4d =
+        g.reshape(k_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let k_t = g.transpose(k_4d, [0, 2, 1, 3]);
+    let k_for_norm =
+        g.reshape(k_t, Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_KV_HEADS * w_kv });
+    let k_norm_w =
+        g.placeholder(Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_KV_HEADS * w_kv });
+    let k_normed = rmsnorm(&mut g, k_for_norm, k_norm_w);
+    let k_norm_4d = g
+        .reshape(k_normed, Shape { batch: 1, channels: HEAD_DIM, height: N_KV_HEADS, width: w_kv });
+    let _k_norm_t = g.transpose(k_norm_4d, [0, 2, 3, 1]);
+
+    // V path: proj + transpose
+    let wv = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: N_KV_HEADS * HEAD_DIM,
+    });
+    let v_all = conv1x1_proj(&mut g, packed, wv, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
+    let v_4d =
+        g.reshape(v_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let _v_4d_t = g.transpose(v_4d, [0, 1, 3, 2]);
+
+    // Q path: proj + per-head norm, no RoPE
+    let wq =
+        g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: N_HEADS * HEAD_DIM });
+    let q_out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
+    let q_4d =
+        g.reshape(q_out, Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
+    let q_t = g.transpose(q_4d, [0, 2, 1, 3]);
+    let q_for_norm =
+        g.reshape(q_t, Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_HEADS * w_sq });
+    let q_norm_w =
+        g.placeholder(Shape { batch: 1, channels: HEAD_DIM, height: 1, width: N_HEADS * w_sq });
+    let q_normed = rmsnorm(&mut g, q_for_norm, q_norm_w);
+    let q_norm_4d =
+        g.reshape(q_normed, Shape { batch: 1, channels: HEAD_DIM, height: N_HEADS, width: w_sq });
+    let _q_norm_t = g.transpose(q_norm_4d, [0, 2, 3, 1]);
+
+    g
+}
+
 /// K full + Q proj + V proj + V reshape+transpose + Q norm + Q rope.
 /// Incrementally building up from k_plus_q_proj to find the breaking point.
 pub fn build_kqv_plus_vnorm_qnorm_kernel(w_sq: usize, w_ctx: usize) -> Graph {
