@@ -89,6 +89,7 @@ class SpecServer:
             turboquant_bits=self.args.turboquant_bits,
             auto_ar=self.args.auto_ar,
             auto_ar_threshold=self.args.auto_ar_threshold,
+            ddtree_budget=self.args.ddtree_budget,
         )
 
         all_tokens = tokens + output_ids[0, len(tokens):].tolist()
@@ -278,6 +279,7 @@ def main():
     parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
     parser.add_argument("--auto-ar", action="store_true", help="Auto fallback to AR when acceptance rate is below breakeven")
     parser.add_argument("--auto-ar-threshold", type=float, default=0.35, help="Auto-AR per-token acceptance threshold (default: 0.35)")
+    parser.add_argument("--ddtree-budget", type=int, default=0, help="DDTree budget (0=off, >0=max tree nodes)")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
@@ -294,7 +296,7 @@ def main():
 
     ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    mode = "DFlash+KOD" if args.kod else ("DFlash+ADAPTIVE" if not args.no_adaptive else "DFlash")
+    mode = "DDTree" if args.ddtree_budget != 0 else ("DFlash+KOD" if args.kod else ("DFlash+ADAPTIVE" if not args.no_adaptive else "DFlash"))
     print(f"Serving {mode} (block_size={config.block_size}) on http://{args.host}:{args.port}")
     print(f"  model: {srv.model_name}")
     print(f"  prompt cache: {args.cache_size} entries")

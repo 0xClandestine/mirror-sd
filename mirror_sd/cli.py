@@ -63,6 +63,7 @@ def cmd_generate(args):
         failfast_max_spec=args.failfast_max_spec,
         num_draft_layers=args.num_draft_layers,
         adaptive_block=args.adaptive_block,
+        ddtree_budget=args.ddtree_budget,
     )
 
     text = tokenizer.decode(output_ids[0].tolist())
@@ -104,6 +105,7 @@ def main():
     gen_parser.add_argument("--failfast-max-spec", type=int, default=64, help="FailFast max speculation length (default: 64)")
     gen_parser.add_argument("--num-draft-layers", type=int, default=None, help="Use only the first N draft layers (1-5)")
     gen_parser.add_argument("--adaptive-block", action="store_true", help="Adaptively adjust block size based on acceptance rate")
+    gen_parser.add_argument("--ddtree-budget", type=int, default=0, help="DDTree budget (0=off, >0=max tree nodes). Defaults to draft_horizon if enabled")
     gen_parser.add_argument("--raw-prompt", action="store_true", help="Use raw prompt without chat template (breaks DFlash acceptance)")
 
     # convert

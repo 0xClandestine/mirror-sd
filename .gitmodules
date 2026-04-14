@@ -24,3 +24,6 @@
 [submodule "references/autoresearch-ANE"]
 	path = references/autoresearch-ANE
 	url = https://github.com/ncdrone/autoresearch-ANE.git
+[submodule "references/ddtree"]
+	path = references/ddtree
+	url = https://github.com/liranringel/ddtree.git

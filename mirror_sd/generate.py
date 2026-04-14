@@ -244,6 +244,7 @@ def spec_generate(
     auto_ar_window: int = 6,
     auto_ar_threshold: float = 0.35,
     auto_ar_min_steps: int = 8,
+    ddtree_budget: int = 0,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
@@ -261,6 +262,21 @@ def spec_generate(
             failfast=failfast, failfast_tau=failfast_tau,
             failfast_max_spec=failfast_max_spec,
         )
+
+    if ddtree_budget != 0:
+        from .ddtree import ddtree_generate
+        if is_qwen35(target_model):
+            import warnings
+            warnings.warn("DDTree is not yet supported for Qwen3.5 (SSM layers); falling back to vanilla spec decode")
+        else:
+            return ddtree_generate(
+                target_model, draft_model, input_ids, max_new_tokens,
+                stop_token_ids=stop_token_ids, temperature=temperature,
+                target_layer_ids=target_layer_ids,
+                ddtree_budget=ddtree_budget,
+                stream_callback=stream_callback,
+                prefill_step_size=prefill_step_size,
+            )
 
     if target_layer_ids is None:
         target_layer_ids = draft_model.config.target_layer_ids
