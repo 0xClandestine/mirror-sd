@@ -1,13 +1,34 @@
 use ane::{Graph, Shape, Tensor, MIN_SPATIAL_WIDTH};
 
-pub const HIDDEN: usize = 4096;
-pub const HEAD_DIM: usize = 128;
-pub const N_HEADS: usize = 32;
-pub const N_KV_HEADS: usize = 8;
-pub const INTERMEDIATE: usize = 12288;
-pub const N_TARGET_FEATURES: usize = 5;
-pub const TARGET_HIDDEN: usize = N_TARGET_FEATURES * HIDDEN;
-const GQA_RATIO: usize = N_HEADS / N_KV_HEADS;
+pub struct DFlashDims {
+    pub hidden: usize,
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub intermediate: usize,
+    pub target_hidden: usize,
+    pub gqa_ratio: usize,
+}
+
+pub const DIMS_8B: DFlashDims = DFlashDims {
+    hidden: 4096,
+    head_dim: 128,
+    n_heads: 32,
+    n_kv_heads: 8,
+    intermediate: 12288,
+    target_hidden: 5 * 4096,
+    gqa_ratio: 4,
+};
+
+pub const DIMS_27B: DFlashDims = DFlashDims {
+    hidden: 5120,
+    head_dim: 128,
+    n_heads: 32,
+    n_kv_heads: 8,
+    intermediate: 17408,
+    target_hidden: 5 * 5120,
+    gqa_ratio: 4,
+};
 
 pub fn align_width(w: usize) -> usize {
     let aligned = ((w + MIN_SPATIAL_WIDTH - 1) / MIN_SPATIAL_WIDTH) * MIN_SPATIAL_WIDTH;
@@ -91,116 +112,110 @@ fn apply_rope(
     g.addition(xc, xs)
 }
 
-fn conv1x1_proj(
-    g: &mut Graph,
-    input: Tensor,
-    weight: Tensor,
-    oc: usize,
-    ic: usize,
-    _seq: usize,
-) -> Tensor {
+fn conv1x1_proj(g: &mut Graph, input: Tensor, weight: Tensor, oc: usize, ic: usize) -> Tensor {
     let wt = g.transpose(weight, [0, 3, 2, 1]);
     let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     g.convolution_2d_1x1_dynamic(input, w_conv)
 }
 
-/// in_norm + QKV projections + per-head Q/K norm + RoPE.
-/// Inputs: hidden, in_norm_w, context, k_proj, k_norm_w, cos_k, sin_k, v_proj, q_proj, q_norm_w, cos_q, sin_q
-/// Outputs: k_rope_4d [1, N_KV_HEADS, w_kv, HEAD_DIM], v_4d_t [1, N_KV_HEADS, w_kv, HEAD_DIM], q_rope_4d [1, N_HEADS, w_sq, HEAD_DIM]
-pub fn build_mega_qkv_kernel(w_sq: usize, w_ctx: usize) -> Graph {
+pub fn build_fc_norm_kernel(d: &DFlashDims, w_ctx: usize) -> Graph {
+    let mut g = Graph::new();
+    let target_hid =
+        g.placeholder(Shape { batch: 1, channels: d.target_hidden, height: 1, width: w_ctx });
+    let fc_w =
+        g.placeholder(Shape { batch: 1, channels: d.target_hidden, height: 1, width: d.hidden });
+    let norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_ctx });
+    let fc_out = conv1x1_proj(&mut g, target_hid, fc_w, d.hidden, d.target_hidden);
+    let _out = rmsnorm_with_eps(&mut g, fc_out, norm_w, 1e-6);
+    g
+}
+
+pub fn build_mega_qkv_kernel(d: &DFlashDims, w_sq: usize, w_ctx: usize) -> Graph {
     let mut g = Graph::new();
     let w_kv = w_ctx + w_sq;
 
-    let hidden = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
-    let in_norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let hidden = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let in_norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let normed = rmsnorm(&mut g, hidden, in_norm_w);
 
-    let context = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
+    let context = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_ctx });
     let packed = g.concat(&[context, normed], 3);
 
-    // K path: proj + per-head norm + RoPE
     let wk = g.placeholder(Shape {
         batch: 1,
-        channels: HIDDEN,
+        channels: d.hidden,
         height: 1,
-        width: N_KV_HEADS * HEAD_DIM,
+        width: d.n_kv_heads * d.head_dim,
     });
-    let k_all = conv1x1_proj(&mut g, packed, wk, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
-    let k_4d =
-        g.reshape(k_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let k_all = conv1x1_proj(&mut g, packed, wk, d.n_kv_heads * d.head_dim, d.hidden);
+    let k_4d = g.reshape(
+        k_all,
+        Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv },
+    );
     let k_norm_w =
-        g.placeholder(Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+        g.placeholder(Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv });
     let k_normed = rmsnorm_per_head(&mut g, k_4d, k_norm_w, 1e-6);
     let k_norm_t = g.transpose(k_normed, [0, 1, 3, 2]);
-    let cos_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
-    let sin_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
-    let _k_rope = apply_rope(&mut g, k_norm_t, cos_k, sin_k, N_KV_HEADS, w_kv, HEAD_DIM);
+    let cos_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: d.head_dim });
+    let sin_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: d.head_dim });
+    let _k_rope = apply_rope(&mut g, k_norm_t, cos_k, sin_k, d.n_kv_heads, w_kv, d.head_dim);
 
-    // V path: proj + transpose
     let wv = g.placeholder(Shape {
         batch: 1,
-        channels: HIDDEN,
+        channels: d.hidden,
         height: 1,
-        width: N_KV_HEADS * HEAD_DIM,
+        width: d.n_kv_heads * d.head_dim,
     });
-    let v_all = conv1x1_proj(&mut g, packed, wv, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
-    let v_4d =
-        g.reshape(v_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let v_all = conv1x1_proj(&mut g, packed, wv, d.n_kv_heads * d.head_dim, d.hidden);
+    let v_4d = g.reshape(
+        v_all,
+        Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv },
+    );
     let _v_4d_t = g.transpose(v_4d, [0, 1, 3, 2]);
 
-    // Q path: proj + per-head norm + RoPE
-    let wq =
-        g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: N_HEADS * HEAD_DIM });
-    let q_out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
+    let wq = g.placeholder(Shape {
+        batch: 1,
+        channels: d.hidden,
+        height: 1,
+        width: d.n_heads * d.head_dim,
+    });
+    let q_out = conv1x1_proj(&mut g, normed, wq, d.n_heads * d.head_dim, d.hidden);
     let q_4d =
-        g.reshape(q_out, Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
+        g.reshape(q_out, Shape { batch: 1, channels: d.n_heads, height: d.head_dim, width: w_sq });
     let q_norm_w =
-        g.placeholder(Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
+        g.placeholder(Shape { batch: 1, channels: d.n_heads, height: d.head_dim, width: w_sq });
     let q_normed = rmsnorm_per_head(&mut g, q_4d, q_norm_w, 1e-6);
     let q_norm_t = g.transpose(q_normed, [0, 1, 3, 2]);
-    let cos_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
-    let sin_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
-    let _q_rope = apply_rope(&mut g, q_norm_t, cos_q, sin_q, N_HEADS, w_sq, HEAD_DIM);
+    let cos_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: d.head_dim });
+    let sin_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: d.head_dim });
+    let _q_rope = apply_rope(&mut g, q_norm_t, cos_q, sin_q, d.n_heads, w_sq, d.head_dim);
 
     g
 }
 
-pub fn build_fc_norm_kernel(w_ctx: usize) -> Graph {
+pub fn build_gqa_tile_kernel(d: &DFlashDims, w_kv: usize) -> Graph {
     let mut g = Graph::new();
-    let target_hid =
-        g.placeholder(Shape { batch: 1, channels: TARGET_HIDDEN, height: 1, width: w_ctx });
-    let fc_w = g.placeholder(Shape { batch: 1, channels: TARGET_HIDDEN, height: 1, width: HIDDEN });
-    let norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
-    let fc_out = conv1x1_proj(&mut g, target_hid, fc_w, HIDDEN, TARGET_HIDDEN, w_ctx);
-    let _out = rmsnorm_with_eps(&mut g, fc_out, norm_w, 1e-2);
-    g
-}
-
-/// GQA tile K and V: [1, N_KV_HEADS, w_kv, HEAD_DIM] each → concat [1, 2*N_HEADS, w_kv, HEAD_DIM].
-pub fn build_gqa_tile_kernel(w_kv: usize) -> Graph {
-    let mut g = Graph::new();
-    let k4 = g.placeholder(Shape { batch: 1, channels: N_KV_HEADS, height: w_kv, width: HEAD_DIM });
-    let k_t = tile_kv_heads(&mut g, k4, N_KV_HEADS, GQA_RATIO, w_kv, HEAD_DIM);
-    let v4 = g.placeholder(Shape { batch: 1, channels: N_KV_HEADS, height: w_kv, width: HEAD_DIM });
-    let v_t = tile_kv_heads(&mut g, v4, N_KV_HEADS, GQA_RATIO, w_kv, HEAD_DIM);
+    let k4 =
+        g.placeholder(Shape { batch: 1, channels: d.n_kv_heads, height: w_kv, width: d.head_dim });
+    let k_t = tile_kv_heads(&mut g, k4, d.n_kv_heads, d.gqa_ratio, w_kv, d.head_dim);
+    let v4 =
+        g.placeholder(Shape { batch: 1, channels: d.n_kv_heads, height: w_kv, width: d.head_dim });
+    let v_t = tile_kv_heads(&mut g, v4, d.n_kv_heads, d.gqa_ratio, w_kv, d.head_dim);
     let _out = g.concat(&[k_t, v_t], 1);
     g
 }
 
-/// SDPA with logit softcapping + flatten output.
-/// Q [1, N_HEADS, w_sq, HEAD_DIM], KV [1, 2*N_HEADS, w_kv, HEAD_DIM], mask [1, 1, w_sq, w_kv]
-/// → flat [1, N_HEADS*HEAD_DIM, 1, w_sq]
-pub fn build_attn_out_kernel(w_sq: usize, w_kv: usize, softcap: f32) -> Graph {
+pub fn build_attn_out_kernel(d: &DFlashDims, w_sq: usize, w_kv: usize, softcap: f32) -> Graph {
     let mut g = Graph::new();
-    let q = g.placeholder(Shape { batch: 1, channels: N_HEADS, height: w_sq, width: HEAD_DIM });
+    let q = g.placeholder(Shape { batch: 1, channels: d.n_heads, height: w_sq, width: d.head_dim });
     let kv =
-        g.placeholder(Shape { batch: 1, channels: 2 * N_HEADS, height: w_kv, width: HEAD_DIM });
-    let k = g.slice(kv, [0, 0, 0, 0], [1, N_HEADS, w_kv, HEAD_DIM]);
-    let v = g.slice(kv, [0, N_HEADS, 0, 0], [1, N_HEADS, w_kv, HEAD_DIM]);
+        g.placeholder(Shape { batch: 1, channels: 2 * d.n_heads, height: w_kv, width: d.head_dim });
+    let k = g.slice(kv, [0, 0, 0, 0], [1, d.n_heads, w_kv, d.head_dim]);
+    let v = g.slice(kv, [0, d.n_heads, 0, 0], [1, d.n_heads, w_kv, d.head_dim]);
 
     let scores = g.matrix_multiplication(q, k, false, true);
     let scale = g.constant_with_scalar(
-        1.0 / (HEAD_DIM as f32).sqrt(),
+        1.0 / (d.head_dim as f32).sqrt(),
         Shape { batch: 1, channels: 1, height: 1, width: 1 },
     );
     let scores_scaled = g.multiplication(scores, scale);
@@ -208,76 +223,95 @@ pub fn build_attn_out_kernel(w_sq: usize, w_kv: usize, softcap: f32) -> Graph {
     let attn_mask = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: w_kv });
     let masked_scores = g.addition(scores_scaled, attn_mask);
 
-    let cap_val =
-        g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let inv_cap =
-        g.constant_with_scalar(1.0 / softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let scores_div_cap = g.multiplication(masked_scores, inv_cap);
-    let tanh_out = g.tanh(scores_div_cap);
-    let softcapped_scores = g.multiplication(cap_val, tanh_out);
+    let softcapped_scores = if softcap > 0.0 {
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let scores_div_cap = g.multiplication(masked_scores, inv_cap);
+        let tanh_out = g.tanh(scores_div_cap);
+        g.multiplication(cap_val, tanh_out)
+    } else {
+        masked_scores
+    };
 
     let attn_probs = g.soft_max(softcapped_scores, 3);
     let attn_out_4d = g.matrix_multiplication(attn_probs, v, false, false);
     let attn_t = g.transpose(attn_out_4d, [0, 1, 3, 2]);
-    let _out =
-        g.reshape(attn_t, Shape { batch: 1, channels: N_HEADS * HEAD_DIM, height: 1, width: w_sq });
+    let _out = g.reshape(
+        attn_t,
+        Shape { batch: 1, channels: d.n_heads * d.head_dim, height: 1, width: w_sq },
+    );
     g
 }
 
-/// o_proj + residual + softcapping.
-pub fn build_o_proj_residual_kernel(w_sq: usize, softcap: f32) -> Graph {
+pub fn build_o_proj_residual_kernel(d: &DFlashDims, w_sq: usize, softcap: f32) -> Graph {
     let mut g = Graph::new();
     let attn_flat =
-        g.placeholder(Shape { batch: 1, channels: N_HEADS * HEAD_DIM, height: 1, width: w_sq });
-    let wo =
-        g.placeholder(Shape { batch: 1, channels: N_HEADS * HEAD_DIM, height: 1, width: HIDDEN });
-    let o_proj = conv1x1_proj(&mut g, attn_flat, wo, HIDDEN, N_HEADS * HEAD_DIM, w_sq);
-    let h_res = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+        g.placeholder(Shape { batch: 1, channels: d.n_heads * d.head_dim, height: 1, width: w_sq });
+    let wo = g.placeholder(Shape {
+        batch: 1,
+        channels: d.n_heads * d.head_dim,
+        height: 1,
+        width: d.hidden,
+    });
+    let o_proj = conv1x1_proj(&mut g, attn_flat, wo, d.hidden, d.n_heads * d.head_dim);
+    let h_res = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let residual = g.addition(h_res, o_proj);
-    let inv_cap =
-        g.constant_with_scalar(1.0 / softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let cap_val =
-        g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let divided = g.multiplication(residual, inv_cap);
-    let tanh_out = g.tanh(divided);
-    let _out = g.multiplication(cap_val, tanh_out);
+    if softcap > 0.0 {
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let divided = g.multiplication(residual, inv_cap);
+        let tanh_out = g.tanh(divided);
+        let _out = g.multiplication(cap_val, tanh_out);
+    }
     g
 }
 
-/// post_norm + FFN (gate/up/down) + residual + softcapping.
-pub fn build_ffn_residual_kernel(w_sq: usize, softcap: f32) -> Graph {
+pub fn build_ffn_residual_kernel(d: &DFlashDims, w_sq: usize, softcap: f32) -> Graph {
     let mut g = Graph::new();
-    let h1 = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
-    let post_norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let h1 = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let post_norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let normed = rmsnorm(&mut g, h1, post_norm_w);
 
     let w_gate =
-        g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: INTERMEDIATE });
-    let gate_out = conv1x1_proj(&mut g, normed, w_gate, INTERMEDIATE, HIDDEN, w_sq);
-    let w_up = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: INTERMEDIATE });
-    let up_out = conv1x1_proj(&mut g, normed, w_up, INTERMEDIATE, HIDDEN, w_sq);
+        g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: d.intermediate });
+    let gate_out = conv1x1_proj(&mut g, normed, w_gate, d.intermediate, d.hidden);
+    let w_up =
+        g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: d.intermediate });
+    let up_out = conv1x1_proj(&mut g, normed, w_up, d.intermediate, d.hidden);
     let sig = g.sigmoid(gate_out);
     let silu = g.multiplication(gate_out, sig);
     let gate = g.multiplication(silu, up_out);
     let w_down =
-        g.placeholder(Shape { batch: 1, channels: INTERMEDIATE, height: 1, width: HIDDEN });
-    let ffn_out = conv1x1_proj(&mut g, gate, w_down, HIDDEN, INTERMEDIATE, w_sq);
+        g.placeholder(Shape { batch: 1, channels: d.intermediate, height: 1, width: d.hidden });
+    let ffn_out = conv1x1_proj(&mut g, gate, w_down, d.hidden, d.intermediate);
 
     let residual = g.addition(h1, ffn_out);
-    let inv_cap =
-        g.constant_with_scalar(1.0 / softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let cap_val =
-        g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let divided = g.multiplication(residual, inv_cap);
-    let tanh_out = g.tanh(divided);
-    let _out = g.multiplication(cap_val, tanh_out);
+    if softcap > 0.0 {
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let divided = g.multiplication(residual, inv_cap);
+        let tanh_out = g.tanh(divided);
+        let _out = g.multiplication(cap_val, tanh_out);
+    }
     g
 }
 
-pub fn build_final_norm_kernel(w_sq: usize) -> Graph {
+pub fn build_final_norm_kernel(d: &DFlashDims, w_sq: usize) -> Graph {
     let mut g = Graph::new();
-    let h = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
-    let norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let h = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let _out = rmsnorm(&mut g, h, norm_w);
     g
 }

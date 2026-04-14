@@ -162,8 +162,8 @@ impl ANEKernel {
     }
 }
 
-#[pyfunction]
-pub fn compile_dflash_kernels(
+fn compile_kernels(
+    dims: &dflash::DFlashDims,
     seq_q: usize,
     ctx_len: usize,
     softcap: f32,
@@ -173,13 +173,13 @@ pub fn compile_dflash_kernels(
     let w_kv = w_ctx + w_sq;
 
     let kernel_builders: Vec<(&str, Graph)> = vec![
-        ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
-        ("mega_qkv", dflash::build_mega_qkv_kernel(w_sq, w_ctx)),
-        ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
-        ("attn_out", dflash::build_attn_out_kernel(w_sq, w_kv, softcap)),
-        ("o_proj_residual", dflash::build_o_proj_residual_kernel(w_sq, softcap)),
-        ("ffn_residual", dflash::build_ffn_residual_kernel(w_sq, softcap)),
-        ("final_norm", dflash::build_final_norm_kernel(w_sq)),
+        ("fc_norm", dflash::build_fc_norm_kernel(dims, w_ctx)),
+        ("mega_qkv", dflash::build_mega_qkv_kernel(dims, w_sq, w_ctx)),
+        ("gqa_tile", dflash::build_gqa_tile_kernel(dims, w_kv)),
+        ("attn_out", dflash::build_attn_out_kernel(dims, w_sq, w_kv, softcap)),
+        ("o_proj_residual", dflash::build_o_proj_residual_kernel(dims, w_sq, softcap)),
+        ("ffn_residual", dflash::build_ffn_residual_kernel(dims, w_sq, softcap)),
+        ("final_norm", dflash::build_final_norm_kernel(dims, w_sq)),
     ];
 
     let mut compiled = Vec::new();
@@ -197,4 +197,22 @@ pub fn compile_dflash_kernels(
         }
     }
     Ok(compiled)
+}
+
+#[pyfunction]
+pub fn compile_dflash_kernels(
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+) -> PyResult<Vec<ANEKernel>> {
+    compile_kernels(&dflash::DIMS_8B, seq_q, ctx_len, softcap)
+}
+
+#[pyfunction]
+pub fn compile_dflash_kernels_27b(
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+) -> PyResult<Vec<ANEKernel>> {
+    compile_kernels(&dflash::DIMS_27B, seq_q, ctx_len, softcap)
 }

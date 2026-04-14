@@ -3,7 +3,8 @@
 Uses mega_qkv kernel (input-pack approach) to fuse Q/K/V projections +
 per-head norms + RoPE into a single ANE dispatch per layer.
 
-Data flow per layer (7 kernels):
+Data flow:
+  target_hidden → fc_norm → context (on ANE, not GPU)
   hidden ──┬──→ mega_qkv ──→ (k_rope_4d, v_4d_t, q_rope_4d) ──→ gqa_tile ──→ attn_out ──→ o_proj_residual ──→ ffn_residual
   context ─┘
 """
@@ -32,17 +33,6 @@ def align_width(w: int) -> int:
     return max(aligned, MIN_SPATIAL_WIDTH)
 
 
-def _interleave_head_dims(data_flat, oc, n_heads, head_dim):
-    half = head_dim // 2
-    w = mx.array(data_flat, dtype=mx.float32).reshape(oc, -1)
-    w_4d = w.reshape(n_heads, head_dim, -1)
-    w_first = w_4d[:, :half, :]
-    w_second = w_4d[:, half:, :]
-    stacked = mx.stack([w_first, w_second], axis=2)
-    w_il = stacked.reshape(n_heads, head_dim, -1)
-    return w_il.reshape(oc, -1).flatten().tolist()
-
-
 def _interleave_head_dims_mx(w: mx.array, n_heads: int, head_dim: int) -> mx.array:
     half = head_dim // 2
     w_4d = w.reshape(n_heads, head_dim, -1)
@@ -54,8 +44,27 @@ def _interleave_head_dims_mx(w: mx.array, n_heads: int, head_dim: int) -> mx.arr
 
 
 class ANEDraftModel:
-    def __init__(self, seq_q: int, ctx_len: int):
+    def __init__(self, seq_q: int, ctx_len: int, config=None):
         import mirror_sd_ane as ane
+
+        if config is not None:
+            self.hidden = config.hidden_size
+            self.head_dim = config.head_dim
+            self.n_heads = config.num_attention_heads
+            self.n_kv_heads = config.num_key_value_heads
+            self.intermediate = config.intermediate_size
+            self.target_hidden = 5 * config.hidden_size
+            self.n_layers = config.num_hidden_layers
+            self.config = config
+        else:
+            self.hidden = HIDDEN
+            self.head_dim = HEAD_DIM
+            self.n_heads = N_HEADS
+            self.n_kv_heads = N_KV_HEADS
+            self.intermediate = INTERMEDIATE
+            self.target_hidden = TARGET_HIDDEN
+            self.n_layers = N_DFLASH_LAYERS
+            self.config = DFlashConfig.qwen3_8b()
 
         self.ane = ane
         self.seq_q = seq_q
@@ -64,14 +73,18 @@ class ANEDraftModel:
         self.w_ctx = align_width(ctx_len)
         self.w_kv = self.w_ctx + self.w_sq
 
-        self.config = DFlashConfig.qwen3_8b()
         self.config.block_size = seq_q
         self.block_size = seq_q
         self.mask_token_id = self.config.mask_token_id
 
+        is_27b = self.hidden == 5120
+        compile_fn = ane.compile_dflash_kernels_27b if is_27b else ane.compile_dflash_kernels
+        self.softcap = float(getattr(self.config, 'attn_logit_softcapping', 0) or 0)
+
         print(f"[ANE] Compiling kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
-              f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
-        self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len, 60000.0)}
+              f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv}, "
+              f"model={'27B' if is_27b else '8B'}, softcap={self.softcap})...")
+        self.kernels = {k.name: k for k in compile_fn(seq_q, ctx_len, self.softcap)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled: {list(self.kernels.keys())}")
 
         self._alloc_buffers()
@@ -79,58 +92,60 @@ class ANEDraftModel:
         self._hidden_norm_weight = None
         self.weights_loaded = False
 
+        self._rope_freqs = None
+        self._rope_cache_key = None
+        self._attn_mask_ctx_len = None
+
     def _alloc_buffers(self):
         ane = self.ane
         w_sq, w_ctx, w_kv = self.w_sq, self.w_ctx, self.w_kv
+        H = self.hidden
+        HD = self.head_dim
+        NH = self.n_heads
+        NKV = self.n_kv_heads
+        TH = self.target_hidden
 
-        self.b_noise = ane.ANETensor(1, HIDDEN, 1, w_sq)
-        self.b_target = ane.ANETensor(1, TARGET_HIDDEN, 1, w_ctx)
-        self.b_context = ane.ANETensor(1, HIDDEN, 1, w_ctx)
-        self.b_hidden = ane.ANETensor(1, HIDDEN, 1, w_sq)
+        self.b_noise = ane.ANETensor(1, H, 1, w_sq)
+        self.b_target = ane.ANETensor(1, TH, 1, w_ctx)
+        self.b_context = ane.ANETensor(1, H, 1, w_ctx)
+        self.b_hidden = ane.ANETensor(1, H, 1, w_sq)
 
-        # mega_qkv outputs
-        self.b_k_rope_4d = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
-        self.b_v_4d_t = ane.ANETensor(1, N_KV_HEADS, w_kv, HEAD_DIM)
-        self.b_q_rope_4d = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
+        self.b_k_rope_4d = ane.ANETensor(1, NKV, w_kv, HD)
+        self.b_v_4d_t = ane.ANETensor(1, NKV, w_kv, HD)
+        self.b_q_rope_4d = ane.ANETensor(1, NH, w_sq, HD)
 
-        # Attention path intermediates
-        self.b_kv_tiled = ane.ANETensor(1, 2 * N_HEADS, w_kv, HEAD_DIM)
-        self.b_attn_out = ane.ANETensor(1, N_HEADS, w_sq, HEAD_DIM)
-        self.b_attn_flat = ane.ANETensor(1, N_HEADS * HEAD_DIM, 1, w_sq)
-        self.b_attn_res = ane.ANETensor(1, HIDDEN, 1, w_sq)
+        self.b_kv_tiled = ane.ANETensor(1, 2 * NH, w_kv, HD)
+        self.b_attn_flat = ane.ANETensor(1, NH * HD, 1, w_sq)
+        self.b_attn_res = ane.ANETensor(1, H, 1, w_sq)
 
-        self.b_output = ane.ANETensor(1, HIDDEN, 1, w_sq)
+        self.b_output = ane.ANETensor(1, H, 1, w_sq)
 
-        self.b_cos_q = ane.ANETensor(1, 1, w_sq, HEAD_DIM)
-        self.b_sin_q = ane.ANETensor(1, 1, w_sq, HEAD_DIM)
-        self.b_cos_k = ane.ANETensor(1, 1, w_kv, HEAD_DIM)
-        self.b_sin_k = ane.ANETensor(1, 1, w_kv, HEAD_DIM)
+        self.b_cos_q = ane.ANETensor(1, 1, w_sq, HD)
+        self.b_sin_q = ane.ANETensor(1, 1, w_sq, HD)
+        self.b_cos_k = ane.ANETensor(1, 1, w_kv, HD)
+        self.b_sin_k = ane.ANETensor(1, 1, w_kv, HD)
 
         self.b_attn_mask = ane.ANETensor(1, 1, w_sq, w_kv)
 
-    def _make_weight(self, data_flat, oc, ic, height=1):
-        w_oc = align_width(oc)
-        data_arr = mx.array(data_flat, dtype=mx.float32).reshape(oc, ic)
-        data_t = data_arr.T
-        padded = mx.zeros((ic, w_oc), dtype=mx.float32)
-        padded[:, :oc] = data_t
-        return self.ane.ANETensor.from_buffer(1, ic, height, oc, memoryview(padded))
+        self._padded_hidden = mx.zeros((1, H, w_sq), dtype=mx.float32)
+        self._padded_target = mx.zeros((1, TH, w_ctx), dtype=mx.float32)
+        self._padded_context = mx.zeros((1, H, w_ctx), dtype=mx.float32)
 
-    def _make_norm_weight_expanded(self, weight_list, channels, width):
+    def _make_norm_weight_expanded(self, weight: mx.array, width: int):
         w = align_width(width)
-        arr = mx.array(weight_list, dtype=mx.float32).reshape(channels, 1)
+        channels = weight.shape[0]
+        arr = weight.astype(mx.float32).reshape(channels, 1)
         arr = mx.broadcast_to(arr, (channels, w))
         return self.ane.ANETensor.from_buffer(1, channels, 1, w, memoryview(arr))
 
-    def _make_per_head_norm_weight(self, head_weight_list, n_heads, width):
+    def _make_per_head_norm_weight(self, head_weight: mx.array, n_heads: int, width: int):
         w = align_width(width)
-        head_dim = len(head_weight_list)
+        head_dim = head_weight.shape[0]
         half = head_dim // 2
-        il = []
-        for k in range(half):
-            il.append(head_weight_list[k])
-            il.append(head_weight_list[k + half])
-        il_arr = mx.array(il, dtype=mx.float32).reshape(1, 1, head_dim, 1)
+        w_first = head_weight[:half].astype(mx.float32)
+        w_second = head_weight[half:].astype(mx.float32)
+        il = mx.stack([w_first, w_second], axis=1).reshape(head_dim)
+        il_arr = il.reshape(1, 1, head_dim, 1)
         arr = mx.broadcast_to(il_arr, (1, n_heads, head_dim, w))
         return self.ane.ANETensor.from_buffer(1, n_heads, head_dim, w, memoryview(arr))
 
@@ -138,19 +153,13 @@ class ANEDraftModel:
         self._load_fc_weights(draft_model)
         self._fc_weight = draft_model.fc.weight.astype(mx.float32)
         self._hidden_norm_weight = draft_model.hidden_norm.weight.astype(mx.float32)
-        for i in range(N_DFLASH_LAYERS):
+        for i in range(self.n_layers):
             t0 = time.time()
             self._load_layer_weights(draft_model, i)
             print(f"[ANE]   Layer {i} loaded ({time.time()-t0:.1f}s)")
         self._load_final_norm_weights(draft_model)
         self.weights_loaded = True
         print("[ANE] Weights loaded")
-
-    def _mlx_to_f32_list(self, arr: mx.array) -> list:
-        return arr.astype(mx.float32).flatten().tolist()
-
-    def _mlx_to_buffer(self, arr: mx.array):
-        return memoryview(arr.astype(mx.float32))
 
     def _make_weight_buf(self, w_flat, oc, ic, height=1):
         w_oc = align_width(oc)
@@ -164,52 +173,53 @@ class ANEDraftModel:
         return self.ane.ANETensor.from_buffer(1, ic, height, oc, memoryview(padded))
 
     def _load_fc_weights(self, model: nn.Module):
-        self.w_fc = self._make_weight_buf(model.fc.weight.astype(mx.float32), HIDDEN, TARGET_HIDDEN)
-        hidden_norm_w = self._mlx_to_f32_list(model.hidden_norm.weight)
-        self.w_hidden_norm = self._make_norm_weight_expanded(hidden_norm_w, HIDDEN, self.w_ctx)
+        self.w_fc = self._make_weight_buf(model.fc.weight.astype(mx.float32), self.hidden, self.target_hidden)
+        self.w_hidden_norm = self._make_norm_weight_expanded(
+            model.hidden_norm.weight, self.w_ctx)
 
     def _load_layer_weights(self, model: nn.Module, layer_idx: int):
         layer = model.layers[layer_idx]
         p = f"l{layer_idx}_"
+        sq_w = layer.self_attn
+        H = self.hidden
+        NH = self.n_heads
+        NKV = self.n_kv_heads
+        HD = self.head_dim
 
-        in_norm_w = self._mlx_to_f32_list(layer.input_layernorm.weight)
-        setattr(self, f"w_{p}in_norm", self._make_norm_weight_expanded(in_norm_w, HIDDEN, self.w_sq))
+        setattr(self, f"w_{p}in_norm",
+                self._make_norm_weight_expanded(layer.input_layernorm.weight, self.w_sq))
 
-        q_proj_w = layer.self_attn.q_proj.weight.astype(mx.float32)
-        q_proj_w_il = _interleave_head_dims_mx(q_proj_w, N_HEADS, HEAD_DIM)
-        setattr(self, f"w_{p}q_proj", self._make_weight_buf(q_proj_w_il, N_HEADS * HEAD_DIM, HIDDEN))
+        q_proj_w_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float32), NH, HD)
+        setattr(self, f"w_{p}q_proj", self._make_weight_buf(q_proj_w_il, NH * HD, H))
 
-        q_norm_w = self._mlx_to_f32_list(layer.self_attn.q_norm.weight)
-        setattr(self, f"w_{p}q_norm_4d", self._make_per_head_norm_weight(q_norm_w, N_HEADS, self.w_sq))
+        setattr(self, f"w_{p}q_norm_4d",
+                self._make_per_head_norm_weight(sq_w.q_norm.weight, NH, self.w_sq))
 
-        k_proj_w = layer.self_attn.k_proj.weight.astype(mx.float32)
-        k_proj_w_il = _interleave_head_dims_mx(k_proj_w, N_KV_HEADS, HEAD_DIM)
-        setattr(self, f"w_{p}k_proj", self._make_weight_buf(k_proj_w_il, N_KV_HEADS * HEAD_DIM, HIDDEN))
+        k_proj_w_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float32), NKV, HD)
+        setattr(self, f"w_{p}k_proj", self._make_weight_buf(k_proj_w_il, NKV * HD, H))
 
-        k_norm_w = self._mlx_to_f32_list(layer.self_attn.k_norm.weight)
-        setattr(self, f"w_{p}k_norm_4d", self._make_per_head_norm_weight(k_norm_w, N_KV_HEADS, self.w_kv))
+        setattr(self, f"w_{p}k_norm_4d",
+                self._make_per_head_norm_weight(sq_w.k_norm.weight, NKV, self.w_kv))
 
-        v_proj_w = layer.self_attn.v_proj.weight.astype(mx.float32)
-        setattr(self, f"w_{p}v_proj", self._make_weight_buf(v_proj_w, N_KV_HEADS * HEAD_DIM, HIDDEN))
+        setattr(self, f"w_{p}v_proj",
+                self._make_weight_buf(sq_w.v_proj.weight.astype(mx.float32), NKV * HD, H))
 
-        o_proj_w = layer.self_attn.o_proj.weight.astype(mx.float32)
-        setattr(self, f"w_{p}o_proj", self._make_weight_buf(o_proj_w, HIDDEN, N_HEADS * HEAD_DIM))
+        setattr(self, f"w_{p}o_proj",
+                self._make_weight_buf(sq_w.o_proj.weight.astype(mx.float32), H, NH * HD))
 
-        post_norm_w = self._mlx_to_f32_list(layer.post_attention_layernorm.weight)
-        setattr(self, f"w_{p}post_norm", self._make_norm_weight_expanded(post_norm_w, HIDDEN, self.w_sq))
+        setattr(self, f"w_{p}post_norm",
+                self._make_norm_weight_expanded(layer.post_attention_layernorm.weight, self.w_sq))
 
-        gate_w = layer.mlp.gate_proj.weight.astype(mx.float32)
-        setattr(self, f"w_{p}gate", self._make_weight_buf(gate_w, INTERMEDIATE, HIDDEN))
-
-        up_w = layer.mlp.up_proj.weight.astype(mx.float32)
-        setattr(self, f"w_{p}up", self._make_weight_buf(up_w, INTERMEDIATE, HIDDEN))
-
-        down_w = layer.mlp.down_proj.weight.astype(mx.float32)
-        setattr(self, f"w_{p}down", self._make_weight_buf(down_w, HIDDEN, INTERMEDIATE))
+        setattr(self, f"w_{p}gate",
+                self._make_weight_buf(layer.mlp.gate_proj.weight.astype(mx.float32), self.intermediate, H))
+        setattr(self, f"w_{p}up",
+                self._make_weight_buf(layer.mlp.up_proj.weight.astype(mx.float32), self.intermediate, H))
+        setattr(self, f"w_{p}down",
+                self._make_weight_buf(layer.mlp.down_proj.weight.astype(mx.float32), H, self.intermediate))
 
     def _load_final_norm_weights(self, model: nn.Module):
-        norm_w = self._mlx_to_f32_list(model.norm.weight)
-        self.w_final_norm = self._make_norm_weight_expanded(norm_w, HIDDEN, self.w_sq)
+        self.w_final_norm = self._make_norm_weight_expanded(model.norm.weight, self.w_sq)
+
     def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
                 rope_offset: int = 0, ctx_len: int = None) -> mx.array:
         if ctx_len is None:
@@ -220,15 +230,16 @@ class ANEDraftModel:
                 f"Re-initialize ANEDraftModel with a larger ctx_len."
             )
         k = self.kernels
-        self._write_mlx_2d(self.b_hidden, noise_embedding)
+
+        self._write_padded(self._padded_hidden, self.b_hidden, noise_embedding)
 
         context = self._compute_context(target_hidden)
-        self._write_mlx_2d(self.b_context, context)
+        self._write_padded(self._padded_context, self.b_context, context)
 
         self._compute_rope(rope_offset, ctx_len)
         self._compute_attn_mask(ctx_len)
 
-        for i in range(N_DFLASH_LAYERS):
+        for i in range(self.n_layers):
             self._run_layer(k, i)
 
         k['final_norm'].run_uncached(
@@ -236,7 +247,7 @@ class ANEDraftModel:
             [self.b_output],
         )
 
-        return self._read_mlx_2d(self.b_output, self.seq_q, HIDDEN)
+        return self._read_mlx_2d(self.b_output, self.seq_q, self.hidden)
 
     def __call__(self, noise_embedding: mx.array, target_hidden: mx.array,
                  mask=None, cache=None, **kwargs) -> mx.array:
@@ -248,14 +259,13 @@ class ANEDraftModel:
 
     def make_cache(self):
         from .dflash import DFlashKVCache
-        return [DFlashKVCache() for _ in range(N_DFLASH_LAYERS)]
+        return [DFlashKVCache() for _ in range(self.n_layers)]
 
-    def _write_mlx_2d(self, buf, arr: mx.array):
+    def _write_padded(self, padded: mx.array, buf, arr: mx.array):
         seq_len = arr.shape[1]
         channels = arr.shape[2]
-        w = buf.shape[3]
         f32 = arr.astype(mx.float32).transpose(0, 2, 1)
-        padded = mx.zeros((1, channels, w), dtype=mx.float32)
+        padded[:, :, :] = 0.0
         padded[:, :, :seq_len] = f32
         mx.eval(padded)
         buf.write_buffer(memoryview(padded))
@@ -265,18 +275,6 @@ class ANEDraftModel:
         data = buf.read_f32()
         arr = mx.array(data, dtype=mx.float32).reshape(1, channels, w)[:, :, :seq_len]
         return arr.transpose(0, 2, 1)
-
-    def _clip_buffer(self, buf, max_val: float):
-        data = buf.read_f32()
-        arr = mx.array(data, dtype=mx.float32)
-        arr = mx.clip(arr, -max_val, max_val)
-        buf.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
-
-    def _softcap_buffer(self, buf, cap: float):
-        data = buf.read_f32()
-        arr = mx.array(data, dtype=mx.float32)
-        arr = cap * mx.tanh(arr / cap)
-        buf.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
 
     def _run_layer(self, k, layer_idx: int):
         p = f"l{layer_idx}_"
@@ -316,34 +314,36 @@ class ANEDraftModel:
         )
 
     def _compute_rope(self, rope_offset: int, ctx_len: int):
-        rope_theta = 1000000.0
-        half = HEAD_DIM // 2
+        cache_key = (rope_offset, ctx_len)
+        if self._rope_cache_key == cache_key:
+            return
+        self._rope_cache_key = cache_key
+
+        rope_theta = float(self.config.rope_theta)
+        half = self.head_dim // 2
+
+        if self._rope_freqs is None:
+            self._rope_freqs = mx.array(
+                [1.0 / (rope_theta ** (2.0 * d / HEAD_DIM)) for d in range(half)],
+                dtype=mx.float32)
+
+        freqs = self._rope_freqs
 
         q_positions = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
-        q_freqs = mx.array([1.0 / (rope_theta ** (2.0 * d / HEAD_DIM)) for d in range(half)], dtype=mx.float32)
-        q_angles = q_positions[:, None] * q_freqs[None, :]
-        q_cos = mx.cos(q_angles)
-        q_sin = mx.sin(q_angles)
-        q_cos = mx.repeat(q_cos, 2, axis=1)
-        q_sin = mx.repeat(q_sin, 2, axis=1)
+        q_angles = q_positions[:, None] * freqs[None, :]
+        q_cos = mx.repeat(mx.cos(q_angles), 2, axis=1)
+        q_sin = mx.repeat(mx.sin(q_angles), 2, axis=1)
         self.b_cos_q.write_buffer(memoryview(q_cos.flatten().astype(mx.float32)))
         self.b_sin_q.write_buffer(memoryview(q_sin.flatten().astype(mx.float32)))
 
-        # K RoPE: context positions [0:ctx_len], noise positions [w_ctx:w_ctx+seq_q]
-        # Buffer layout: [0:ctx_len]=ctx, [ctx_len:w_ctx]=pad, [w_ctx:w_ctx+seq_q]=noise
         k_ctx_pos = mx.array([rope_offset + p for p in range(ctx_len)], dtype=mx.float32)
         k_noise_pos = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
 
-        k_ctx_angles = k_ctx_pos[:, None] * q_freqs[None, :]
-        k_noise_angles = k_noise_pos[:, None] * q_freqs[None, :]
+        k_ctx_cos = mx.repeat(mx.cos(k_ctx_pos[:, None] * freqs[None, :]), 2, axis=1)
+        k_ctx_sin = mx.repeat(mx.sin(k_ctx_pos[:, None] * freqs[None, :]), 2, axis=1)
+        k_noise_cos = mx.repeat(mx.cos(k_noise_pos[:, None] * freqs[None, :]), 2, axis=1)
+        k_noise_sin = mx.repeat(mx.sin(k_noise_pos[:, None] * freqs[None, :]), 2, axis=1)
 
-        k_ctx_cos = mx.repeat(mx.cos(k_ctx_angles), 2, axis=1)
-        k_ctx_sin = mx.repeat(mx.sin(k_ctx_angles), 2, axis=1)
-        k_noise_cos = mx.repeat(mx.cos(k_noise_angles), 2, axis=1)
-        k_noise_sin = mx.repeat(mx.sin(k_noise_angles), 2, axis=1)
-
-        # Build full K cos/sin buffer with correct position mapping
-        # Shape: [1, 1, w_kv, HEAD_DIM] where w_kv = w_ctx + w_sq
         k_cos_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)
         k_sin_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)
         k_cos_full[:, :, :ctx_len, :] = k_ctx_cos[None, None]
@@ -356,17 +356,13 @@ class ANEDraftModel:
         self.b_sin_k.write_buffer(memoryview(k_sin_full.flatten().astype(mx.float32)))
 
     def _compute_attn_mask(self, ctx_len: int):
+        if self._attn_mask_ctx_len == ctx_len:
+            return
+        self._attn_mask_ctx_len = ctx_len
         mask = mx.full((1, 1, self.w_sq, self.w_kv), -1e4, dtype=mx.float32)
         mask[:, :, :, :ctx_len] = 0.0
         mask[:, :, :, self.w_ctx:self.w_ctx + self.seq_q] = 0.0
         self.b_attn_mask.write_buffer(memoryview(mask.flatten().astype(mx.float32)))
-
-    def _zero_pad_context(self, ctx_len: int):
-        w = self.b_context.shape[3]
-        data = self.b_context.read_f32()
-        arr = mx.array(data, dtype=mx.float32).reshape(1, HIDDEN, 1, w)
-        arr[:, :, :, ctx_len:] = 0.0
-        self.b_context.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
 
     def _compute_context(self, target_hidden: mx.array) -> mx.array:
         fc_out = target_hidden @ self._fc_weight.T
