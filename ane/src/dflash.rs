@@ -1,4 +1,4 @@
-use ane::{Graph, MIN_SPATIAL_WIDTH, Shape, Tensor};
+use ane::{Graph, Shape, Tensor, MIN_SPATIAL_WIDTH};
 
 pub const HIDDEN: usize = 4096;
 pub const HEAD_DIM: usize = 128;
@@ -15,6 +15,10 @@ pub fn align_width(w: usize) -> usize {
 }
 
 pub fn rmsnorm(g: &mut Graph, x: Tensor, weight: Tensor) -> Tensor {
+    rmsnorm_with_eps(g, x, weight, 1e-6)
+}
+
+pub fn rmsnorm_with_eps(g: &mut Graph, x: Tensor, weight: Tensor, eps: f32) -> Tensor {
     let inv_s =
         g.constant_with_scalar(1.0 / 128.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let x_scaled = g.multiplication(x, inv_s);
@@ -22,7 +26,7 @@ pub fn rmsnorm(g: &mut Graph, x: Tensor, weight: Tensor) -> Tensor {
     let diff = g.subtraction(x_scaled, ms);
     let sq = g.multiplication(diff, diff);
     let mean_sq = g.reduce_mean(sq, 1);
-    let eps_t = g.constant_with_scalar(1e-6, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let eps_t = g.constant_with_scalar(eps, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let mean_sq_eps = g.addition(mean_sq, eps_t);
     let neg_half =
         g.constant_with_scalar(-0.5, Shape { batch: 1, channels: 1, height: 1, width: 1 });
@@ -167,7 +171,7 @@ pub fn build_fc_norm_kernel(w_ctx: usize) -> Graph {
     let fc_w = g.placeholder(Shape { batch: 1, channels: TARGET_HIDDEN, height: 1, width: HIDDEN });
     let norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
     let fc_out = conv1x1_proj(&mut g, target_hid, fc_w, HIDDEN, TARGET_HIDDEN, w_ctx);
-    let _out = rmsnorm(&mut g, fc_out, norm_w);
+    let _out = rmsnorm_with_eps(&mut g, fc_out, norm_w, 1e-2);
     g
 }
 

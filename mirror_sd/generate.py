@@ -249,10 +249,14 @@ def spec_generate(
 
     is_ane = hasattr(draft_model, 'ane')
     if is_ane:
-        return _spec_generate_parallel(
+        result = _spec_generate_parallel(
             target_model, draft_model, input_ids, max_new_tokens,
             stop_token_ids, temperature, target_layer_ids,
         )
+        if len(result) == 2:
+            output_ids, stats = result
+            return output_ids, stats, [], [], mx.array([])
+        return result
 
     if mirror_sd:
         return _spec_generate_mirror_sd(

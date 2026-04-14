@@ -85,10 +85,12 @@ class ANEDraftModel:
 
         print(f"[ANE] Compiling kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
-        self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len, 30000.0)}
+        self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len, 60000.0)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled: {list(self.kernels.keys())}")
 
         self._alloc_buffers()
+        self._fc_weight = None
+        self._hidden_norm_weight = None
         self.weights_loaded = False
 
     def _alloc_buffers(self):
@@ -148,6 +150,8 @@ class ANEDraftModel:
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
         self._load_fc_weights(draft_model)
+        self._fc_weight = draft_model.fc.weight.astype(mx.float32)
+        self._hidden_norm_weight = draft_model.hidden_norm.weight.astype(mx.float32)
         for i in range(N_DFLASH_LAYERS):
             t0 = time.time()
             self._load_layer_weights(draft_model, i)
@@ -174,7 +178,6 @@ class ANEDraftModel:
         return self.ane.ANETensor.from_buffer(1, ic, height, oc, memoryview(padded))
 
     def _load_fc_weights(self, model: nn.Module):
-        fc_buf = self._mlx_to_buffer(model.fc.weight)
         self.w_fc = self._make_weight_buf(model.fc.weight.astype(mx.float32), HIDDEN, TARGET_HIDDEN)
         hidden_norm_w = self._mlx_to_f32_list(model.hidden_norm.weight)
         self.w_hidden_norm = self._make_norm_weight_expanded(hidden_norm_w, HIDDEN, self.w_ctx)
@@ -233,15 +236,12 @@ class ANEDraftModel:
             )
         k = self.kernels
         self._write_mlx_2d(self.b_hidden, noise_embedding * self.embed_scale)
-        self._write_mlx_2d(self.b_target, target_hidden / 2048.0)
+
+        context = self._compute_context(target_hidden)
+        self._write_mlx_2d(self.b_context, context)
 
         self._compute_rope(rope_offset, ctx_len)
         self._compute_attn_mask(ctx_len)
-
-        k['fc_norm'].run_uncached(
-            [self.b_target, self.w_fc, self.w_hidden_norm],
-            [self.b_context],
-        )
 
         for i in range(N_DFLASH_LAYERS):
             self._run_layer(k, i)
@@ -376,3 +376,10 @@ class ANEDraftModel:
         arr = mx.array(data, dtype=mx.float32).reshape(1, HIDDEN, 1, w)
         arr[:, :, :, ctx_len:] = 0.0
         self.b_context.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
+
+    def _compute_context(self, target_hidden: mx.array) -> mx.array:
+        fc_out = target_hidden @ self._fc_weight.T
+        rms = mx.sqrt(mx.mean(fc_out.astype(mx.float32) ** 2, axis=-1, keepdims=True) + 1e-6)
+        context = (fc_out / rms) * self._hidden_norm_weight
+        mx.eval(context)
+        return context.astype(mx.float32)
