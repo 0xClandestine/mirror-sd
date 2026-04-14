@@ -4,7 +4,7 @@ Uses mega_qkv kernel (input-pack approach) to fuse Q/K/V projections +
 per-head norms + RoPE into a single ANE dispatch per layer.
 
 Data flow per layer (7 kernels):
-  hidden ──┬──→ mega_qkv ──→ (k_rope_4d, v_4d_t, q_rope_4d) ──→ gqa_tile ──→ attn_out ──→ (Python 4D→flat) ──→ o_proj_residual ──→ ffn_residual
+  hidden ──┬──→ mega_qkv ──→ (k_rope_4d, v_4d_t, q_rope_4d) ──→ gqa_tile ──→ attn_out ──→ o_proj_residual ──→ ffn_residual
   context ─┘
 """
 
@@ -281,7 +281,6 @@ class ANEDraftModel:
     def _run_layer(self, k, layer_idx: int):
         p = f"l{layer_idx}_"
 
-        # --- mega_qkv: in_norm + Q/K/V projections + per-head norms + RoPE ---
         k['mega_qkv'].run_uncached(
             [self.b_hidden, getattr(self, f"w_{p}in_norm"),
              self.b_context,
@@ -295,7 +294,6 @@ class ANEDraftModel:
             [self.b_k_rope_4d, self.b_v_4d_t, self.b_q_rope_4d],
         )
 
-        # --- GQA tile + attention + o_proj ---
         k['gqa_tile'].run_uncached(
             [self.b_k_rope_4d, self.b_v_4d_t],
             [self.b_kv_tiled],
