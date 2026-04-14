@@ -47,6 +47,129 @@ def _flat_cache_states(cache):
     return out
 
 
+_SPLIT_SDPA_INSTALLED = set()
+
+
+def _install_split_sdpa_if_hybrid(target_model):
+    """Install split SDPA hooks on attention layers for hybrid (Qwen3.5) models.
+
+    At long context, the standard SDPA processes all 16 query positions against
+    the full KV cache in one shot. The split SDPA hook processes each query
+    position individually, which is both faster and more numerically stable for
+    speculative verify where we only need per-position logits.
+
+    This is a no-op for pure-attention models (no linear/SSM layers).
+    """
+    from .target import _get_inner_model
+    model_id = id(target_model)
+    if model_id in _SPLIT_SDPA_INSTALLED:
+        return
+
+    inner = _get_inner_model(target_model)
+    has_linear = any(getattr(l, 'is_linear', False) for l in inner.layers)
+    if not has_linear:
+        _SPLIT_SDPA_INSTALLED.add(model_id)
+        return
+
+    _install_split_attention_hooks(inner)
+    _SPLIT_SDPA_INSTALLED.add(model_id)
+
+
+def _install_split_attention_hooks(inner_model):
+    """Install split SDPA + small-proj-padding hooks on full-attention layers."""
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    _EXACT_KV_THRESHOLD = 1024
+    _PAD_M = 16
+
+    for layer in inner_model.layers:
+        if getattr(layer, 'is_linear', False):
+            continue
+        attn = getattr(layer, 'self_attn', None)
+        if attn is None:
+            continue
+        cls = type(attn)
+        if getattr(cls, '_mirror_sd_split_installed', False):
+            continue
+
+        original_call = cls.__call__
+
+        has_qk_norm = hasattr(attn, 'q_norm') and hasattr(attn, 'k_norm')
+        if not has_qk_norm:
+            continue
+
+        def _make_split_call(orig):
+            def split_call(self, x, mask=None, cache=None):
+                if not getattr(self, '_mirror_sd_split_enabled', False):
+                    return orig(self, x, mask=mask, cache=cache)
+
+                B, L, _ = x.shape
+                q_proj_output = self.q_proj(x)
+                n_heads = self.num_attention_heads
+                n_kv_heads = self.num_key_value_heads
+                queries, gate = mx.split(
+                    q_proj_output.reshape(B, L, n_heads, -1), 2, axis=-1
+                )
+                gate = gate.reshape(B, L, -1)
+
+                keys = self.k_proj(x)
+                values = self.v_proj(x)
+
+                queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+                keys = self.k_norm(keys.reshape(B, L, n_kv_heads, -1)).transpose(
+                    0, 2, 1, 3
+                )
+                values = values.reshape(B, L, n_kv_heads, -1).transpose(
+                    0, 2, 1, 3
+                )
+
+                cached_prefix_len = int(getattr(cache, 'offset', 0) or 0) if cache is not None else 0
+                if cache is not None:
+                    queries = self.rope(queries, offset=cached_prefix_len)
+                    keys = self.rope(keys, offset=cached_prefix_len)
+                    keys, values = cache.update_and_fetch(keys, values)
+                else:
+                    queries = self.rope(queries)
+                    keys = self.rope(keys)
+
+                total_kv_len = int(keys.shape[2])
+                should_split = (
+                    cache is not None
+                    and cached_prefix_len >= _EXACT_KV_THRESHOLD
+                    and (mask is None or mask == "causal" or isinstance(mask, mx.array))
+                )
+
+                if should_split:
+                    outputs = []
+                    for qi in range(L):
+                        chunk_mask = None
+                        if isinstance(mask, mx.array):
+                            chunk_mask = mask[..., qi:qi+1, :total_kv_len]
+                        outputs.append(scaled_dot_product_attention(
+                            queries[:, :, qi:qi+1, :],
+                            keys[:, :, :total_kv_len, :],
+                            values[:, :, :total_kv_len, :],
+                            cache=cache,
+                            scale=self.scale,
+                            mask=chunk_mask,
+                        ))
+                    output = mx.concatenate(outputs, axis=2)
+                else:
+                    output = scaled_dot_product_attention(
+                        queries, keys, values, cache=cache, scale=self.scale, mask=mask
+                    )
+
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                gated_output = output * mx.sigmoid(gate)
+                return self.o_proj(gated_output)
+
+            return split_call
+
+        cls.__call__ = _make_split_call(original_call)
+        cls._mirror_sd_split_installed = True
+        attn._mirror_sd_split_enabled = True
+
+
 def _kod_optimal_gamma(alpha, cost_a, cost_b, min_gamma=2, max_gamma=16):
     """KOD: find block_size that maximizes expected throughput.
 
@@ -265,6 +388,8 @@ def spec_generate(
     if target_layer_ids is None:
         target_layer_ids = draft_model.config.target_layer_ids
 
+    _install_split_sdpa_if_hybrid(target_model)
+
     if num_draft_layers is not None and hasattr(draft_model, 'num_draft_layers'):
         original = draft_model.num_draft_layers
         draft_model.num_draft_layers = min(num_draft_layers, original)
@@ -453,6 +578,7 @@ def spec_generate(
         )
         draft_logits = lm_head_fn(draft_hidden[:, -current_block_size + 1:, :])
         sampled_tokens = sample(draft_logits, temperature)
+        mx.eval(sampled_tokens)
 
         for c in draft_cache:
             c.trim(current_block_size)
