@@ -63,6 +63,9 @@ def _interleave_head_dims_mx(w: mx.array, n_heads: int, head_dim: int) -> mx.arr
     return w_il.reshape(-1)
 
 
+EMBED_SCALE = 1.0
+
+
 class ANEDraftModel:
     def __init__(self, seq_q: int, ctx_len: int):
         import mirror_sd_ane as ane
@@ -78,6 +81,7 @@ class ANEDraftModel:
         self.config.block_size = seq_q
         self.block_size = seq_q
         self.mask_token_id = self.config.mask_token_id
+        self.embed_scale = EMBED_SCALE
 
         print(f"[ANE] Compiling kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
@@ -178,6 +182,7 @@ class ANEDraftModel:
     def _load_layer_weights(self, model: nn.Module, layer_idx: int):
         layer = model.layers[layer_idx]
         p = f"l{layer_idx}_"
+        alpha = self.embed_scale
 
         in_norm_w = self._mlx_to_f32_list(layer.input_layernorm.weight)
         setattr(self, f"w_{p}in_norm", self._make_norm_weight_expanded(in_norm_w, HIDDEN, self.w_sq))
@@ -227,7 +232,7 @@ class ANEDraftModel:
                 f"Re-initialize ANEDraftModel with a larger ctx_len."
             )
         k = self.kernels
-        self._write_mlx_2d(self.b_hidden, noise_embedding)
+        self._write_mlx_2d(self.b_hidden, noise_embedding * self.embed_scale)
         self._write_mlx_2d(self.b_target, target_hidden / 2048.0)
 
         self._compute_rope(rope_offset, ctx_len)
@@ -286,6 +291,11 @@ class ANEDraftModel:
         data = buf.read_f32()
         arr = mx.array(data, dtype=mx.float32)
         arr = cap * mx.tanh(arr / cap)
+        buf.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
+
+    def _unscale_buffer(self, buf, scale: float):
+        data = buf.read_f32()
+        arr = mx.array(data, dtype=mx.float32) / scale
         buf.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
 
     def _run_layer(self, k, layer_idx: int):

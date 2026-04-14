@@ -135,6 +135,29 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - Using the same IOSurface buffer for both input and output of a kernel (e.g., `rope_q` reading from and writing to `b_q_4d`) works correctly but is fragile.
 - **Fix**: `rope_q` now uses separate output buffer `b_q_rope_4d`. `attn_out` reads from `b_q_rope_4d` (not `b_q_4d`).
 
+## Weight Scaling for RMSNorm Accuracy (Rule #26)
+- The ANE uses scaled RMSNorm (input / 128 before variance) to prevent diff² overflow
+- When input values are small (e.g., embedding output ~0.003), dividing by 128 makes them ~2.3e-5
+- Variance of these ~5e-10, which is much smaller than eps=1e-6
+- eps dominates → RMSNorm gives completely wrong normalization (cosine 0.805 at layer 0)
+- **Weight scaling approach (from Gemma3 FP16/ANE guide):**
+  - Scale embedding input by α at write time
+  - Scale `o_proj.weight *= α` and `down_proj.weight *= α` (all layers)
+  - Scale `final_norm.weight /= α` to cancel at output
+  - On GPU (bf16/fp16 without softcapping): α=8 gives cosine 0.9999, logits match ✓
+- **NOT VIABLE on our ANE pipeline**: weight scaling amplifies residual stream into
+  softcap's compression range. α=8 → residual peak ~31k → softcap(cap=30000) compresses
+  ~3%, but cumulative across 5 layers → cosine DROPS from 0.76 to 0.57
+- **Root cause**: softcapping is the dominant error source, not RMSNorm eps.
+  Weight scaling fixes RMSNorm but worsens softcap distortion.
+- **Real fix**: raise or remove softcap (requires recompiling ANE kernels with higher cap
+  or no cap). Our profiling shows peak residual is ~7904 — well below FP16 max (65504).
+  Cap=30000 is overly conservative; cap=60000 or removing softcap would eliminate
+  most distortion without overflow risk for this model.
+- **Alternative**: fix RMSNorm eps issue directly by using larger eps (e.g., 1e-3 instead
+  of 1e-6) in the ANE scaled RMSNorm. This changes the kernel constant but doesn't
+  affect the residual stream scale. Requires recompiling Rust ANE kernels.
+
 ## FP16 Overflow (SOLVED via scaled rmsnorm + residual softcapping)
 - ANE operates in **fp16** internally (max representable value ~65504)
 - GPU uses **bf16** (max ~3.4×10^38)
