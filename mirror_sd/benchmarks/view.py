@@ -96,6 +96,10 @@ def fmt_compare(rows_a, rows_b, label_a, label_b):
     return "\n".join(lines)
 
 
+def _ctx_rows(rows):
+    return {r["depth"]: r for r in rows if r["is_ctx"] or (r["depth"] == 0 and not r["is_ctx"])}
+
+
 def plot_chart(rows_a, rows_b, meta_a, meta_b, output_path):
     try:
         import matplotlib
@@ -109,8 +113,8 @@ def plot_chart(rows_a, rows_b, meta_a, meta_b, output_path):
     label_a = meta_a.get("label", meta_a.get("mode", "spec"))
     label_b = meta_b.get("label", "Baseline")
 
-    ctx_a = {r["depth"]: r for r in rows_a if r["is_ctx"] or (r["depth"] == 0 and not r["is_ctx"])}
-    ctx_b = {r["depth"]: r for r in rows_b if r["is_ctx"] or (r["depth"] == 0 and not r["is_ctx"])}
+    ctx_a = _ctx_rows(rows_a)
+    ctx_b = _ctx_rows(rows_b)
     depths = sorted(set(ctx_a.keys()) & set(ctx_b.keys()))
 
     a_tg = [ctx_a[d]["tg"] for d in depths]
@@ -159,6 +163,78 @@ def plot_chart(rows_a, rows_b, meta_a, meta_b, output_path):
     print(f"Saved chart: {output_path}")
 
 
+def plot_multi_chart(all_rows, all_meta, output_path):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("ERROR: matplotlib not installed. Run: pip install matplotlib")
+        sys.exit(1)
+
+    n = len(all_rows)
+    palette = ["#6c757d", "#0d6efd", "#dc3545", "#ffc107", "#198754", "#6f42c1"]
+    labels = [m.get("label", m.get("mode", f"run_{i}")) for i, m in enumerate(all_meta)]
+
+    ctx_maps = [_ctx_rows(r) for r in all_rows]
+    all_depths = [set(cm.keys()) for cm in ctx_maps]
+    depths = sorted(set.intersection(*all_depths)) if all_depths else []
+
+    x = np.arange(len(depths))
+    width = 0.8 / n
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    for i in range(n):
+        tg = [ctx_maps[i][d]["tg"] for d in depths]
+        tg_std = [ctx_maps[i][d]["tg_std"] for d in depths]
+        offset = (i - (n - 1) / 2) * width
+        bars = ax1.bar(x + offset, tg, width, label=labels[i], color=palette[i % len(palette)],
+                       yerr=tg_std, capsize=3, alpha=0.88)
+        for bar, val in zip(bars, tg):
+            ax1.annotate(f"{val:.1f}", xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                         xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7)
+
+    ax1.set_xlabel("Context Depth")
+    ax1.set_ylabel("TG Throughput (tok/s)")
+    ax1.set_title("Decode Speed by Context Depth")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([str(d) for d in depths])
+    ax1.legend()
+    ax1.grid(axis="y", alpha=0.3)
+
+    baseline_idx = next((i for i, l in enumerate(labels) if l == "baseline"), 0)
+    baseline_tg = [ctx_maps[baseline_idx][d]["tg"] for d in depths]
+    for i in range(n):
+        if i == baseline_idx:
+            continue
+        tg = [ctx_maps[i][d]["tg"] for d in depths]
+        speedups = [s/b if b > 0 else 0 for s, b in zip(tg, baseline_tg)]
+        offset = (i - (n - 1) / 2) * width * 0.8
+        colors_bar = ["#198754" if s >= 1.0 else "#dc3545" for s in speedups]
+        bars = ax2.bar(x + offset, speedups, width * 0.8, label=f"{labels[i]}/{labels[baseline_idx]}",
+                       color=palette[i % len(palette)], alpha=0.82)
+        for bar, val in zip(bars, speedups):
+            ax2.annotate(f"{val:.2f}x", xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                         xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7, fontweight="bold")
+
+    ax2.axhline(y=1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax2.set_xlabel("Context Depth")
+    ax2.set_ylabel("Speedup over Baseline (x)")
+    ax2.set_title("Speedup vs AR Baseline")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([str(d) for d in depths])
+    ax2.legend()
+    ax2.grid(axis="y", alpha=0.3)
+
+    model_name = all_meta[0].get("model", "Qwen3.5-27B")
+    fig.suptitle(f"{model_name} — Speculative Decoding Benchmark", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved chart: {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="View and compare llama-benchy results")
     parser.add_argument("results", nargs="+", help="JSON result files (1=show, 2=compare)")
@@ -172,22 +248,28 @@ def main():
         print()
         print(fmt_summary(raw_rows))
 
-    elif len(args.results) == 2:
-        _, raw_a, meta_a = parse_bench(args.results[0])
-        _, raw_b, meta_b = parse_bench(args.results[1])
-        label_a = meta_a.get("label", meta_a.get("mode", "spec"))
-        label_b = meta_b.get("label", meta_b.get("mode", "baseline"))
+    elif len(args.results) >= 2:
+        parsed = [parse_bench(p) for p in args.results]
+        all_raw = [p[1] for p in parsed]
+        all_meta = [p[2] for p in parsed]
 
-        print(fmt_compare(raw_a, raw_b, label_a, label_b))
+        for i in range(len(all_raw) - 1):
+            label_a = all_meta[i + 1].get("label", all_meta[i + 1].get("mode", "spec"))
+            label_b = all_meta[i].get("label", all_meta[i].get("mode", "baseline"))
+            print(fmt_compare(all_raw[i + 1], all_raw[i], label_a, label_b))
+            print()
 
         chart_path = args.chart
         if chart_path is None:
             out_dir = os.path.dirname(args.results[0]) or "."
-            chart_path = os.path.join(out_dir, "comparison.png")
-        plot_chart(raw_a, raw_b, meta_a, meta_b, chart_path)
+            chart_path = os.path.join(out_dir, "comparison_chart.png")
+        if len(all_raw) == 2:
+            plot_chart(all_raw[0], all_raw[1], all_meta[0], all_meta[1], chart_path)
+        else:
+            plot_multi_chart(all_raw, all_meta, chart_path)
 
     else:
-        print("ERROR: provide 1 file (view) or 2 files (compare)")
+        print("ERROR: provide 1 file (view) or 2+ files (compare)")
         sys.exit(1)
 
 
