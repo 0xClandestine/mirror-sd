@@ -175,6 +175,8 @@ pub fn compile_dflash_kernels(
     let kernel_builders: Vec<(&str, Graph)> = vec![
         ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
         ("mega_qkv", dflash::build_kqv_plus_vnorm_qnorm_kernel(w_sq, w_ctx)),
+        ("mega_proj", dflash::build_mega_proj_kernel(w_sq, w_ctx)),
+        ("qk_rope", dflash::build_qk_rope_kernel(w_sq, w_kv)),
         ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
         ("attn_out", dflash::build_attn_out_kernel(w_sq, w_kv, softcap)),
         ("o_proj_residual", dflash::build_o_proj_residual_kernel(w_sq, softcap)),

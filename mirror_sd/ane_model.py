@@ -1,19 +1,9 @@
 """DFlash draft model running on Apple Neural Engine.
 
 Uses mega_qkv kernel (input-pack approach) to fuse Q/K/V projections +
-per-head norms + RoPE into a single ANE dispatch per layer, eliminating
-3 Python round-trips per layer.
+per-head norms + RoPE into a single ANE dispatch per layer.
 
-Key innovation (ANE rule #22): Instead of separate k_proj_ctx + k_proj_noise
-+ concat (which fails at runtime due to concat→reshape→transpose pattern),
-we pack context + normed into one tensor [1, HIDDEN, 1, w_kv] and do ONE
-conv1x1 for K (and V). This is mathematically equivalent and avoids the
-problematic output concat pattern.
-
-The attention computation (GQA tile + SDPA + o_proj) uses separate kernels
-because the mega_qkv + GQA tile exceeds the ANE's per-dispatch operation limit.
-
-Data flow per layer (7 kernels → 4 kernels + 1 Python round-trip):
+Data flow per layer (7 kernels):
   hidden ──┬──→ mega_qkv ──→ (k_rope_4d, v_4d_t, q_rope_4d) ──→ gqa_tile ──→ attn_out ──→ (Python 4D→flat) ──→ o_proj_residual ──→ ffn_residual
   context ─┘
 """
@@ -81,10 +71,12 @@ class ANEDraftModel:
 
         print(f"[ANE] Compiling kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv})...")
-        self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len, 30000.0)}
+        self.kernels = {k.name: k for k in ane.compile_dflash_kernels(seq_q, ctx_len, 60000.0)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled: {list(self.kernels.keys())}")
 
         self._alloc_buffers()
+        self._fc_weight = None
+        self._hidden_norm_weight = None
         self.weights_loaded = False
 
     def _alloc_buffers(self):
@@ -144,6 +136,8 @@ class ANEDraftModel:
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
         self._load_fc_weights(draft_model)
+        self._fc_weight = draft_model.fc.weight.astype(mx.float32)
+        self._hidden_norm_weight = draft_model.hidden_norm.weight.astype(mx.float32)
         for i in range(N_DFLASH_LAYERS):
             t0 = time.time()
             self._load_layer_weights(draft_model, i)
@@ -170,7 +164,6 @@ class ANEDraftModel:
         return self.ane.ANETensor.from_buffer(1, ic, height, oc, memoryview(padded))
 
     def _load_fc_weights(self, model: nn.Module):
-        fc_buf = self._mlx_to_buffer(model.fc.weight)
         self.w_fc = self._make_weight_buf(model.fc.weight.astype(mx.float32), HIDDEN, TARGET_HIDDEN)
         hidden_norm_w = self._mlx_to_f32_list(model.hidden_norm.weight)
         self.w_hidden_norm = self._make_norm_weight_expanded(hidden_norm_w, HIDDEN, self.w_ctx)
@@ -228,15 +221,12 @@ class ANEDraftModel:
             )
         k = self.kernels
         self._write_mlx_2d(self.b_hidden, noise_embedding)
-        self._write_mlx_2d(self.b_target, target_hidden / 2048.0)
+
+        context = self._compute_context(target_hidden)
+        self._write_mlx_2d(self.b_context, context)
 
         self._compute_rope(rope_offset, ctx_len)
         self._compute_attn_mask(ctx_len)
-
-        k['fc_norm'].run_uncached(
-            [self.b_target, self.w_fc, self.w_hidden_norm],
-            [self.b_context],
-        )
 
         for i in range(N_DFLASH_LAYERS):
             self._run_layer(k, i)
@@ -292,8 +282,6 @@ class ANEDraftModel:
         p = f"l{layer_idx}_"
 
         # --- mega_qkv: in_norm + Q/K/V projections + per-head norms + RoPE ---
-        # Input-pack approach: concat(context, normed) → one conv1x1 for K/V
-        # 3 outputs: k_rope_4d, v_4d_t, q_rope_4d
         k['mega_qkv'].run_uncached(
             [self.b_hidden, getattr(self, f"w_{p}in_norm"),
              self.b_context,
@@ -343,16 +331,31 @@ class ANEDraftModel:
         self.b_cos_q.write_buffer(memoryview(q_cos.flatten().astype(mx.float32)))
         self.b_sin_q.write_buffer(memoryview(q_sin.flatten().astype(mx.float32)))
 
+        # K RoPE: context positions [0:ctx_len], noise positions [w_ctx:w_ctx+seq_q]
+        # Buffer layout: [0:ctx_len]=ctx, [ctx_len:w_ctx]=pad, [w_ctx:w_ctx+seq_q]=noise
         k_ctx_pos = mx.array([rope_offset + p for p in range(ctx_len)], dtype=mx.float32)
         k_noise_pos = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
-        k_positions = mx.concatenate([k_ctx_pos, k_noise_pos])
-        k_angles = k_positions[:, None] * q_freqs[None, :]
-        k_cos = mx.cos(k_angles)
-        k_sin = mx.sin(k_angles)
-        k_cos = mx.repeat(k_cos, 2, axis=1)
-        k_sin = mx.repeat(k_sin, 2, axis=1)
-        self.b_cos_k.write_buffer(memoryview(k_cos.flatten().astype(mx.float32)))
-        self.b_sin_k.write_buffer(memoryview(k_sin.flatten().astype(mx.float32)))
+
+        k_ctx_angles = k_ctx_pos[:, None] * q_freqs[None, :]
+        k_noise_angles = k_noise_pos[:, None] * q_freqs[None, :]
+
+        k_ctx_cos = mx.repeat(mx.cos(k_ctx_angles), 2, axis=1)
+        k_ctx_sin = mx.repeat(mx.sin(k_ctx_angles), 2, axis=1)
+        k_noise_cos = mx.repeat(mx.cos(k_noise_angles), 2, axis=1)
+        k_noise_sin = mx.repeat(mx.sin(k_noise_angles), 2, axis=1)
+
+        # Build full K cos/sin buffer with correct position mapping
+        # Shape: [1, 1, w_kv, HEAD_DIM] where w_kv = w_ctx + w_sq
+        k_cos_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)
+        k_sin_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)
+        k_cos_full[:, :, :ctx_len, :] = k_ctx_cos[None, None]
+        k_cos_full[:, :, self.w_ctx:, :] = k_noise_cos[None, None]
+        k_sin_full[:, :, :ctx_len, :] = k_ctx_sin[None, None]
+        k_sin_full[:, :, self.w_ctx:, :] = k_noise_sin[None, None]
+        mx.eval(k_cos_full, k_sin_full)
+
+        self.b_cos_k.write_buffer(memoryview(k_cos_full.flatten().astype(mx.float32)))
+        self.b_sin_k.write_buffer(memoryview(k_sin_full.flatten().astype(mx.float32)))
 
     def _compute_attn_mask(self, ctx_len: int):
         mask = mx.full((1, 1, self.w_sq, self.w_kv), -1e4, dtype=mx.float32)
@@ -366,3 +369,10 @@ class ANEDraftModel:
         arr = mx.array(data, dtype=mx.float32).reshape(1, HIDDEN, 1, w)
         arr[:, :, :, ctx_len:] = 0.0
         self.b_context.write_buffer(memoryview(arr.flatten().astype(mx.float32)))
+
+    def _compute_context(self, target_hidden: mx.array) -> mx.array:
+        fc_out = target_hidden @ self._fc_weight.T
+        rms = mx.sqrt(mx.mean(fc_out.astype(mx.float32) ** 2, axis=-1, keepdims=True) + 1e-6)
+        context = (fc_out / rms) * self._hidden_norm_weight
+        mx.eval(context)
+        return context.astype(mx.float32)

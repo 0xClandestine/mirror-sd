@@ -1,4 +1,4 @@
-use ane::{Graph, MIN_SPATIAL_WIDTH, Shape, Tensor};
+use ane::{Graph, Shape, Tensor, MIN_SPATIAL_WIDTH};
 
 pub const HIDDEN: usize = 4096;
 pub const HEAD_DIM: usize = 128;
@@ -15,14 +15,16 @@ pub fn align_width(w: usize) -> usize {
 }
 
 pub fn rmsnorm(g: &mut Graph, x: Tensor, weight: Tensor) -> Tensor {
+    rmsnorm_with_eps(g, x, weight, 1e-6)
+}
+
+pub fn rmsnorm_with_eps(g: &mut Graph, x: Tensor, weight: Tensor, eps: f32) -> Tensor {
     let inv_s =
         g.constant_with_scalar(1.0 / 128.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let x_scaled = g.multiplication(x, inv_s);
-    let ms = g.reduce_mean(x_scaled, 1);
-    let diff = g.subtraction(x_scaled, ms);
-    let sq = g.multiplication(diff, diff);
+    let sq = g.multiplication(x_scaled, x_scaled);
     let mean_sq = g.reduce_mean(sq, 1);
-    let eps_t = g.constant_with_scalar(1e-6, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let eps_t = g.constant_with_scalar(eps, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let mean_sq_eps = g.addition(mean_sq, eps_t);
     let neg_half =
         g.constant_with_scalar(-0.5, Shape { batch: 1, channels: 1, height: 1, width: 1 });
@@ -88,6 +90,73 @@ fn conv1x1_proj(
     let wt = g.transpose(w, [0, 3, 2, 1]);
     let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     g.convolution_2d_1x1_dynamic(a, w_conv)
+}
+
+/// Projections only: input_layernorm + Q/K/V projections + V reshape/transpose.
+/// No per-head Q/K norm, no RoPE. Q and K outputs are raw 4D tensors.
+pub fn build_mega_proj_kernel(w_sq: usize, w_ctx: usize) -> Graph {
+    let mut g = Graph::new();
+    let w_kv = w_ctx + w_sq;
+
+    let hidden = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let in_norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, hidden, in_norm_w);
+
+    let context = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
+    let packed = g.concat(&[context, normed], 3);
+
+    // K projection only
+    let wk = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: N_KV_HEADS * HEAD_DIM,
+    });
+    let k_all = conv1x1_proj(&mut g, packed, wk, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
+    let k_4d =
+        g.reshape(k_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let _k_4d_t = g.transpose(k_4d, [0, 1, 3, 2]);
+
+    // V projection + transpose
+    let wv = g.placeholder(Shape {
+        batch: 1,
+        channels: HIDDEN,
+        height: 1,
+        width: N_KV_HEADS * HEAD_DIM,
+    });
+    let v_all = conv1x1_proj(&mut g, packed, wv, N_KV_HEADS * HEAD_DIM, HIDDEN, w_kv);
+    let v_4d =
+        g.reshape(v_all, Shape { batch: 1, channels: N_KV_HEADS, height: HEAD_DIM, width: w_kv });
+    let _v_4d_t = g.transpose(v_4d, [0, 1, 3, 2]);
+
+    // Q projection only
+    let wq =
+        g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: N_HEADS * HEAD_DIM });
+    let q_out = conv1x1_proj(&mut g, normed, wq, N_HEADS * HEAD_DIM, HIDDEN, w_sq);
+    let q_4d =
+        g.reshape(q_out, Shape { batch: 1, channels: N_HEADS, height: HEAD_DIM, width: w_sq });
+    let _q_4d_t = g.transpose(q_4d, [0, 1, 3, 2]);
+
+    g
+}
+
+/// RoPE only: takes pre-normed Q and K in 4D format, applies RoPE.
+/// Q: [1, N_HEADS, w_sq, HEAD_DIM], K: [1, N_KV_HEADS, w_kv, HEAD_DIM]
+pub fn build_qk_rope_kernel(w_sq: usize, w_kv: usize) -> Graph {
+    let mut g = Graph::new();
+
+    let q_in = g.placeholder(Shape { batch: 1, channels: N_HEADS, height: w_sq, width: HEAD_DIM });
+    let cos_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
+    let sin_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: HEAD_DIM });
+    let _q_rope = apply_rope(&mut g, q_in, cos_q, sin_q, N_HEADS, w_sq, HEAD_DIM);
+
+    let k_in =
+        g.placeholder(Shape { batch: 1, channels: N_KV_HEADS, height: w_kv, width: HEAD_DIM });
+    let cos_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
+    let sin_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: HEAD_DIM });
+    let _k_rope = apply_rope(&mut g, k_in, cos_k, sin_k, N_KV_HEADS, w_kv, HEAD_DIM);
+
+    g
 }
 
 /// K full + Q proj + V proj + V reshape+transpose + Q norm + Q rope.
@@ -167,7 +236,7 @@ pub fn build_fc_norm_kernel(w_ctx: usize) -> Graph {
     let fc_w = g.placeholder(Shape { batch: 1, channels: TARGET_HIDDEN, height: 1, width: HIDDEN });
     let norm_w = g.placeholder(Shape { batch: 1, channels: HIDDEN, height: 1, width: w_ctx });
     let fc_out = conv1x1_proj(&mut g, target_hid, fc_w, HIDDEN, TARGET_HIDDEN, w_ctx);
-    let _out = rmsnorm(&mut g, fc_out, norm_w);
+    let _out = rmsnorm_with_eps(&mut g, fc_out, norm_w, 1e-2);
     g
 }
 
