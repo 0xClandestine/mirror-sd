@@ -103,9 +103,23 @@ impl ANETensor {
         Ok(())
     }
 
-    fn read_f32(&self) -> PyResult<Vec<f32>> {
-        let slice = self.inner.as_f32_slice();
-        Ok(slice.to_vec())
+    fn read_f32(&self, py: Python<'_>) -> PyResult<Vec<f32>> {
+        let element_count = {
+            let s = self.inner.shape();
+            s.batch * s.channels * s.height * s.width
+        };
+        let mut result = vec![0.0f32; element_count];
+        let surface = self.inner.surface();
+        py.allow_threads(|| unsafe {
+            surface.lockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+            let src = std::slice::from_raw_parts(
+                surface.baseAddress().as_ptr().cast::<u16>(),
+                element_count,
+            );
+            ane::neon_convert::f16_to_f32_bulk(src, &mut result);
+            surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+        });
+        Ok(result)
     }
 
     #[getter]
