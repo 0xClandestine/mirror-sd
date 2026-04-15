@@ -1152,11 +1152,23 @@ def _spec_generate_parallel(
     # Precompute the first draft while nothing is running on GPU
     draft_result = None
     draft_thread = None
+    # Set to True when the thread ran run_kernels() and main thread must call
+    # read_output() + lm_head after joining.
+    _ane_kernels_pending = False
 
     gpu_fallback = getattr(draft_model, 'gpu_fallback', None)
+    has_ane_context = hasattr(draft_model, '_compute_context')
+    # True when the model supports the split run_kernels / read_output API.
+    has_prepare = (hasattr(draft_model, 'prepare_forward') and
+                   hasattr(draft_model, 'run_kernels') and
+                   hasattr(draft_model, 'read_output'))
 
-    def _run_draft(th, ne, dc, rope_offset):
-        nonlocal draft_result
+    # Dedicated GPU stream for the lm_head eval in the non-prepared draft path.
+    _draft_stream = mx.new_stream(mx.gpu)
+
+    def _run_draft(th, ne, dc, rope_offset, precomputed_context=None,
+                   buffers_prepared=False):
+        nonlocal draft_result, _ane_kernels_pending
         ctx_len = th.shape[1]
         use_gpu = (gpu_fallback is not None and
                    ctx_len > getattr(draft_model, 'max_ctx_len', ctx_len))
@@ -1170,15 +1182,32 @@ def _spec_generate_parallel(
                     c_new.offset = c_old.offset
         else:
             dc_active = dc
+        if not use_gpu and buffers_prepared:
+            # All Metal/mx.eval work was done on the main thread in _start_draft.
+            # This thread is PURE ANE (IOSurface reads/writes + CoreML kernels) —
+            # no mx.array creation, no mx.eval, no Metal.
+            # read_output() + lm_head will be called on the main thread after join.
+            active_draft.run_kernels()
+            _ane_kernels_pending = True
+            return
         q_len = ne.shape[1]
-        draft_hidden = active_draft(
-            noise_embedding=ne,
-            target_hidden=th,
-            cache=dc_active,
-        )
-        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
-        sampled_tokens = sample(draft_logits, temperature)
-        mx.eval(sampled_tokens)
+        if use_gpu:
+            draft_hidden = active_draft(
+                noise_embedding=ne,
+                target_hidden=th,
+                cache=dc_active,
+            )
+        else:
+            draft_hidden = active_draft(
+                noise_embedding=ne,
+                target_hidden=th,
+                cache=dc_active,
+                precomputed_context=precomputed_context,
+            )
+        with mx.stream(_draft_stream):
+            draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+            sampled_tokens = sample(draft_logits, temperature)
+            mx.eval(sampled_tokens)
         if use_gpu:
             for c_old, c_new in zip(dc, dc_active):
                 c_old.keys = c_new.keys
@@ -1186,13 +1215,50 @@ def _spec_generate_parallel(
                 c_old.offset = c_new.offset
         draft_result = sampled_tokens
 
-    # Kick off first draft
-    block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-    noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
-    mx.eval(noise_embedding)
+    def _start_draft(th, last_token, dc, start_pos):
+        """Prepare all ANE buffers on the main thread, then fork a pure-ANE thread.
+
+        All mx.eval() / Metal calls happen HERE (main thread) before the thread
+        starts, so the spawned thread runs zero Metal during its critical window
+        (while GPU verify is executing on the main thread).
+        """
+        nonlocal draft_thread, t_draft_start
+        ctx_len = th.shape[1]
+        use_gpu = (gpu_fallback is not None and
+                   ctx_len > getattr(draft_model, 'max_ctx_len', ctx_len))
+
+        block_tokens = [last_token] + [mask_token_id] * (block_size - 1)
+        noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
+        mx.eval(noise_embedding)
+
+        if not use_gpu and has_prepare:
+            # Compute context + write all ANE input buffers on main thread.
+            # After this call every mx.eval() is done; the thread is pure ANE.
+            precomputed_context = None  # prepare_forward handles context internally
+            if has_ane_context:
+                precomputed_context = draft_model._compute_context(th)
+                mx.eval(precomputed_context)
+            draft_model.prepare_forward(noise_embedding, precomputed_context, dc, th)
+            buffers_prepared = True
+        elif not use_gpu and has_ane_context:
+            precomputed_context = draft_model._compute_context(th)
+            mx.eval(precomputed_context)
+            buffers_prepared = False
+        else:
+            precomputed_context = None
+            buffers_prepared = False
+
+        t_draft_start = time.perf_counter()
+        draft_thread = threading.Thread(
+            target=_run_draft,
+            args=(th, noise_embedding, dc, start_pos, precomputed_context,
+                  buffers_prepared),
+        )
+        draft_thread.start()
+
+    # Kick off first draft (no GPU verify running yet — no contention)
     t_draft_start = time.perf_counter()
-    draft_thread = threading.Thread(target=_run_draft, args=(target_hidden, noise_embedding, draft_cache, 0))
-    draft_thread.start()
+    _start_draft(target_hidden, output_ids_list[-1], draft_cache, 0)
 
     while start < max_length:
         remaining = max_length - start
@@ -1205,6 +1271,7 @@ def _spec_generate_parallel(
                 if draft_thread is not None:
                     draft_thread.join()
                     draft_thread = None
+                    _ane_kernels_pending = False  # discard stale draft
                 token_id = mx.array([[output_ids_list[-1]]], dtype=mx.int32)
                 logits = target_model(token_id, cache=target_cache)
                 mx.eval(logits)
@@ -1224,6 +1291,17 @@ def _spec_generate_parallel(
         t_draft_done = time.perf_counter()
         draft_time = t_draft_done - t_draft_start
 
+        # When ANE ran run_kernels() in the thread, read_output() + lm_head
+        # must happen on the main thread (safe — no concurrent Metal access).
+        if _ane_kernels_pending:
+            _ane_kernels_pending = False
+            draft_hidden = draft_model.read_output()
+            q_len = current_block_size
+            draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+            sampled_tokens = sample(draft_logits, temperature)
+            mx.eval(sampled_tokens)
+            draft_result = sampled_tokens
+
         sampled_tokens = draft_result
         block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)
         block_tokens_updated = block_tokens.copy()
@@ -1232,7 +1310,31 @@ def _spec_generate_parallel(
             block_tokens_updated[i + 1] = int(sampled_tokens[0, i])
         block_output_ids = mx.array([block_tokens_updated], dtype=mx.int32)
 
-        # --- Verify on GPU + start next draft on ANE in parallel ---
+        # Trim draft cache before starting the next draft (trim amount is always
+        # block_size regardless of acceptance, so this can precede accept/reject).
+        for c in draft_cache:
+            c.trim(block_size)
+
+        # --- Pipeline: start draft N+1 with current target_hidden BEFORE verify N ---
+        #
+        # target_hidden here is h_{N-1} (fresh from the previous verify step).
+        # Starting the draft now lets ANE and GPU truly run in parallel:
+        #   ANE: draft N+1 (using h_{N-1}, output_ids_list[-1] as block start)
+        #   GPU: verify N  (below)
+        #
+        # _compute_context (GPU matmul ~2ms) is precomputed on this thread inside
+        # _start_draft before forking, so the spawned thread is pure ANE and won't
+        # contend with GPU verify.
+        #
+        # Staleness: draft N+1 is conditioned on h_{N-1} and correction_token_{N-1}
+        # rather than h_N / correction_token_N (known only after verify N). The
+        # verify step always corrects any mismatch, so acceptance rate degrades
+        # slightly but throughput improves from serial ~367ms/step to
+        # max(draft, verify) ~204ms/step.
+        if start < max_length:
+            _start_draft(target_hidden, output_ids_list[-1], draft_cache, start)
+
+        # --- Verify on GPU (draft N+1 running on ANE in parallel) ---
         t_verify_start = time.perf_counter()
 
         verify_logits, _, verify_hidden = forward_with_hidden_states(
@@ -1263,9 +1365,6 @@ def _spec_generate_parallel(
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
 
-        for c in draft_cache:
-            c.trim(block_size)
-
         start += acceptance_length + 1
 
         for tid in draft_tokens[:acceptance_length] + [correction_token]:
@@ -1281,7 +1380,6 @@ def _spec_generate_parallel(
 
         t_verify_done = time.perf_counter()
         verify_time = t_verify_done - t_verify_start
-        overlap = max(0, draft_time - verify_time) if draft_time > 0 else 0
         stats.total_draft_time += draft_time
         stats.total_verify_time += verify_time
         stats.total_overlap_time += min(draft_time, verify_time)
@@ -1291,42 +1389,22 @@ def _spec_generate_parallel(
         stats.draft_steps += 1
         stats.total_tokens = len(output_ids_list) - num_input_tokens
 
+        # Update target_hidden for the next iteration's _start_draft call.
+        # draft_thread (draft N+1) continues running and is joined at the top of
+        # the next iteration.
+        target_hidden = new_target_hidden
+
         if stop_token_ids is not None:
             for stop_id in stop_token_ids:
                 if stop_id in output_ids_list[num_input_tokens:]:
                     break
             else:
-                # Start next draft in parallel with upcoming verify
-                if start < max_length:
-                    next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-                    next_noise_embedding = embed_fn(
-                        mx.array([next_block_tokens], dtype=mx.int32)
-                    )
-                    mx.eval(next_noise_embedding)
-                    t_draft_start = time.perf_counter()
-                    draft_thread = threading.Thread(
-                        target=_run_draft,
-                        args=(new_target_hidden, next_noise_embedding, draft_cache, start),
-                    )
-                    draft_thread.start()
-                target_hidden = new_target_hidden
                 continue
+            # Stop token found — join any running draft thread before exiting.
+            if draft_thread is not None:
+                draft_thread.join()
+                draft_thread = None
             break
-
-        # Start next draft in parallel with upcoming verify
-        if start < max_length:
-            next_block_tokens = [output_ids_list[-1]] + [mask_token_id] * (block_size - 1)
-            next_noise_embedding = embed_fn(
-                mx.array([next_block_tokens], dtype=mx.int32)
-            )
-            mx.eval(next_noise_embedding)
-            t_draft_start = time.perf_counter()
-            draft_thread = threading.Thread(
-                target=_run_draft,
-                args=(new_target_hidden, next_noise_embedding, draft_cache, start),
-            )
-            draft_thread.start()
-        target_hidden = new_target_hidden
 
     # Clean up any remaining draft thread
     if draft_thread is not None:

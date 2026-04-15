@@ -224,7 +224,8 @@ class ANEDraftModel:
         self.w_final_norm = self._make_norm_weight_expanded(model.norm.weight, self.w_sq)
 
     def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
-                rope_offset: int = 0, ctx_len: int = None) -> mx.array:
+                rope_offset: int = 0, ctx_len: int = None,
+                precomputed_context: mx.array = None) -> mx.array:
         if ctx_len is None:
             ctx_len = target_hidden.shape[1]
         if ctx_len > self.max_ctx_len:
@@ -236,7 +237,7 @@ class ANEDraftModel:
 
         self._write_padded(self._padded_hidden, self.b_hidden, noise_embedding)
 
-        context = self._compute_context(target_hidden)
+        context = precomputed_context if precomputed_context is not None else self._compute_context(target_hidden)
         self._write_padded(self._padded_context, self.b_context, context)
 
         self._compute_rope(rope_offset, ctx_len)
@@ -253,12 +254,14 @@ class ANEDraftModel:
         return self._read_mlx_2d(self.b_output, self.seq_q, self.hidden)
 
     def __call__(self, noise_embedding: mx.array, target_hidden: mx.array,
-                 mask=None, cache=None, **kwargs) -> mx.array:
+                 mask=None, cache=None, precomputed_context: mx.array = None,
+                 **kwargs) -> mx.array:
         rope_offset = 0
         if cache is not None and len(cache) > 0 and cache[0].offset > 0:
             rope_offset = cache[0].offset
         return self.forward(noise_embedding, target_hidden, rope_offset=rope_offset,
-                           ctx_len=target_hidden.shape[1])
+                           ctx_len=target_hidden.shape[1],
+                           precomputed_context=precomputed_context)
 
     def make_cache(self):
         from .dflash import DFlashKVCache
@@ -366,6 +369,56 @@ class ANEDraftModel:
         mask[:, :, :, :ctx_len] = 0.0
         mask[:, :, :, self.w_ctx:self.w_ctx + self.seq_q] = 0.0
         self.b_attn_mask.write_buffer(memoryview(mask.flatten().astype(mx.float32)))
+
+    def prepare_forward(
+        self,
+        noise_embedding: mx.array,
+        precomputed_context: mx.array,
+        cache,
+        target_hidden: mx.array,
+    ) -> None:
+        """Write all ANE input buffers on the calling (main) thread.
+
+        Runs all mx.eval() / Metal operations here so that run_prepared()
+        can be called from a background thread with zero Metal work —
+        enabling true ANE||GPU concurrency without racing on Metal state.
+        """
+        rope_offset = 0
+        if cache is not None and len(cache) > 0 and cache[0].offset > 0:
+            rope_offset = cache[0].offset
+        ctx_len = target_hidden.shape[1]
+
+        self._write_padded(self._padded_hidden, self.b_hidden, noise_embedding)
+
+        context = precomputed_context if precomputed_context is not None else self._compute_context(target_hidden)
+        self._write_padded(self._padded_context, self.b_context, context)
+
+        self._compute_rope(rope_offset, ctx_len)
+        self._compute_attn_mask(ctx_len)
+
+    def run_kernels(self) -> None:
+        """Execute ANE kernels on already-prepared buffers. No mx ops.
+
+        Pure ANE (IOSurface + CoreML) — safe to call from a background thread
+        while the main thread runs GPU verify. Writes result to self.b_output.
+        Call read_output() on the main thread after the thread joins.
+        """
+        k = self.kernels
+        for i in range(self.n_layers):
+            self._run_layer(k, i)
+        k['final_norm'].run_uncached(
+            [self.b_hidden, self.w_final_norm],
+            [self.b_output],
+        )
+
+    def read_output(self) -> mx.array:
+        """Read b_output into an mx.array. Must be called on the main thread."""
+        return self._read_mlx_2d(self.b_output, self.seq_q, self.hidden)
+
+    def run_prepared(self) -> mx.array:
+        """Convenience: run_kernels() + read_output() for single-threaded callers."""
+        self.run_kernels()
+        return self.read_output()
 
     def _compute_context(self, target_hidden: mx.array) -> mx.array:
         fc_out = target_hidden @ self._fc_weight.T

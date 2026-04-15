@@ -66,6 +66,47 @@ class _ProfiledANEDraftModel:
     def make_cache(self):
         return self._m.make_cache()
 
+    # ---- prepare_forward / run_kernels / read_output / run_prepared:
+    #      delegate to the real model so the pipelined ANE||GPU path in
+    #      _spec_generate_parallel can pre-buffer all Metal work on the main
+    #      thread.  run_kernels() is pure ANE (called from thread),
+    #      read_output() creates mx.array (called on main thread after join).
+    def prepare_forward(self, noise_embedding, precomputed_context, cache,
+                        target_hidden):
+        return self._m.prepare_forward(noise_embedding, precomputed_context,
+                                       cache, target_hidden)
+
+    def run_kernels(self):
+        if self._active:
+            m = self._m
+            k = m.kernels
+            t0 = time.perf_counter()
+            for i in range(m.n_layers):
+                m._run_layer(k, i)
+            self.phase_times['layers_total'].append(
+                (time.perf_counter() - t0) * 1e3)
+            t0 = time.perf_counter()
+            k['final_norm'].run_uncached(
+                [m.b_hidden, m.w_final_norm], [m.b_output])
+            self.phase_times['final_norm'].append(
+                (time.perf_counter() - t0) * 1e3)
+        else:
+            self._m.run_kernels()
+
+    def read_output(self):
+        if self._active:
+            m = self._m
+            t0 = time.perf_counter()
+            result = m._read_mlx_2d(m.b_output, m.seq_q, m.hidden)
+            self.phase_times['read_output'].append(
+                (time.perf_counter() - t0) * 1e3)
+            return result
+        return self._m.read_output()
+
+    def run_prepared(self):
+        self.run_kernels()
+        return self.read_output()
+
     def __call__(self, noise_embedding, target_hidden, cache=None, **kwargs):
         if not self._active:
             return self._m(noise_embedding, target_hidden, cache=cache, **kwargs)
