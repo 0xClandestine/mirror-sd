@@ -1227,6 +1227,16 @@ def _spec_generate_parallel(
         use_gpu = (gpu_fallback is not None and
                    ctx_len > getattr(draft_model, 'max_ctx_len', ctx_len))
 
+        # The ANE model never calls update_and_fetch, so draft_cache.offset
+        # is never incremented — RoPE positions would always start from 0.
+        # Replicate what the GPU path achieves via update_and_fetch + trim:
+        #   offset after trim = start_pos - ctx_len  (= V_{N-1}, the absolute
+        #   position of the first context token in the current target_hidden).
+        if not use_gpu:
+            rope_offset_val = max(0, start_pos - ctx_len)
+            for c in dc:
+                c.offset = rope_offset_val
+
         block_tokens = [last_token] + [mask_token_id] * (block_size - 1)
         noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
         mx.eval(noise_embedding)
