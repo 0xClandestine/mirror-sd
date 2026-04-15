@@ -44,7 +44,7 @@ def _interleave_head_dims_mx(w: mx.array, n_heads: int, head_dim: int) -> mx.arr
 
 
 class ANEDraftModel:
-    def __init__(self, seq_q: int, ctx_len: int, config=None):
+    def __init__(self, seq_q: int, ctx_len: int, config=None, vocab_size: Optional[int] = None):
         import mirror_sd_ane as ane
 
         if config is not None:
@@ -87,6 +87,14 @@ class ANEDraftModel:
         self.kernels = {k.name: k for k in compile_fn(seq_q, ctx_len, self.softcap)}
         print(f"[ANE] All {len(self.kernels)} kernels compiled: {list(self.kernels.keys())}")
 
+        self.vocab_size = vocab_size
+        if vocab_size is not None:
+            print(f"[ANE] Compiling lm_head kernel (vocab={vocab_size})...")
+            t0 = time.time()
+            lm_head_k = ane.compile_lm_head_kernel(seq_q, vocab_size, is_27b)
+            self.kernels['final_norm_lm_head'] = lm_head_k
+            print(f"[ANE] lm_head kernel compiled ({time.time()-t0:.1f}s)")
+
         self._alloc_buffers()
         self._fc_weight = None
         self._hidden_norm_weight = None
@@ -127,6 +135,11 @@ class ANEDraftModel:
 
         self.b_attn_mask = ane.ANETensor(1, 1, w_sq, w_kv)
 
+        # Allocated only when vocab_size is set
+        self.b_logits = (
+            ane.ANETensor(1, self.vocab_size, 1, w_sq) if self.vocab_size is not None else None
+        )
+
         self._padded_hidden = mx.zeros((1, H, w_sq), dtype=mx.float32)
         self._padded_target = mx.zeros((1, TH, w_ctx), dtype=mx.float32)
         self._padded_context = mx.zeros((1, H, w_ctx), dtype=mx.float32)
@@ -158,6 +171,8 @@ class ANEDraftModel:
             self._load_layer_weights(draft_model, i)
             print(f"[ANE]   Layer {i} loaded ({time.time()-t0:.1f}s)")
         self._load_final_norm_weights(draft_model)
+        if self.vocab_size is not None and target_model is not None:
+            self._load_lm_head_weights(target_model)
         self.weights_loaded = True
         print("[ANE] Weights loaded")
 
@@ -222,6 +237,25 @@ class ANEDraftModel:
 
     def _load_final_norm_weights(self, model: nn.Module):
         self.w_final_norm = self._make_norm_weight_expanded(model.norm.weight, self.w_sq)
+
+    def _load_lm_head_weights(self, target_model: nn.Module):
+        # lm_head weight: [vocab_size, hidden] — may be tied to embed_tokens
+        inner = target_model
+        for attr in ('language_model', 'model'):
+            if hasattr(inner, attr):
+                inner = getattr(inner, attr)
+                break
+        lm_head_w = getattr(inner, 'lm_head', None) or getattr(target_model, 'lm_head', None)
+        if lm_head_w is None:
+            raise AttributeError(
+                "Cannot find lm_head on target_model. "
+                "Pass target_model with a .lm_head attribute."
+            )
+        w = lm_head_w.weight if hasattr(lm_head_w, 'weight') else lm_head_w
+        print(f"[ANE] Loading lm_head weight {w.shape}...")
+        t0 = time.time()
+        self.w_lm_head = self._make_weight_buf(w.astype(mx.float16), self.vocab_size, self.hidden)
+        print(f"[ANE] lm_head weight loaded ({time.time()-t0:.1f}s)")
 
     def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
                 rope_offset: int = 0, ctx_len: int = None,
@@ -400,20 +434,39 @@ class ANEDraftModel:
         """Execute ANE kernels on already-prepared buffers. No mx ops.
 
         Pure ANE (IOSurface + CoreML) — safe to call from a background thread
-        while the main thread runs GPU verify. Writes result to self.b_output.
-        Call read_output() on the main thread after the thread joins.
+        while the main thread runs GPU verify. Writes result to self.b_output
+        (hidden states) and optionally self.b_logits (lm_head logits).
+        Call read_output() / read_draft_tokens() on the main thread after join.
         """
         k = self.kernels
         for i in range(self.n_layers):
             self._run_layer(k, i)
-        k['final_norm'].run_uncached(
-            [self.b_hidden, self.w_final_norm],
-            [self.b_output],
-        )
+        if self.b_logits is not None:
+            # Fused final-norm + lm_head → logits [1, vocab_size, 1, w_sq]
+            k['final_norm_lm_head'].run_uncached(
+                [self.b_hidden, self.w_final_norm, self.w_lm_head],
+                [self.b_logits],
+            )
+        else:
+            k['final_norm'].run_uncached(
+                [self.b_hidden, self.w_final_norm],
+                [self.b_output],
+            )
 
     def read_output(self) -> mx.array:
         """Read b_output into an mx.array. Must be called on the main thread."""
         return self._read_mlx_2d(self.b_output, self.seq_q, self.hidden)
+
+    def read_draft_tokens(self) -> mx.array:
+        """Argmax over vocab from b_logits → token ids [1, seq_q].
+
+        Only valid when vocab_size was set at construction. Must be called on
+        the main thread after run_kernels() completes.
+        """
+        if self.b_logits is None:
+            raise RuntimeError("vocab_size not set — lm_head kernel not compiled")
+        ids = self.b_logits.read_argmax(self.seq_q, self.vocab_size)
+        return mx.array(ids, dtype=mx.int32).reshape(1, self.seq_q)
 
     def run_prepared(self) -> mx.array:
         """Convenience: run_kernels() + read_output() for single-threaded callers."""

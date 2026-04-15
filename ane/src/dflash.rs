@@ -316,3 +316,18 @@ pub fn build_final_norm_kernel(d: &DFlashDims, w_sq: usize) -> Graph {
     let _out = rmsnorm(&mut g, h, norm_w);
     g
 }
+
+/// Fused final RMSNorm + lm_head projection.
+///
+/// Inputs:  hidden [1, hidden, 1, w_sq], norm_w [1, hidden, 1, w_sq], lm_head_w [1, hidden, 1, vocab_size]
+/// Output:  logits [1, vocab_size, 1, w_sq]
+pub fn build_final_norm_lm_head_kernel(d: &DFlashDims, w_sq: usize, vocab_size: usize) -> Graph {
+    let mut g = Graph::new();
+    let h = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, h, norm_w);
+    let lm_head_w =
+        g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: vocab_size });
+    let _logits = conv1x1_proj(&mut g, normed, lm_head_w, vocab_size, d.hidden);
+    g
+}

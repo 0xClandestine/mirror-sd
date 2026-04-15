@@ -103,6 +103,42 @@ impl ANETensor {
         Ok(())
     }
 
+    /// Return argmax over the channels (vocab) dimension for each of the first `seq_len`
+    /// spatial positions.  Expects buffer shape [1, vocab_size, 1, w_sq] (fp16 IOSurface).
+    fn read_argmax(&self, py: Python<'_>, seq_len: usize, vocab_size: usize) -> PyResult<Vec<i32>> {
+        let w_sq = self.inner.shape().width;
+        let total = vocab_size * w_sq;
+        let surface = self.inner.surface();
+        let argmax = py.allow_threads(|| {
+            let mut result = vec![0i32; seq_len];
+            unsafe {
+                surface.lockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+                let src = std::slice::from_raw_parts(
+                    surface.baseAddress().as_ptr().cast::<u16>(),
+                    total,
+                );
+                let mut f32_data = vec![0.0f32; total];
+                ane::neon_convert::f16_to_f32_bulk(src, &mut f32_data);
+                surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+                // Layout: [1, vocab_size, 1, w_sq] → element[c, w] = f32_data[c * w_sq + w]
+                for w in 0..seq_len {
+                    let mut best_val = f32::NEG_INFINITY;
+                    let mut best_idx = 0i32;
+                    for c in 0..vocab_size {
+                        let val = f32_data[c * w_sq + w];
+                        if val > best_val {
+                            best_val = val;
+                            best_idx = c as i32;
+                        }
+                    }
+                    result[w] = best_idx;
+                }
+            }
+            result
+        });
+        Ok(argmax)
+    }
+
     fn read_f32(&self, py: Python<'_>) -> PyResult<Vec<f32>> {
         let element_count = {
             let s = self.inner.shape();
@@ -269,4 +305,25 @@ pub fn compile_dflash_kernels_27b(
     softcap: f32,
 ) -> PyResult<Vec<ANEKernel>> {
     compile_kernels(&dflash::DIMS_27B, seq_q, ctx_len, softcap)
+}
+
+/// Compile the fused final-norm + lm_head kernel.
+///
+/// `is_27b`: True for 27B model (hidden=5120), False for 8B (hidden=4096).
+#[pyfunction]
+pub fn compile_lm_head_kernel(
+    seq_q: usize,
+    vocab_size: usize,
+    is_27b: bool,
+) -> PyResult<ANEKernel> {
+    let dims = if is_27b { &dflash::DIMS_27B } else { &dflash::DIMS_8B };
+    let w_sq = dflash::align_width(seq_q);
+    let graph = dflash::build_final_norm_lm_head_kernel(dims, w_sq, vocab_size);
+    match graph.compile(NSQualityOfService::UserInteractive) {
+        Ok(exec) => Ok(ANEKernel { executable: exec, name: "final_norm_lm_head".to_string() }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "ANE compile 'final_norm_lm_head' failed: {:?}",
+            e
+        ))),
+    }
 }
