@@ -131,7 +131,7 @@ def forward_with_hidden_states_and_rollback(
 
     Returns same as forward_with_hidden_states plus rollback_records dict
     mapping linear layer index to {initial_conv_state, initial_ssm_state,
-    qkv, k, v, g, beta, repeat_factor}.
+    qkv, k, g, tape}.
     """
     if capture_layers is None:
         capture_layers = []
@@ -221,13 +221,13 @@ def _forward_linear_layer_with_record(layer, hidden_states, mask, cache):
     queries = (inv_scale**2) * mx.fast.rms_norm(queries, None, 1e-6)
     keys = inv_scale * mx.fast.rms_norm(keys, None, 1e-6)
 
-    from mlx_lm.models.gated_delta import compute_g, gated_delta_update
+    from mlx_lm.models.gated_delta import compute_g
+    from .kernels import gated_delta_kernel_with_tape
     beta = mx.sigmoid(b_raw)
     g = compute_g(linear.A_log, a_raw, linear.dt_bias)
 
-    out, state = gated_delta_update(
-        queries, keys, values, a_raw, b_raw, linear.A_log, linear.dt_bias,
-        initial_ssm_state, mask, use_kernel=True,
+    out, state, tape = gated_delta_kernel_with_tape(
+        queries, keys, values, g, beta, initial_ssm_state, mask,
     )
 
     cache[1] = state
@@ -245,11 +245,9 @@ def _forward_linear_layer_with_record(layer, hidden_states, mask, cache):
         'initial_conv_state': initial_conv_state,
         'initial_ssm_state': initial_ssm_state,
         'qkv': qkv,
-        'k': keys,
-        'v': values,
-        'g': g,
-        'beta': beta,
-        'repeat_factor': linear.num_v_heads // linear.num_k_heads,
+        'k': keys,   # [B, T, Hk, Dk] — not GQA-repeated
+        'g': g,      # [B, T, Hv]
+        'tape': tape, # [B, T, Hv, Dv] float32 — precomputed innovation deltas
     }
 
     return hidden_states, rollback_record
@@ -261,16 +259,15 @@ def rollback_linear_caches(cache, rollback_records, accepted_inputs):
     Restores conv_state and SSM state to what they would be after processing
     only the first accepted_inputs tokens from the block.
 
-    Batches all SSM state updates into a single Metal kernel call by
-    concatenating layer states along the batch dimension, then scattering
-    the results back.
+    Uses tape_replay_kernel: reads precomputed innovation deltas from the tape
+    recorded during the verify forward pass, so no dot-product reduction is
+    needed during rollback. Batches all layers into one kernel dispatch.
     """
     layer_indices = []
     initial_states = []
+    all_tapes = []
     all_keys = []
-    all_values = []
     all_g = []
-    all_beta = []
 
     for idx, record in rollback_records.items():
         layer_cache = cache[idx]
@@ -284,39 +281,25 @@ def rollback_linear_caches(cache, rollback_records, accepted_inputs):
         )
         layer_cache[0] = conv_prefix[:, -n_keep:, :]
 
-        record_keys = record['k'][:, :accepted_inputs]
-        repeat_factor = int(record['repeat_factor'])
-        if repeat_factor > 1:
-            record_keys = mx.repeat(record_keys, repeat_factor, axis=2)
-        record_values = record['v'][:, :accepted_inputs]
-        record_g = record['g'][:, :accepted_inputs]
-        record_beta = record['beta'][:, :accepted_inputs]
-
         layer_indices.append(idx)
         initial_states.append(record['initial_ssm_state'])
-        all_keys.append(record_keys)
-        all_values.append(record_values)
-        all_g.append(record_g)
-        all_beta.append(record_beta)
+        all_tapes.append(record['tape'][:, :accepted_inputs])
+        all_keys.append(record['k'][:, :accepted_inputs])
+        all_g.append(record['g'][:, :accepted_inputs])
 
     if not layer_indices:
         return
 
-    rebuilt_states = _advance_gated_delta_states(
-        mx.concatenate(initial_states, axis=0),
+    from .kernels import tape_replay_kernel
+    rebuilt_states = tape_replay_kernel(
+        mx.concatenate(all_tapes, axis=0),
         mx.concatenate(all_keys, axis=0),
-        mx.concatenate(all_values, axis=0),
         mx.concatenate(all_g, axis=0),
-        mx.concatenate(all_beta, axis=0),
+        mx.concatenate(initial_states, axis=0),
     )
 
     for offset, idx in enumerate(layer_indices):
         cache[idx][1] = rebuilt_states[offset:offset + 1]
-
-
-def _advance_gated_delta_states(initial_state, keys, values, g, beta):
-    from .kernels import advance_gated_delta_states_metal
-    return advance_gated_delta_states_metal(initial_state, keys, values, g, beta)
 
 
 def forward_prefix(

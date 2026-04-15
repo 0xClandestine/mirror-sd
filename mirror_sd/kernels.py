@@ -9,131 +9,358 @@ from typing import Optional
 import mlx.core as mx
 
 
-# ── GatedDeltaNet SSM state replay ─────────────────────────────────────────────
+# ── GatedDeltaNet forward with innovation tape ──────────────────────────────────
+#
+# Two kernels that replace the standard gated_delta_update for the verify pass:
+#
+#   gated_delta_kernel_with_tape(q, k, v, g, beta, state)
+#     → (y, state_out, innovation_tape)
+#     Runs the full GDA forward and records delta = (v - state@k) * beta per
+#     token. Identical output to gated_delta_update; tape enables cheap rollback.
+#
+#   tape_replay_kernel(tape, k, g, state, T)
+#     → state_out
+#     Replays accepted tokens using precomputed deltas — no simd_sum needed,
+#     just state = state * g + k * delta. Replaces the old SSM state advance.
 
-def _make_gated_delta_state_kernel():
+
+def _make_gated_delta_kernel_with_tape(*, has_mask: bool = False):
     if not mx.metal.is_available():
         return None
 
-    source = r"""
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+
+    source = f"""
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
-        auto dv_idx = thread_position_in_grid.y;
+        auto hk_idx = hv_idx / (Hv / Hk);
         constexpr int n_per_t = Dk / 32;
 
-        auto k_ = k + (b_idx * T * Hv + hv_idx) * Dk;
-        auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
-        auto g_ = g + b_idx * T * Hv;
-        auto beta_ = beta + b_idx * T * Hv;
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
 
+        // v, y, tape: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
         auto i_state = state_in + (n * Dv + dv_idx) * Dk;
         auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
         float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-          auto s_idx = n_per_t * thread_position_in_threadgroup.x + i;
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
           state[i] = static_cast<float>(i_state[s_idx]);
-        }
+        }}
 
-        for (int t = 0; t < T; ++t) {
-          float kv_mem = 0.0f;
-          auto g_t = g_[hv_idx];
-          for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * thread_position_in_threadgroup.x + i;
-            state[i] = state[i] * g_t;
-            kv_mem += state[i] * static_cast<float>(k_[s_idx]);
-          }
-          kv_mem = simd_sum(kv_mem);
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
 
-          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * beta_[hv_idx];
-          for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * thread_position_in_threadgroup.x + i;
-            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-          }
+        for (int t = 0; t < T; ++t) {{
+          float delta = 0.0f;
+          if ({mask_source}) {{
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * g_[hv_idx];
+              kv_mem += state[i] * k_[s_idx];
+            }}
+            kv_mem = simd_sum(kv_mem);
 
-          k_ += Hv * Dk;
+            delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] + k_[s_idx] * delta;
+              out += state[i] * q_[s_idx];
+            }}
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(out);
+            }}
+          }}
+          if (thread_index_in_simdgroup == 0) {{
+            tape_[dv_idx] = delta;
+          }}
+          for (int i = 0; i < n_per_t; ++i) {{
+            state[i] = static_cast<float>(static_cast<InT>(state[i]));
+          }}
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
           v_ += Hv * Dv;
+          y += Hv * Dv;
+          tape_ += Hv * Dv;
           g_ += Hv;
           beta_ += Hv;
-        }
+        }}
 
-        for (int i = 0; i < n_per_t; ++i) {
-          auto s_idx = n_per_t * thread_position_in_threadgroup.x + i;
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
           o_state[s_idx] = static_cast<InT>(state[i]);
-        }
+        }}
     """
+
+    inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    if has_mask:
+        inputs.append("mask")
+
     return mx.fast.metal_kernel(
-        name="gated_delta_state_update",
-        input_names=["k", "v", "g", "beta", "state_in", "T"],
+        name=f"gated_delta_tape{'_mask' if has_mask else ''}",
+        input_names=inputs,
+        output_names=["y", "state_out", "innovation_tape"],
+        source=source,
+    )
+
+
+_gda_tape_kernel = _make_gated_delta_kernel_with_tape(has_mask=False)
+_gda_tape_kernel_masked = _make_gated_delta_kernel_with_tape(has_mask=True)
+
+
+def _gated_delta_ops_with_tape_python(q, k, v, g, beta, state, mask=None):
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    repeat_factor = Hv // Hk
+    if repeat_factor > 1:
+        q = mx.repeat(q, repeat_factor, axis=2)
+        k = mx.repeat(k, repeat_factor, axis=2)
+    state = state.astype(mx.float32)
+    outputs, tape = [], []
+    for t in range(T):
+        use = True if mask is None else mask[:, t]
+        decay = g[:, t, :, None, None]
+        state = state * decay
+        kv_mem = mx.sum(state * k[:, t, :, None, :], axis=-1)
+        delta = (v[:, t] - kv_mem) * beta[:, t, :, None]
+        state = state + k[:, t, :, None, :] * delta[..., None]
+        y = mx.sum(state * q[:, t, :, None, :], axis=-1)
+        if mask is not None:
+            m = mask[:, t][:, None, None]
+            y = mx.where(m, y, mx.zeros_like(y))
+            delta = mx.where(m, delta, mx.zeros_like(delta))
+        outputs.append(y)
+        tape.append(delta.astype(mx.float32))
+    return (
+        mx.stack(outputs, axis=1),
+        state.astype(q.dtype),
+        mx.stack(tape, axis=1),
+    )
+
+
+def gated_delta_kernel_with_tape(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+):
+    """GDA forward pass that also records the innovation tape for cheap rollback.
+
+    Identical output to gated_delta_update. In addition to y and state_out,
+    returns innovation_tape = delta values (one float32 per B,T,Hv,Dv) which
+    tape_replay_kernel uses to roll back to any accepted prefix without
+    recomputing projections or the dot-product reduction.
+
+    Args:
+        q, k: [B, T, Hk, Dk]
+        v:    [B, T, Hv, Dv]
+        g:    [B, T, Hv]   (scalar gate per head)
+        beta: [B, T, Hv]
+        state:[B, Hv, Dv, Dk]
+
+    Returns:
+        (y, state_out, innovation_tape) — shapes [B,T,Hv,Dv], [B,Hv,Dv,Dk], [B,T,Hv,Dv]
+    """
+    if not mx.metal.is_available():
+        return _gated_delta_ops_with_tape_python(q, k, v, g, beta, state, mask)
+
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+
+    if Dk < 32 or Dk % 32 != 0:
+        return _gated_delta_ops_with_tape_python(q, k, v, g, beta, state, mask)
+
+    kernel = _gda_tape_kernel_masked if mask is not None else _gda_tape_kernel
+    if kernel is None:
+        return _gated_delta_ops_with_tape_python(q, k, v, g, beta, state, mask)
+
+    input_type = q.dtype
+    inputs = [q, k, v, g, beta, state, T]
+    if mask is not None:
+        inputs.append(mask)
+
+    return kernel(
+        inputs=inputs,
+        template=[
+            ("InT", input_type),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv)],
+        output_dtypes=[input_type, input_type, mx.float32],
+    )
+
+
+# ── Tape replay (rollback) ───────────────────────────────────────────────────────
+
+
+def _make_tape_replay_kernel(*, has_mask: bool = False):
+    if not mx.metal.is_available():
+        return None
+
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+
+    source = f"""
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // tape: [B, T, Hv, Dv]
+        auto tape_ = tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        // k: [B, T, Hk, Dk]
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }}
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {{
+          if ({mask_source}) {{
+            auto delta = static_cast<float>(tape_[dv_idx]);
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = state[i] * g_[hv_idx];
+              state[i] = state[i] + k_[s_idx] * delta;
+            }}
+            for (int i = 0; i < n_per_t; ++i) {{
+              state[i] = static_cast<float>(static_cast<InT>(state[i]));
+            }}
+          }}
+          tape_ += Hv * Dv;
+          k_ += Hk * Dk;
+          g_ += Hv;
+        }}
+
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<InT>(state[i]);
+        }}
+    """
+
+    inputs = ["tape", "k", "g", "state_in", "T"]
+    if has_mask:
+        inputs.append("mask")
+
+    return mx.fast.metal_kernel(
+        name=f"tape_replay{'_mask' if has_mask else ''}",
+        input_names=inputs,
         output_names=["state_out"],
         source=source,
     )
 
 
-_gda_state_kernel = _make_gated_delta_state_kernel()
+_tape_replay_kernel = _make_tape_replay_kernel(has_mask=False)
+_tape_replay_kernel_masked = _make_tape_replay_kernel(has_mask=True)
 
 
-def _advance_gated_delta_states_python(initial_state, keys, values, g, beta):
-    state = initial_state.astype(mx.float32)
-    keys_f = keys.astype(mx.float32)
-    values_f = values.astype(mx.float32)
-    g_f = g.astype(mx.float32)
-    beta_f = beta.astype(mx.float32)
-    for t in range(keys.shape[1]):
-        state = state * g_f[:, t, :, None, None]
-        kv_mem = mx.sum(state * keys_f[:, t, :, None, :], axis=-1)
-        delta = (values_f[:, t] - kv_mem) * beta_f[:, t, :, None]
-        state = state + delta[..., None] * keys_f[:, t, :, None, :]
-    return state.astype(initial_state.dtype)
+def _tape_replay_python(tape, k, g, state, mask=None):
+    _, _, hk, _ = k.shape
+    hv = tape.shape[2]
+    repeat_factor = hv // hk
+    if repeat_factor > 1:
+        k = mx.repeat(k, repeat_factor, axis=2)
+    state = state.astype(mx.float32)
+    for t in range(int(tape.shape[1])):
+        delta = tape[:, t, :, :, None].astype(mx.float32)
+        decay = g[:, t, :, None, None].astype(mx.float32)
+        state = state * decay + k[:, t, :, None, :].astype(mx.float32) * delta
+        if mask is not None:
+            pass  # mask not used in rollback path
+    return state.astype(tape.dtype if tape.dtype != mx.float32 else k.dtype)
 
 
-def advance_gated_delta_states_metal(
-    initial_states: mx.array,
-    keys: mx.array,
-    values: mx.array,
+def tape_replay_kernel(
+    tape: mx.array,
+    k: mx.array,
     g: mx.array,
-    beta: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
 ) -> mx.array:
-    """Advance GatedDeltaNet SSM state using a single Metal kernel dispatch.
+    """Replay accepted tokens using a precomputed innovation tape.
 
-    Replaces the Python per-token loop in rollback with one GPU dispatch.
-    Falls back to the Python loop if Metal is unavailable or Dk % 32 != 0.
+    Cheaper than re-running the GDA forward: reads delta from tape instead
+    of recomputing the dot-product reduction. No simd_sum needed.
 
     Args:
-        initial_states: [B, Hv, Dv, Dk]
-        keys:           [B, T, Hv, Dk] (already GQA-repeated)
-        values:         [B, T, Hv, Dv]
-        g:              [B, T, Hv]
-        beta:           [B, T, Hv]
+        tape:  [B, T, Hv, Dv] float32 — innovation_tape from gated_delta_kernel_with_tape
+        k:     [B, T, Hk, Dk]          — key vectors (not GQA-repeated; handled internally)
+        g:     [B, T, Hv]              — scalar gate per head
+        state: [B, Hv, Dv, Dk]         — initial SSM state
 
     Returns:
-        Updated SSM state [B, Hv, Dv, Dk]
+        state_out: [B, Hv, Dv, Dk]
     """
-    if (
-        _gda_state_kernel is not None
-        and mx.default_device() == mx.gpu
-        and keys.shape[-1] % 32 == 0
-    ):
-        batch_size, _, _, head_dim = keys.shape
-        num_v_heads = values.shape[2]
-        value_dim = values.shape[-1]
-        output = _gda_state_kernel(
-            inputs=[keys, values, g, beta, initial_states, keys.shape[1]],
-            template=[
-                ("InT", initial_states.dtype),
-                ("Dk", head_dim),
-                ("Dv", value_dim),
-                ("Hv", num_v_heads),
-            ],
-            grid=(32, value_dim, batch_size * num_v_heads),
-            threadgroup=(32, 4, 1),
-            output_shapes=[initial_states.shape],
-            output_dtypes=[initial_states.dtype],
-        )
-        return output[0] if isinstance(output, (list, tuple)) else output
+    if not mx.metal.is_available():
+        return _tape_replay_python(tape, k, g, state, mask)
 
-    return _advance_gated_delta_states_python(initial_states, keys, values, g, beta)
+    bsz, steps, hk, dk = k.shape
+    hv, dv = tape.shape[2:]
+    input_type = state.dtype
+
+    if dk < 32 or dk % 32 != 0:
+        return _tape_replay_python(tape, k, g, state, mask)
+
+    kernel = _tape_replay_kernel_masked if mask is not None else _tape_replay_kernel
+    if kernel is None:
+        return _tape_replay_python(tape, k, g, state, mask)
+
+    inputs = [tape, k, g, state, steps]
+    if mask is not None:
+        inputs.append(mask)
+
+    (state_out,) = kernel(
+        inputs=inputs,
+        template=[
+            ("InT", input_type),
+            ("Dk", dk),
+            ("Dv", dv),
+            ("Hk", hk),
+            ("Hv", hv),
+        ],
+        grid=(32, dv, bsz * hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[state.shape],
+        output_dtypes=[input_type],
+    )
+    return state_out
 
 
 # ── 2-pass SDPA for q_len=16 verify ────────────────────────────────────────────
