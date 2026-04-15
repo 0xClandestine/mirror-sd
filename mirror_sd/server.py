@@ -42,7 +42,7 @@ class SpecServer:
         cache_count = len(tokens) - len(rest)
         return target_cache, rest, cache_count
 
-    def _do_spec(self, tokens, max_tokens, temperature, stream_callback=None):
+    def _do_spec(self, tokens, max_tokens, temperature, stream_callback=None, stream_flush_callback=None):
         eos_ids = get_stop_token_ids(self.tokenizer)
 
         target_cache, rest_tokens, cache_count = self._fetch_cache(tokens)
@@ -61,14 +61,13 @@ class SpecServer:
             self.target_model, self.draft_model, input_ids,
             max_new_tokens=max_tokens, temperature=temperature,
             stop_token_ids=eos_ids,
-            adaptive_block=not self.args.no_adaptive, kod=self.args.kod,
+            adaptive_block=self.args.adaptive_block, kod=self.args.kod,
             stream_callback=stream_callback,
+            stream_flush_callback=stream_flush_callback,
             prefill_step_size=self.args.prefill_step_size,
             prompt_cache=target_cache,
             lazy_logits=self.args.lazy_logits,
             logit_chunk_size=self.args.logit_chunk_size,
-            compile_full=self.args.compile_full,
-            compiled_whole=self.args.compiled_whole,
             turboquant_bits=self.args.turboquant_bits,
             auto_ar=self.args.auto_ar,
             auto_ar_threshold=self.args.auto_ar_threshold,
@@ -78,6 +77,14 @@ class SpecServer:
         self.prompt_cache.insert_cache(
             self.model_key, all_tokens, final_cache
         )
+
+        if stats.total_tokens > 0:
+            ar = stats.accepted_tokens / stats.total_tokens
+            avg_block = stats.total_tokens / max(stats.draft_steps, 1)
+            print(f"  stats: {stats.accepted_tokens}/{stats.total_tokens} accepted "
+                  f"({ar:.1%}), avg_block={avg_block:.1f}, "
+                  f"draft={stats.draft_time:.2f}s, verify={stats.verify_time:.2f}s, "
+                  f"prefill={stats.prefill_time:.2f}s")
 
         return output_ids, stats
 
@@ -90,7 +97,7 @@ class SpecServer:
                 pass
         return self.tokenizer.apply_chat_template(messages, **kwargs)
 
-    def generate_streaming(self, messages, max_tokens=128, temperature=0.0, write_fn=None):
+    def generate_streaming(self, messages, max_tokens=128, temperature=0.0, write_fn=None, flush_fn=None):
         prompt = self._format_prompt(messages)
         tokens = self.tokenizer.encode(prompt)
 
@@ -111,10 +118,23 @@ class SpecServer:
 
         _write_chunk({"role": "assistant"})
 
-        def on_token(tok_id):
-            _write_chunk({"content": self.tokenizer.decode([tok_id], skip_special_tokens=True)})
+        pending_ids = []
 
-        output_ids, stats = self._do_spec(tokens, max_tokens, temperature, stream_callback=on_token)
+        def on_token(tok_id):
+            pending_ids.append(tok_id)
+
+        def on_flush():
+            if pending_ids:
+                for tok_id in pending_ids:
+                    text = self.tokenizer.decode([tok_id], skip_special_tokens=True)
+                    _write_chunk({"content": text})
+                pending_ids.clear()
+            if flush_fn:
+                flush_fn()
+
+        output_ids, stats = self._do_spec(tokens, max_tokens, temperature, stream_callback=on_token, stream_flush_callback=on_flush)
+
+        on_flush()
 
         gen_count = output_ids.shape[1] - len(tokens)
         _write_chunk({}, finish_reason="stop", usage={
@@ -223,12 +243,19 @@ class Handler(BaseHTTPRequestHandler):
             self._set_cors_headers()
             self.end_headers()
 
+            sse_buf = []
+
             def write_sse(chunk):
                 data = json.dumps(chunk)
-                self.wfile.write(f"data: {data}\n\n".encode())
-                self.wfile.flush()
+                sse_buf.append(f"data: {data}\n\n".encode())
 
-            srv.generate_streaming(messages, max_tokens, temperature, write_fn=write_sse)
+            def flush_sse(_=None):
+                if sse_buf:
+                    self.wfile.write(b"".join(sse_buf))
+                    self.wfile.flush()
+                    sse_buf.clear()
+
+            srv.generate_streaming(messages, max_tokens, temperature, write_fn=write_sse, flush_fn=flush_sse)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
@@ -248,7 +275,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8989)
     parser.add_argument("--kod", action="store_true", help="Kelly-Optimal Drafting")
-    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size")
+    parser.add_argument("--adaptive-block", action="store_true", help="Enable adaptive block size (default: off, known to cause numerical drift)")
     parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8])
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--prefill-step-size", type=int, default=512, help="Chunk size for prompt prefill")
@@ -277,7 +304,7 @@ def main():
 
     ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    mode = "DFlash+KOD" if args.kod else ("DFlash+ADAPTIVE" if not args.no_adaptive else "DFlash")
+    mode = "DFlash+KOD" if args.kod else ("DFlash+ADAPTIVE" if args.adaptive_block else "DFlash")
     print(f"Serving {mode} (block_size={config.block_size}) on http://{args.host}:{args.port}")
     print(f"  model: {srv.model_name}")
     print(f"  prompt cache: {args.cache_size} entries")

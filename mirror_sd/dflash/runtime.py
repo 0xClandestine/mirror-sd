@@ -16,12 +16,10 @@ from .model import extract_context_feature
 from ..generate import sample
 from ..target import (
     forward_with_hidden_states, forward_with_hidden_states_and_rollback,
-    forward_with_hidden_states_compiled,
-    forward_verifier_states, forward_verifier_states_compiled,
+    forward_verifier_states,
     forward_prefix, forward_suffix,
     get_embed_tokens, get_lm_head,
     is_qwen35, rollback_linear_caches, _apply_lm_head,
-    _forward_full_attention_layer_compiled,
 )
 
 
@@ -246,12 +244,10 @@ def spec_generate(
     adaptive_block: bool = False,
     kod: bool = False,
     stream_callback=None,
+    stream_flush_callback=None,
     prefill_step_size: int = 512,
     prompt_cache=None,
     prefill_callback=None,
-    use_compiled: bool = False,
-    compile_full: bool = False,
-    compiled_whole: bool = False,
     lazy_logits: bool = False,
     logit_chunk_size: int = 1,
     accept_all_first: bool = False,
@@ -359,6 +355,8 @@ def spec_generate(
     output_ids_list.append(first_tok)
     if stream_callback is not None:
         stream_callback(first_tok)
+    if stream_flush_callback is not None:
+        stream_flush_callback()
 
     if prefill_callback is not None:
         prefill_callback(target_cache, target_hidden, first_tok)
@@ -429,12 +427,14 @@ def spec_generate(
                 capture_layers=target_layer_ids,
             )
             ar_next = sample(ar_logits[:, -1:, :], temperature)
-            mx.eval(ar_next, *ar_hidden, *_flat_cache_states(target_cache))
+            mx.eval(ar_next, *ar_hidden)
             target_hidden = extract_context_feature(ar_hidden, target_layer_ids)
             next_tok = int(ar_next[0, 0])
             output_ids_list.append(next_tok)
             if stream_callback is not None:
                 stream_callback(next_tok)
+            if stream_flush_callback is not None:
+                stream_flush_callback()
             start += 1
             stats.total_verify_time += time.perf_counter() - t_ar_start
             stats.acceptance_lengths.append(1)
@@ -485,31 +485,14 @@ def spec_generate(
         )
 
         if lazy_logits or prev_full_accept:
-            if q35:
-                if use_compiled:
-                    norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states_compiled(
-                        target_model,
-                        verify_input,
-                        cache=target_cache,
-                        capture_layers=target_layer_ids,
-                    )
-                else:
-                    norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states(
-                        target_model,
-                        verify_input,
-                        cache=target_cache,
-                        capture_layers=target_layer_ids,
-                    )
-            else:
-                norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states(
-                    target_model,
-                    verify_input,
-                    cache=target_cache,
-                    capture_layers=target_layer_ids,
-                    compile_full=compile_full,
-                )
+            norm_hidden, _, verify_hidden, rollback_records = forward_verifier_states(
+                target_model,
+                verify_input,
+                cache=target_cache,
+                capture_layers=target_layer_ids,
+            )
 
-            mx.eval(norm_hidden, *verify_hidden, *_flat_cache_states(target_cache))
+            mx.eval(norm_hidden, *verify_hidden)
 
             acceptance_length = 0
             correction_token = None
@@ -541,39 +524,22 @@ def spec_generate(
                     break
         else:
             if q35:
-                if compiled_whole:
-                    from mirror_sd.target import forward_with_hidden_states_compiled_whole
-                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_compiled_whole(
-                        target_model,
-                        verify_input,
-                        cache=target_cache,
-                        capture_layers=target_layer_ids,
-                    )
-                elif use_compiled:
-                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_compiled(
-                        target_model,
-                        verify_input,
-                        cache=target_cache,
-                        capture_layers=target_layer_ids,
-                    )
-                else:
-                    verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_and_rollback(
-                        target_model,
-                        verify_input,
-                        cache=target_cache,
-                        capture_layers=target_layer_ids,
-                    )
+                verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_and_rollback(
+                    target_model,
+                    verify_input,
+                    cache=target_cache,
+                    capture_layers=target_layer_ids,
+                )
             else:
                 verify_logits, _, verify_hidden = forward_with_hidden_states(
                     target_model,
                     verify_input,
                     cache=target_cache,
                     capture_layers=target_layer_ids,
-                    compile_full=compile_full,
                 )
                 rollback_records = None
             posterior = sample(verify_logits, temperature)
-            mx.eval(posterior, *verify_hidden, *_flat_cache_states(target_cache))
+            mx.eval(posterior, *verify_hidden)
 
             target_toks = posterior[0, :-1].tolist()
             if isinstance(target_toks, int):
@@ -607,6 +573,8 @@ def spec_generate(
         output_ids_list.append(correction_token)
         if stream_callback is not None:
             stream_callback(correction_token)
+        if stream_flush_callback is not None:
+            stream_flush_callback()
 
         start += acceptance_length + 1
 
