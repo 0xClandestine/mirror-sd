@@ -166,14 +166,17 @@ class ANEDraftModel:
         if isinstance(w_flat, mx.array):
             data_arr = w_flat.reshape(oc, ic)
         else:
-            data_arr = mx.array(w_flat, dtype=mx.float32).reshape(oc, ic)
-        data_t = data_arr.T
-        padded = mx.zeros((ic, w_oc), dtype=mx.float32)
+            data_arr = mx.array(w_flat, dtype=mx.float16).reshape(oc, ic)
+        data_t = data_arr.T.astype(mx.float16)
+        padded = mx.zeros((ic, w_oc), dtype=mx.float16)
         padded[:, :oc] = data_t
-        return self.ane.ANETensor.from_buffer(1, ic, height, oc, memoryview(padded))
+        mx.eval(padded)
+        t = self.ane.ANETensor(1, ic, height, oc)
+        t.write_buffer_f16(memoryview(padded))
+        return t
 
     def _load_fc_weights(self, model: nn.Module):
-        self.w_fc = self._make_weight_buf(model.fc.weight.astype(mx.float32), self.hidden, self.target_hidden)
+        self.w_fc = self._make_weight_buf(model.fc.weight, self.hidden, self.target_hidden)
         self.w_hidden_norm = self._make_norm_weight_expanded(
             model.hidden_norm.weight, self.w_ctx)
 
@@ -189,33 +192,33 @@ class ANEDraftModel:
         setattr(self, f"w_{p}in_norm",
                 self._make_norm_weight_expanded(layer.input_layernorm.weight, self.w_sq))
 
-        q_proj_w_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float32), NH, HD)
+        q_proj_w_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float16), NH, HD)
         setattr(self, f"w_{p}q_proj", self._make_weight_buf(q_proj_w_il, NH * HD, H))
 
         setattr(self, f"w_{p}q_norm_4d",
                 self._make_per_head_norm_weight(sq_w.q_norm.weight, NH, self.w_sq))
 
-        k_proj_w_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float32), NKV, HD)
+        k_proj_w_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float16), NKV, HD)
         setattr(self, f"w_{p}k_proj", self._make_weight_buf(k_proj_w_il, NKV * HD, H))
 
         setattr(self, f"w_{p}k_norm_4d",
                 self._make_per_head_norm_weight(sq_w.k_norm.weight, NKV, self.w_kv))
 
         setattr(self, f"w_{p}v_proj",
-                self._make_weight_buf(sq_w.v_proj.weight.astype(mx.float32), NKV * HD, H))
+                self._make_weight_buf(sq_w.v_proj.weight, NKV * HD, H))
 
         setattr(self, f"w_{p}o_proj",
-                self._make_weight_buf(sq_w.o_proj.weight.astype(mx.float32), H, NH * HD))
+                self._make_weight_buf(sq_w.o_proj.weight, H, NH * HD))
 
         setattr(self, f"w_{p}post_norm",
                 self._make_norm_weight_expanded(layer.post_attention_layernorm.weight, self.w_sq))
 
         setattr(self, f"w_{p}gate",
-                self._make_weight_buf(layer.mlp.gate_proj.weight.astype(mx.float32), self.intermediate, H))
+                self._make_weight_buf(layer.mlp.gate_proj.weight, self.intermediate, H))
         setattr(self, f"w_{p}up",
-                self._make_weight_buf(layer.mlp.up_proj.weight.astype(mx.float32), self.intermediate, H))
+                self._make_weight_buf(layer.mlp.up_proj.weight, self.intermediate, H))
         setattr(self, f"w_{p}down",
-                self._make_weight_buf(layer.mlp.down_proj.weight.astype(mx.float32), H, self.intermediate))
+                self._make_weight_buf(layer.mlp.down_proj.weight, H, self.intermediate))
 
     def _load_final_norm_weights(self, model: nn.Module):
         self.w_final_norm = self._make_norm_weight_expanded(model.norm.weight, self.w_sq)

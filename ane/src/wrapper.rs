@@ -1,5 +1,7 @@
+use std::ptr;
 use std::time::Instant;
 
+use objc2_io_surface::IOSurfaceLockOptions;
 use pyo3::prelude::*;
 
 use ane::{Executable, Graph, NSQualityOfService, Shape, TensorData};
@@ -73,6 +75,34 @@ impl ANETensor {
         Ok(())
     }
 
+    /// Write fp16 data directly into the ANE buffer (no f32 conversion).
+    ///
+    /// `buf` must be a Python buffer whose raw bytes are IEEE 754 fp16 values
+    /// (2 bytes per element, little-endian). Equivalent to `write_buffer` but
+    /// skips the f32→fp16 NEON conversion — use this when the source data is
+    /// already fp16 (e.g. from `mx.float16` arrays).
+    fn write_buffer_f16(&self, py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = buf.call_method0("tobytes")?;
+        let raw: &[u8] = bytes.downcast::<pyo3::types::PyBytes>()?.as_bytes();
+        let u16_count = raw.len() / 2;
+        // Copy fp16 bits into a Vec before releasing the GIL so the Python
+        // buffer cannot be mutated while we write to the IOSurface.
+        let data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const u16, u16_count).to_vec()
+        };
+        let surface = self.inner.surface();
+        py.allow_threads(|| unsafe {
+            surface.lockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
+            let dst = std::slice::from_raw_parts_mut(
+                surface.baseAddress().as_ptr().cast::<u16>(),
+                u16_count,
+            );
+            dst.copy_from_slice(&data);
+            surface.unlockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
+        });
+        Ok(())
+    }
+
     fn read_f32(&self) -> PyResult<Vec<f32>> {
         let slice = self.inner.as_f32_slice();
         Ok(slice.to_vec())
@@ -112,48 +142,58 @@ impl ANEKernel {
         &self.name
     }
 
-    fn run(&self, inputs: Vec<PyRef<ANETensor>>, outputs: Vec<PyRef<ANETensor>>) -> PyResult<()> {
-        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
-        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run failed: {:?}",
-                self.name, e
-            ))
-        })?;
-        Ok(())
-    }
-
-    fn run_uncached(
+    fn run(
         &self,
+        py: Python<'_>,
         inputs: Vec<PyRef<ANETensor>>,
         outputs: Vec<PyRef<ANETensor>>,
     ) -> PyResult<()> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable.run(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run_uncached failed: {:?}",
-                self.name, e
-            ))
-        })?;
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn run_uncached(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_uncached failed: {:?}",
+                    self.name, e
+                ))
+            })?;
         Ok(())
     }
 
     fn run_timed(
         &self,
+        py: Python<'_>,
         inputs: Vec<PyRef<ANETensor>>,
         outputs: Vec<PyRef<ANETensor>>,
     ) -> PyResult<f64> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
         let start = Instant::now();
-        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run failed: {:?}",
-                self.name, e
-            ))
-        })?;
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run failed: {:?}",
+                    self.name, e
+                ))
+            })?;
         Ok(start.elapsed().as_secs_f64())
     }
 
