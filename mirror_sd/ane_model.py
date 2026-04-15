@@ -473,6 +473,27 @@ class ANEDraftModel:
         self.run_kernels()
         return self.read_output()
 
+    def set_block_size(self, new_seq_q: int) -> None:
+        """Change the active block size without recompiling kernels.
+
+        Valid for any new_seq_q in [1, w_sq] (w_sq = align_width(original seq_q)).
+        All seq_q values that map to the same w_sq share identical compiled kernels
+        and buffer layouts, so this is safe to call at any time between forward passes.
+        The attn-mask and RoPE caches are invalidated so they are recomputed on
+        the next forward call with the correct dimensions.
+        """
+        if new_seq_q < 1 or new_seq_q > self.w_sq:
+            raise ValueError(
+                f"new_seq_q={new_seq_q} must be in [1, {self.w_sq}] "
+                f"(kernel compiled for w_sq={self.w_sq})"
+            )
+        self.seq_q = new_seq_q
+        self.block_size = new_seq_q
+        self.config.block_size = new_seq_q
+        # Invalidate caches so _compute_rope / _compute_attn_mask rebuild them.
+        self._rope_cache_key = None
+        self._attn_mask_ctx_len = None
+
     def _compute_context(self, target_hidden: mx.array) -> mx.array:
         fc_out = target_hidden @ self._fc_weight.T
         rms = mx.sqrt(mx.mean(fc_out.astype(mx.float32) ** 2, axis=-1, keepdims=True) + 1e-6)

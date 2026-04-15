@@ -33,6 +33,7 @@ from .target import (
     get_embed_tokens, get_lm_head,
     is_qwen35, rollback_linear_caches, _apply_lm_head,
     _forward_full_attention_layer_compiled,
+    _get_inner_model,
 )
 
 
@@ -244,6 +245,8 @@ def spec_generate(
     auto_ar_window: int = 6,
     auto_ar_threshold: float = 0.35,
     auto_ar_min_steps: int = 8,
+    override_block_size: Optional[int] = None,
+    early_exit_k: int = 0,
 ) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     from mlx_lm.models import cache as cache_module
 
@@ -252,6 +255,8 @@ def spec_generate(
         return _spec_generate_parallel(
             target_model, draft_model, input_ids, max_new_tokens,
             stop_token_ids, temperature, target_layer_ids,
+            override_block_size=override_block_size,
+            early_exit_k=early_exit_k,
         )
 
     if mirror_sd:
@@ -1094,6 +1099,8 @@ def _spec_generate_parallel(
     stop_token_ids: Optional[List[int]] = None,
     temperature: float = 0.0,
     target_layer_ids: Optional[List[int]] = None,
+    override_block_size: Optional[int] = None,
+    early_exit_k: int = 0,
 ) -> Tuple[mx.array, SpecDecodeStats]:
     """Parallel ANE||GPU speculative decoding (Mirror-SD Eq. 10).
 
@@ -1105,6 +1112,11 @@ def _spec_generate_parallel(
                                             ↑ starts while verify_N is still running
 
     If draft_N+1 finishes within verify_N's time, it's effectively free.
+
+    override_block_size: if set and draft_model supports set_block_size(), uses
+    this block size instead of draft_model.block_size.  All values in [1, 64]
+    share the same compiled ANE kernel (w_sq=64), so larger blocks cost nothing
+    extra on the draft side — only verify scales with block size.
     """
     from mlx_lm.models import cache as cache_module
 
@@ -1118,6 +1130,9 @@ def _spec_generate_parallel(
     lm_head_fn = get_lm_head(target_model)
 
     block_size = draft_model.block_size
+    if override_block_size is not None and hasattr(draft_model, 'set_block_size'):
+        draft_model.set_block_size(override_block_size)
+        block_size = override_block_size
     mask_token_id = draft_model.mask_token_id
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -1166,9 +1181,11 @@ def _spec_generate_parallel(
     # Dedicated GPU stream for the lm_head eval in the non-prepared draft path.
     _draft_stream = mx.new_stream(mx.gpu)
 
-    # Only use prefix split when ANE model supports the prepare_forward API.
-    # NOTE: prefix-split is disabled — see analysis in MEMORY.md.
-    use_prefix_split = False
+    # Soft-anchor: logits at the correction position from the most recent verify.
+    # Used in _start_draft to replace the hard stale-correction embedding with a
+    # soft expected embedding: sum_i(p_i * embed_i) over top-K probable tokens.
+    # None on the first step (no prior verify).
+    _prev_correction_logits = None
 
     def _run_draft(th, ne, dc, rope_offset, precomputed_context=None,
                    buffers_prepared=False):
@@ -1219,12 +1236,18 @@ def _spec_generate_parallel(
                 c_old.offset = c_new.offset
         draft_result = sampled_tokens
 
-    def _start_draft(th, last_token, dc, start_pos):
+    def _start_draft(th, last_token, dc, start_pos, correction_logits=None):
         """Prepare all ANE buffers on the main thread, then fork a pure-ANE thread.
 
         All mx.eval() / Metal calls happen HERE (main thread) before the thread
         starts, so the spawned thread runs zero Metal during its critical window
         (while GPU verify is executing on the main thread).
+
+        correction_logits: optional [vocab_size] logit vector from the previous
+        verify step at the correction position.  When provided, position-0 of the
+        noise embedding is replaced with a soft expected embedding:
+          anchor = sum_i(p_i * embed(i))  for top-K tokens by probability.
+        This reduces damage when the stale hard anchor is the wrong token.
         """
         nonlocal draft_thread, t_draft_start
         ctx_len = th.shape[1]
@@ -1243,6 +1266,22 @@ def _spec_generate_parallel(
 
         block_tokens = [last_token] + [mask_token_id] * (block_size - 1)
         noise_embedding = embed_fn(mx.array([block_tokens], dtype=mx.int32))
+
+        if correction_logits is not None:
+            # Soft anchor: replace position-0 hard embedding with weighted sum
+            # of top-K token embeddings under the previous verify distribution.
+            _top_k = 8
+            top_ids = mx.argsort(-correction_logits)[:_top_k]         # [k]
+            top_logits = correction_logits[top_ids]
+            weights = mx.softmax(top_logits.astype(mx.float32))       # [k]
+            top_embeds = embed_fn(top_ids.reshape(1, _top_k))         # [1, k, H]
+            soft_anchor = mx.sum(
+                weights.reshape(1, _top_k, 1) * top_embeds, axis=1, keepdims=True
+            ).astype(noise_embedding.dtype)                            # [1, 1, H]
+            noise_embedding = mx.concatenate(
+                [soft_anchor, noise_embedding[:, 1:, :]], axis=1
+            )
+
         mx.eval(noise_embedding)
 
         if not use_gpu and has_prepare:
@@ -1270,7 +1309,8 @@ def _spec_generate_parallel(
         )
         draft_thread.start()
 
-    # Kick off first draft (no GPU verify running yet — no contention)
+    # Kick off first draft (no GPU verify running yet — no contention).
+    # No prior verify logits available yet, so correction_logits=None.
     t_draft_start = time.perf_counter()
     _start_draft(target_hidden, output_ids_list[-1], draft_cache, 0)
 
@@ -1345,24 +1385,69 @@ def _spec_generate_parallel(
         # verify step always corrects any mismatch, so acceptance rate degrades
         # slightly but throughput improves from serial ~370ms/step to
         # max(draft, verify) ~203ms/step.
-        if start < max_length:
-            _start_draft(target_hidden, output_ids_list[-1], draft_cache, start)
+        # draft_tokens_list built here so early-exit can compare before verify.
+        draft_tokens_list = block_tokens_updated[1:]
 
-        # --- Verify on GPU (draft N+1 running on ANE in parallel) ---
-        t_verify_start = time.perf_counter()
+        if early_exit_k > 0:
+            # --- Early-exit provisional correction ---
+            # Run first early_exit_k layers synchronously to get a provisional
+            # correction token. Better than stale when:
+            #   P(provisional correct) > stale threshold ≈ 55%.
+            # Uses full acceptance prediction: compare provisional target-tokens
+            # with draft tokens at all positions to estimate acceptance_N, then
+            # read the correction at that estimated position.
+            t_verify_start = time.perf_counter()
+            h_early, _, prefix_captured, fa_mask_early = forward_prefix(
+                target_model, block_output_ids, cache=target_cache,
+                exit_layer=early_exit_k - 1, capture_layers=target_layer_ids,
+            )
+            inner_model = _get_inner_model(target_model)
+            prov_logits = _apply_lm_head(target_model, inner_model.norm(h_early))
+            mx.eval(prov_logits)
+            mx.eval([c.state for c in target_cache[:early_exit_k]])
 
-        verify_logits, _, verify_hidden = forward_with_hidden_states(
-            target_model,
-            block_output_ids,
-            cache=target_cache,
-            capture_layers=target_layer_ids,
-        )
-        posterior = sample(verify_logits, temperature)
-        mx.eval(posterior, *verify_hidden)
-        mx.eval([c.state for c in target_cache])
+            # Predict acceptance + correction from provisional logits.
+            prov_target_toks = prov_logits[0, :-1, :].argmax(axis=-1).tolist()
+            prov_accept = 0
+            for _i in range(len(draft_tokens_list)):
+                if draft_tokens_list[_i] == prov_target_toks[_i]:
+                    prov_accept += 1
+                else:
+                    break
+            prov_correction = int(mx.argmax(prov_logits[0, prov_accept, :]))
+
+            # Start ANE draft with provisional correction (early estimate of correction_N).
+            # Skips soft anchor — provisional correction is a more direct estimate.
+            if start < max_length:
+                _start_draft(target_hidden, prov_correction, draft_cache, start)
+
+            # Continue with remaining layers; ANE draft now runs in parallel.
+            verify_logits, suffix_captured = forward_suffix(
+                target_model, h_early, cache=target_cache,
+                start_layer=early_exit_k, mask=fa_mask_early,
+                capture_layers=target_layer_ids,
+            )
+            verify_hidden = prefix_captured + suffix_captured
+            posterior = sample(verify_logits, temperature)
+            mx.eval(posterior, *verify_hidden)
+            mx.eval([c.state for c in target_cache[early_exit_k:]])
+        else:
+            # --- Standard path: start draft with soft anchor, verify in full ---
+            if start < max_length:
+                _start_draft(target_hidden, output_ids_list[-1], draft_cache, start,
+                             correction_logits=_prev_correction_logits)
+
+            t_verify_start = time.perf_counter()
+            verify_logits, _, verify_hidden = forward_with_hidden_states(
+                target_model, block_output_ids, cache=target_cache,
+                capture_layers=target_layer_ids,
+            )
+            posterior = sample(verify_logits, temperature)
+            mx.eval(posterior, *verify_hidden)
+            mx.eval([c.state for c in target_cache])
 
         # --- Accept/reject ---
-        draft_tokens = block_tokens_updated[1:]
+        draft_tokens = draft_tokens_list
         target_tokens = posterior[0, :-1].tolist()
         if isinstance(target_tokens, int):
             target_tokens = [target_tokens]
@@ -1391,6 +1476,12 @@ def _spec_generate_parallel(
             cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
         new_target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
+
+        # Soft-anchor: stash logits at the correction position for the next step.
+        # verify_logits is already materialized (posterior depends on it).
+        # We eval just the [vocab_size] slice so verify_logits can be freed.
+        _prev_correction_logits = verify_logits[0, acceptance_length, :]
+        mx.eval(_prev_correction_logits)
 
         t_verify_done = time.perf_counter()
         verify_time = t_verify_done - t_verify_start
