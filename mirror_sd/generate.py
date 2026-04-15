@@ -1166,6 +1166,10 @@ def _spec_generate_parallel(
     # Dedicated GPU stream for the lm_head eval in the non-prepared draft path.
     _draft_stream = mx.new_stream(mx.gpu)
 
+    # Only use prefix split when ANE model supports the prepare_forward API.
+    # NOTE: prefix-split is disabled — see analysis in MEMORY.md.
+    use_prefix_split = False
+
     def _run_draft(th, ne, dc, rope_offset, precomputed_context=None,
                    buffers_prepared=False):
         nonlocal draft_result, _ane_kernels_pending
@@ -1339,8 +1343,8 @@ def _spec_generate_parallel(
         # Staleness: draft N+1 is conditioned on h_{N-1} and correction_token_{N-1}
         # rather than h_N / correction_token_N (known only after verify N). The
         # verify step always corrects any mismatch, so acceptance rate degrades
-        # slightly but throughput improves from serial ~367ms/step to
-        # max(draft, verify) ~204ms/step.
+        # slightly but throughput improves from serial ~370ms/step to
+        # max(draft, verify) ~203ms/step.
         if start < max_length:
             _start_draft(target_hidden, output_ids_list[-1], draft_cache, start)
 

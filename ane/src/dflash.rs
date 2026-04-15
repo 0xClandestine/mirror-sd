@@ -258,8 +258,8 @@ pub fn build_o_proj_residual_kernel(d: &DFlashDims, w_sq: usize, softcap: f32) -
         width: d.hidden,
     });
     let o_proj = conv1x1_proj(&mut g, attn_flat, wo, d.hidden, d.n_heads * d.head_dim);
-    let h_res = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
-    let residual = g.addition(h_res, o_proj);
+    let h_in = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let residual = g.addition(h_in, o_proj);
     if softcap > 0.0 {
         let inv_cap = g.constant_with_scalar(
             1.0 / softcap,
@@ -307,6 +307,7 @@ pub fn build_ffn_residual_kernel(d: &DFlashDims, w_sq: usize, softcap: f32) -> G
     }
     g
 }
+
 
 pub fn build_final_norm_kernel(d: &DFlashDims, w_sq: usize) -> Graph {
     let mut g = Graph::new();
