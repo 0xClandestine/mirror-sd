@@ -6,6 +6,17 @@ Running backlog. Move entries to `optimization-attempts.md` when tried.
 
 ## Kernel Fusion / Dispatch Reduction
 
+### IDEA-00: QK-norm RMSNorm fix (in progress — highest priority)
+**Root cause confirmed in ANE_RULES.md**: ANE `rmsnorm` with `reduce_mean(x, axis=1)` reduces
+over ALL 4096 channels globally. For Q/K projections, we need per-head RMSNorm (128 dims/head).
+Global variance ≠ per-head variance (empirically 9.2–16.5 across heads). This gives cosine ~0.5
+vs GPU for Q/K after the norm — completely wrong attention patterns.
+**Status**: current branch `fix/ane-qk-norm` is addressing this. Fix = compute QK norms in
+Python/FP32 instead of ANE. When correct, α should rise toward GPU-only's 4.61.
+**Expected gain**: if α goes from 2.12 → 3.5+, tok/s: 9.9 → 17+ (+70%).
+
+---
+
 ### IDEA-01: Fuse gqa_tile into mega_qkv output stage
 **Hypothesis**: `gqa_tile` is a KV head-expansion step that reads back the output of
 `mega_qkv`. If it can be computed inside the same CoreML program as `mega_qkv`, we
@@ -20,6 +31,10 @@ save one dispatch + buffer read (~0.5ms).
 **Risk**: creates a special-cased last-layer kernel variant; compile complexity.
 
 ### IDEA-03: Eliminate per-layer run_uncached calls — compile multi-layer program
+**Update from ANE_RULES.md**: autoresearch reference uses 10 kernels TOTAL across all layers
+(compile once, reuse). We already use `run_cached` (0.05ms vs 0.095ms overhead per dispatch).
+The autoresearch achieves full sharing by using per-layer IOSurfaces with pre-staged weights.
+We do something similar. The remaining dispatch overhead is ~1.3ms (26 dispatches × 0.05ms).
 **Hypothesis**: dispatching 5 kernels × 5 layers = 25 calls. Compiling a single
 multi-layer CoreML program would reduce that to 1 dispatch with all weights bound.
 **Risk**: very large program; weight patching between steps may be infeasible.
@@ -29,7 +44,19 @@ multi-layer CoreML program would reduce that to 1 dispatch with all weights boun
 
 ## Memory / Buffer Bandwidth
 
-### IDEA-04: Reduce b_context width padding
+### IDEA-04-BANDWIDTH: FFN weight bandwidth is the fundamental ANE bottleneck
+**Finding from ANE_RULES.md**: ANE gets 6-8% compute utilization. Utilization is
+bandwidth-limited, not compute-limited. Our FFN loads ~3GB of weights per forward pass
+(5 layers × gate/up/down at 4096×12288). At ~100GB/s ANE bus: 30ms theoretical minimum.
+**Measured**: 40ms actual (75% bandwidth efficiency — reasonable).
+**Implication**: no amount of scheduling or kernel fusion can make FFN faster without
+reducing the weight data loaded. Options:
+- int8 weight quantization: halve bandwidth → halve FFN time (requires CoreML model change)
+- int4 weight quantization: 4× reduction (but quality impact may hurt α)
+- Reusing weights across seq_q positions: ANE already does this in conv1x1 (broadcast)
+**This is the hard ceiling. The other ideas are in the noise compared to this.**
+
+### IDEA-04b: Reduce b_context width padding
 `w_ctx = align_width(ctx_len)` always rounds up to the next multiple of 64.
 For ctx_len=64 this is fine, but for ctx_len=48 we waste 25% bandwidth writing context.
 **Hypothesis**: smaller minimum alignment (32?) or dynamic shapes could help small-ctx.
