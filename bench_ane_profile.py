@@ -66,6 +66,10 @@ class _ProfiledANEDraftModel:
     def make_cache(self):
         return self._m.make_cache()
 
+    def set_block_size(self, new_seq_q: int) -> None:
+        self._m.set_block_size(new_seq_q)
+        self.block_size = new_seq_q
+
     # ---- prepare_forward / run_kernels / read_output / run_prepared:
     #      delegate to the real model so the pipelined ANE||GPU path in
     #      _spec_generate_parallel can pre-buffer all Metal work on the main
@@ -269,6 +273,8 @@ def main():
                         help="Skip AR baseline (saves ~5 min)")
     parser.add_argument("--skip-gpu",   action="store_true",
                         help="Skip GPU-only spec decode")
+    parser.add_argument("--block-size", type=int, default=32,
+                        help="ANE draft block size (default: 32; all 1-64 use identical kernels)")
     args = parser.parse_args()
 
     import os
@@ -277,6 +283,7 @@ def main():
     n_warmup    = args.warmup
     n_runs      = args.runs
     ctx_depths  = args.ctx_depths
+    ane_block_size = args.block_size
 
     _header("ANE DFlash Comprehensive Profile")
     print(f"  Target model : {model_path}")
@@ -299,7 +306,7 @@ def main():
     gpu_draft, config = load_dflash_model(args.draft)
     print(f"  Draft loaded  in {time.perf_counter()-t0:.1f}s")
     print(f"  Draft config  : hidden={config.hidden_size}, layers={config.num_hidden_layers}, "
-          f"block_size={config.block_size}, heads={config.num_attention_heads}")
+          f"block_size={config.block_size} (ANE override→{ane_block_size}), heads={config.num_attention_heads}")
 
     from mirror_sd.prompt import format_prompt, get_stop_token_ids
     stop_ids   = get_stop_token_ids(tokenizer)
@@ -359,7 +366,7 @@ def main():
         print(f"\n  ── ctx_len={ctx_len} ──", flush=True)
 
         t0 = time.perf_counter()
-        raw_ane = ANEDraftModel(seq_q=config.block_size, ctx_len=ctx_len, config=config)
+        raw_ane = ANEDraftModel(seq_q=ane_block_size, ctx_len=ctx_len, config=config)
         raw_ane.load_weights(gpu_draft, target_model)
         raw_ane.gpu_fallback = gpu_draft
         print(f"  ANE compiled+loaded in {time.perf_counter()-t0:.1f}s")

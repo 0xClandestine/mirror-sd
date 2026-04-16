@@ -1186,7 +1186,7 @@ def _spec_generate_parallel(
                        hasattr(draft_model, 'read_draft_tokens') and
                        getattr(draft_model, 'b_logits', None) is not None)
 
-    # Dedicated GPU stream for the lm_head eval in the non-prepared draft path.
+    # GPU stream for lm_head in the GPU-fallback (non-prepared) draft path.
     _draft_stream = mx.new_stream(mx.gpu)
 
     # Soft-anchor: logits at the correction position from the most recent verify.
@@ -1212,34 +1212,10 @@ def _spec_generate_parallel(
         else:
             dc_active = dc
         if not use_gpu and buffers_prepared:
-            # ANE execution phase.  All mx.eval / Metal work was done on the
-            # main thread inside _start_draft before this thread started.
+            # Pure ANE execution: all Metal/mx work was done in _start_draft.
             active_draft.run_kernels()
-
-            # Extend into read_output + lm_head-submit here in the thread so
-            # the main thread can proceed straight to _start_draft + verify
-            # with zero post-join overhead (~4 ms saved per step).
-            #
-            # Thread-safety rationale:
-            #   read_output() — Rust IOSurface lock (py.allow_threads) +
-            #     mx.array creation; both are thread-safe in MLX.
-            #   lm_head_fn() — builds a lazy MLX graph; thread-safe.
-            #   mx.stream(_draft_stream) — independent Metal stream; runs
-            #     concurrently with verify on the default stream.
-            #   draft_result write — visible to main thread after join()
-            #     (join provides the happens-before memory barrier).
-            if has_ane_lm_head:
-                raw_tokens = active_draft.read_draft_tokens()  # NEON argmax
-                draft_result = raw_tokens[:, 1:ne.shape[1]]
-            else:
-                draft_hidden = active_draft.read_output()
-                q_len = ne.shape[1]
-                with mx.stream(_draft_stream):
-                    draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
-                    sampled_tokens = sample(draft_logits, temperature)
-                draft_result = sampled_tokens
-            # Signal that main thread needs no post-join finalization.
-            _ane_kernels_pending = False
+            # Signal main thread to call read_output() + lm_head after join.
+            _ane_kernels_pending = True
             return
         q_len = ne.shape[1]
         if use_gpu:
@@ -1380,27 +1356,14 @@ def _spec_generate_parallel(
         if _ane_kernels_pending:
             _ane_kernels_pending = False
             if has_ane_lm_head:
-                # run_kernels() already executed fused final_norm+lm_head on
-                # ANE.  read_draft_tokens() reads argmax via NEON directly
-                # from the IOSurface — no GPU dispatch, no mx.eval, ~0.5 ms.
-                # pos 0 = prediction following the anchor (not a draft token);
-                # pos 1..block_size-1 = predictions for the mask positions.
-                raw_tokens = draft_model.read_draft_tokens()   # (1, seq_q)
+                raw_tokens = draft_model.read_draft_tokens()
                 draft_result = raw_tokens[:, 1:current_block_size]
             else:
-                # GPU lm_head path.  read_output() copies b_output IOSurface
-                # → mx.array (unavoidable, ~4 ms).  The lm_head matmul is
-                # then submitted to _draft_stream WITHOUT eval so it overlaps
-                # with _start_draft prep and the first ~8 ms of verify.
-                # MLX cross-stream dependency tracking ensures sampled_tokens
-                # is materialized before its values are read below.
                 draft_hidden = draft_model.read_output()
                 q_len = current_block_size
-                with mx.stream(_draft_stream):
-                    draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
-                    sampled_tokens = sample(draft_logits, temperature)
-                # No mx.eval — runs concurrently on _draft_stream while the
-                # default stream handles _start_draft + verify below.
+                draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+                sampled_tokens = sample(draft_logits, temperature)
+                mx.eval(sampled_tokens)
                 draft_result = sampled_tokens
 
         sampled_tokens = draft_result

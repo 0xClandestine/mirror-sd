@@ -280,7 +280,7 @@ class ANEDraftModel:
         for i in range(self.n_layers):
             self._run_layer(k, i)
 
-        k['final_norm'].run_cached(
+        k['final_norm'].run_uncached(
             [self.b_hidden, self.w_final_norm],
             [self.b_output],
         )
@@ -319,7 +319,7 @@ class ANEDraftModel:
     def _run_layer(self, k, layer_idx: int):
         p = f"l{layer_idx}_"
 
-        k['mega_qkv'].run_cached(
+        k['mega_qkv'].run_uncached(
             [self.b_hidden, getattr(self, f"w_{p}in_norm"),
              self.b_context,
              getattr(self, f"w_{p}k_proj"),
@@ -332,22 +332,22 @@ class ANEDraftModel:
             [self.b_k_rope_4d, self.b_v_4d_t, self.b_q_rope_4d],
         )
 
-        k['gqa_tile'].run_cached(
+        k['gqa_tile'].run_uncached(
             [self.b_k_rope_4d, self.b_v_4d_t],
             [self.b_kv_tiled],
         )
 
-        k['attn_out'].run_cached(
+        k['attn_out'].run_uncached(
             [self.b_q_rope_4d, self.b_kv_tiled, self.b_attn_mask],
             [self.b_attn_flat],
         )
 
-        k['o_proj_residual'].run_cached(
+        k['o_proj_residual'].run_uncached(
             [self.b_attn_flat, getattr(self, f"w_{p}o_proj"), self.b_hidden],
             [self.b_attn_res],
         )
 
-        k['ffn_residual'].run_cached(
+        k['ffn_residual'].run_uncached(
             [self.b_attn_res, getattr(self, f"w_{p}post_norm"),
              getattr(self, f"w_{p}gate"), getattr(self, f"w_{p}up"), getattr(self, f"w_{p}down")],
             [self.b_hidden],
@@ -443,12 +443,12 @@ class ANEDraftModel:
             self._run_layer(k, i)
         if self.b_logits is not None:
             # Fused final-norm + lm_head → logits [1, vocab_size, 1, w_sq]
-            k['final_norm_lm_head'].run_cached(
+            k['final_norm_lm_head'].run_uncached(
                 [self.b_hidden, self.w_final_norm, self.w_lm_head],
                 [self.b_logits],
             )
         else:
-            k['final_norm'].run_cached(
+            k['final_norm'].run_uncached(
                 [self.b_hidden, self.w_final_norm],
                 [self.b_output],
             )
