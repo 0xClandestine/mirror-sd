@@ -34,7 +34,7 @@ pip install -e .
 UV_CONFIG_FILE=/dev/null maturin develop --manifest-path ane/Cargo.toml
 
 # Run the benchmark
-python python/bench_ane_profile.py \
+python scripts/bench_ane_profile.py \
     --model ~/.omlx/models/Qwen3.5-27B-4bit \
     --draft z-lab/Qwen3.5-27B-DFlash \
     --q8 --skip-ar --skip-gpu \
@@ -212,7 +212,7 @@ ane/                # ANE implementation (Rust + PyO3)
 ├── src/wrapper.rs  # Python bindings
 └── ANE_RULES.md    # ANE compiler constraints, timing, op-count limits
 
-python/
+scripts/
 ├── bench_ane_profile.py   # Full profiler: AR / GPU spec / ANE spec at multiple ctx depths
 ├── bench_ane_pipeline.py  # Pipeline phase breakdown
 ├── bench_ane_power.py     # Per-kernel power + timing
