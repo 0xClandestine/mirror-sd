@@ -1,5 +1,25 @@
 use ane::{Graph, Shape, Tensor, MIN_SPATIAL_WIDTH};
 
+/// Quantized weight data: int8 bytes + per-channel fp16 scales.
+#[derive(Clone)]
+pub struct Q8Weight {
+    pub int8_data: Box<[u8]>,
+    pub scales_f16: Vec<u16>,
+    pub oc: usize,
+    pub ic: usize,
+}
+
+/// Per-layer quantized projection weights for a transformer block.
+pub struct Q8LayerWeights {
+    pub wq: Q8Weight,
+    pub wk: Q8Weight,
+    pub wv: Q8Weight,
+    pub wo: Q8Weight,
+    pub w_gate: Q8Weight,
+    pub w_up: Q8Weight,
+    pub w_down: Q8Weight,
+}
+
 pub struct DFlashDims {
     pub hidden: usize,
     pub head_dim: usize,
@@ -116,6 +136,14 @@ fn conv1x1_proj(g: &mut Graph, input: Tensor, weight: Tensor, oc: usize, ic: usi
     let wt = g.transpose(weight, [0, 3, 2, 1]);
     let w_conv = g.reshape(wt, Shape { batch: oc, channels: ic, height: 1, width: 1 });
     g.convolution_2d_1x1_dynamic(input, w_conv)
+}
+
+/// 1×1 projection with an int8-quantized constant weight baked into the kernel.
+///
+/// `w`: weight in row-major `[oc, ic]` order, pre-quantized to int8 with per-channel fp16 scales.
+fn conv1x1_proj_q8(g: &mut Graph, input: Tensor, w: Q8Weight) -> Tensor {
+    let w_const = g.quantized_weight_1x1(w.int8_data, w.scales_f16, w.oc, w.ic);
+    g.convolution_2d_1x1_dynamic(input, w_const)
 }
 
 pub fn build_fc_norm_kernel(d: &DFlashDims, w_ctx: usize) -> Graph {
@@ -314,6 +342,125 @@ pub fn build_final_norm_kernel(d: &DFlashDims, w_sq: usize) -> Graph {
     let h = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
     let _out = rmsnorm(&mut g, h, norm_w);
+    g
+}
+
+/// Build the mega_qkv kernel with int8-quantized projection weights baked in.
+///
+/// Inputs: hidden, in_norm_w, context, k_norm_w, q_norm_w, cos_k, sin_k, cos_q, sin_q
+/// (projection weights wq/wk/wv are baked as int8 constants)
+pub fn build_mega_qkv_kernel_q8(
+    d: &DFlashDims,
+    w_sq: usize,
+    w_ctx: usize,
+    wq: Q8Weight,
+    wk: Q8Weight,
+    wv: Q8Weight,
+) -> Graph {
+    let mut g = Graph::new();
+    let w_kv = w_ctx + w_sq;
+
+    let hidden = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let in_norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, hidden, in_norm_w);
+
+    let context = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_ctx });
+    let packed = g.concat(&[context, normed], 3);
+
+    let k_all = conv1x1_proj_q8(&mut g, packed, wk);
+    let k_4d = g.reshape(
+        k_all,
+        Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv },
+    );
+    let k_norm_w =
+        g.placeholder(Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv });
+    let k_normed = rmsnorm_per_head(&mut g, k_4d, k_norm_w, 1e-6);
+    let k_norm_t = g.transpose(k_normed, [0, 1, 3, 2]);
+    let cos_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: d.head_dim });
+    let sin_k = g.placeholder(Shape { batch: 1, channels: 1, height: w_kv, width: d.head_dim });
+    let _k_rope = apply_rope(&mut g, k_norm_t, cos_k, sin_k, d.n_kv_heads, w_kv, d.head_dim);
+
+    let v_all = conv1x1_proj_q8(&mut g, packed, wv);
+    let v_4d = g.reshape(
+        v_all,
+        Shape { batch: 1, channels: d.n_kv_heads, height: d.head_dim, width: w_kv },
+    );
+    let _v_4d_t = g.transpose(v_4d, [0, 1, 3, 2]);
+
+    let q_out = conv1x1_proj_q8(&mut g, normed, wq);
+    let q_4d =
+        g.reshape(q_out, Shape { batch: 1, channels: d.n_heads, height: d.head_dim, width: w_sq });
+    let q_norm_w =
+        g.placeholder(Shape { batch: 1, channels: d.n_heads, height: d.head_dim, width: w_sq });
+    let q_normed = rmsnorm_per_head(&mut g, q_4d, q_norm_w, 1e-6);
+    let q_norm_t = g.transpose(q_normed, [0, 1, 3, 2]);
+    let cos_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: d.head_dim });
+    let sin_q = g.placeholder(Shape { batch: 1, channels: 1, height: w_sq, width: d.head_dim });
+    let _q_rope = apply_rope(&mut g, q_norm_t, cos_q, sin_q, d.n_heads, w_sq, d.head_dim);
+
+    g
+}
+
+/// Build the o_proj_residual kernel with int8-quantized wo baked in.
+pub fn build_o_proj_residual_kernel_q8(
+    d: &DFlashDims,
+    w_sq: usize,
+    softcap: f32,
+    wo: Q8Weight,
+) -> Graph {
+    let mut g = Graph::new();
+    let attn_flat =
+        g.placeholder(Shape { batch: 1, channels: d.n_heads * d.head_dim, height: 1, width: w_sq });
+    let o_proj = conv1x1_proj_q8(&mut g, attn_flat, wo);
+    let h_in = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let residual = g.addition(h_in, o_proj);
+    if softcap > 0.0 {
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let divided = g.multiplication(residual, inv_cap);
+        let tanh_out = g.tanh(divided);
+        let _out = g.multiplication(cap_val, tanh_out);
+    }
+    g
+}
+
+/// Build the ffn_residual kernel with int8-quantized gate/up/down weights baked in.
+pub fn build_ffn_residual_kernel_q8(
+    d: &DFlashDims,
+    w_sq: usize,
+    softcap: f32,
+    w_gate: Q8Weight,
+    w_up: Q8Weight,
+    w_down: Q8Weight,
+) -> Graph {
+    let mut g = Graph::new();
+    let h1 = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let post_norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, h1, post_norm_w);
+
+    let gate_out = conv1x1_proj_q8(&mut g, normed, w_gate);
+    let up_out = conv1x1_proj_q8(&mut g, normed, w_up);
+    let sig = g.sigmoid(gate_out);
+    let silu = g.multiplication(gate_out, sig);
+    let gate = g.multiplication(silu, up_out);
+    let ffn_out = conv1x1_proj_q8(&mut g, gate, w_down);
+
+    let residual = g.addition(h1, ffn_out);
+    if softcap > 0.0 {
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let divided = g.multiplication(residual, inv_cap);
+        let tanh_out = g.tanh(divided);
+        let _out = g.multiplication(cap_val, tanh_out);
+    }
     g
 }
 

@@ -80,6 +80,11 @@ class ANEDraftModel:
         is_27b = self.hidden == 5120
         compile_fn = ane.compile_dflash_kernels_27b if is_27b else ane.compile_dflash_kernels
         self.softcap = float(getattr(self.config, 'attn_logit_softcapping', 0) or 0)
+        self.is_27b = is_27b
+
+        # Set True after load_weights_q8() — switches run_kernels to use per-layer q8 kernels.
+        self.use_q8 = False
+        self.layer_kernels = None
 
         print(f"[ANE] Compiling kernels (seq_q={seq_q}, ctx_len={ctx_len}, "
               f"w_sq={self.w_sq}, w_ctx={self.w_ctx}, w_kv={self.w_kv}, "
@@ -257,6 +262,132 @@ class ANEDraftModel:
         self.w_lm_head = self._make_weight_buf(w.astype(mx.float16), self.vocab_size, self.hidden)
         print(f"[ANE] lm_head weight loaded ({time.time()-t0:.1f}s)")
 
+    # ------------------------------------------------------------------ #
+    # W8A16 / Int8 quantized path                                        #
+    # ------------------------------------------------------------------ #
+
+    def _quantize_weight_q8(self, w: mx.array):
+        """Quantize [oc, ic] weight to (int8_bytes, fp16_scale_bytes, oc, ic).
+
+        Symmetric per-output-channel int8: scale = max(|w|, axis=1) / 127.
+        Weights must already be in [oc, ic] row-major order.
+        """
+        import numpy as np
+        w_np = np.array(w.astype(mx.float32), dtype=np.float32)  # [oc, ic]
+        oc, ic = w_np.shape
+        max_vals = np.abs(w_np).max(axis=1)  # [oc]
+        max_vals = np.where(max_vals == 0, 1.0, max_vals)
+        scales = max_vals / 127.0  # [oc]
+        w_int8 = np.clip(np.round(w_np / scales[:, None]), -127, 127).astype(np.int8)
+        scales_f16 = scales.astype(np.float16)
+        return w_int8.tobytes(), scales_f16.tobytes(), oc, ic
+
+    def _load_layer_norm_weights(self, model: nn.Module, layer_idx: int):
+        """Load per-head norm + layer norm weights only (no projection weights)."""
+        layer = model.layers[layer_idx]
+        p = f"l{layer_idx}_"
+        setattr(self, f"w_{p}in_norm",
+                self._make_norm_weight_expanded(layer.input_layernorm.weight, self.w_sq))
+        setattr(self, f"w_{p}q_norm_4d",
+                self._make_per_head_norm_weight(layer.self_attn.q_norm.weight, self.n_heads, self.w_sq))
+        setattr(self, f"w_{p}k_norm_4d",
+                self._make_per_head_norm_weight(layer.self_attn.k_norm.weight, self.n_kv_heads, self.w_kv))
+        setattr(self, f"w_{p}post_norm",
+                self._make_norm_weight_expanded(layer.post_attention_layernorm.weight, self.w_sq))
+
+    def _load_layer_weights_q8(self, model: nn.Module, layer_idx: int):
+        """Quantize one layer's projection weights → Q8LayerWeights pyobject."""
+        layer = model.layers[layer_idx]
+        sq_w = layer.self_attn
+        H, NH, NKV, HD = self.hidden, self.n_heads, self.n_kv_heads, self.head_dim
+        INT = self.intermediate
+
+        q_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float32), NH, HD)
+        wq = self._quantize_weight_q8(q_il.reshape(NH * HD, H))
+
+        k_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float32), NKV, HD)
+        wk = self._quantize_weight_q8(k_il.reshape(NKV * HD, H))
+
+        wv = self._quantize_weight_q8(sq_w.v_proj.weight.astype(mx.float32).reshape(NKV * HD, H))
+        wo = self._quantize_weight_q8(sq_w.o_proj.weight.astype(mx.float32).reshape(H, NH * HD))
+        w_gate = self._quantize_weight_q8(layer.mlp.gate_proj.weight.astype(mx.float32).reshape(INT, H))
+        w_up = self._quantize_weight_q8(layer.mlp.up_proj.weight.astype(mx.float32).reshape(INT, H))
+        w_down = self._quantize_weight_q8(layer.mlp.down_proj.weight.astype(mx.float32).reshape(H, INT))
+
+        return self.ane.Q8LayerWeights(wq, wk, wv, wo, w_gate, w_up, w_down)
+
+    def load_weights_q8(self, draft_model: nn.Module, target_model: nn.Module = None):
+        """Load weights as W8A16 int8 and compile per-layer quantized kernels.
+
+        This replaces load_weights() for the quantized inference path.
+        After this call, run_kernels() uses per-layer kernels with baked int8 weights
+        (no fp16 weight IOSurfaces), reducing ANE memory bandwidth by ~2×.
+        """
+        # Non-projection weights (fc, norms) — unchanged from fp16 path
+        self._load_fc_weights(draft_model)
+        self._fc_weight = draft_model.fc.weight.astype(mx.float32)
+        self._hidden_norm_weight = draft_model.hidden_norm.weight.astype(mx.float32)
+
+        print(f"[ANE] Loading layer norm weights ({self.n_layers} layers)...")
+        for i in range(self.n_layers):
+            self._load_layer_norm_weights(draft_model, i)
+
+        print(f"[ANE] Quantizing + compiling {self.n_layers} q8 layer kernels...")
+        t0 = time.time()
+        layer_weights = [self._load_layer_weights_q8(draft_model, i) for i in range(self.n_layers)]
+        layer_kernel_lists = self.ane.compile_dflash_kernels_q8(
+            self.seq_q, self.max_ctx_len, self.softcap, layer_weights, self.is_27b,
+        )
+        self.layer_kernels = [{k.name: k for k in lklist} for lklist in layer_kernel_lists]
+        print(f"[ANE] q8 kernels compiled ({time.time() - t0:.1f}s, "
+              f"{len(self.layer_kernels)} layers × {len(layer_kernel_lists[0])} kernels)")
+
+        self._load_final_norm_weights(draft_model)
+        if self.vocab_size is not None and target_model is not None:
+            self._load_lm_head_weights(target_model)
+
+        self.use_q8 = True
+        self.weights_loaded = True
+        print("[ANE] Weights loaded (q8)")
+
+    def _run_layer_q8(self, layer_idx: int):
+        """Run one transformer layer using baked int8 projection weights."""
+        lk = self.layer_kernels[layer_idx]
+        p = f"l{layer_idx}_"
+
+        # mega_qkv_q8: projection weights baked in — only norm/rope inputs
+        lk['mega_qkv_q8'].run_uncached(
+            [self.b_hidden, getattr(self, f"w_{p}in_norm"),
+             self.b_context,
+             getattr(self, f"w_{p}k_norm_4d"),
+             self.b_cos_k, self.b_sin_k,
+             getattr(self, f"w_{p}q_norm_4d"),
+             self.b_cos_q, self.b_sin_q],
+            [self.b_k_rope_4d, self.b_v_4d_t, self.b_q_rope_4d],
+        )
+
+        lk['gqa_tile'].run_uncached(
+            [self.b_k_rope_4d, self.b_v_4d_t],
+            [self.b_kv_tiled],
+        )
+
+        lk['attn_out'].run_uncached(
+            [self.b_q_rope_4d, self.b_kv_tiled, self.b_attn_mask],
+            [self.b_attn_flat],
+        )
+
+        # o_proj_residual_q8: wo baked in — only attn_flat + residual input
+        lk['o_proj_residual_q8'].run_uncached(
+            [self.b_attn_flat, self.b_hidden],
+            [self.b_attn_res],
+        )
+
+        # ffn_residual_q8: gate/up/down baked in — only h1 + post_norm input
+        lk['ffn_residual_q8'].run_uncached(
+            [self.b_attn_res, getattr(self, f"w_{p}post_norm")],
+            [self.b_hidden],
+        )
+
     def forward(self, noise_embedding: mx.array, target_hidden: mx.array,
                 rope_offset: int = 0, ctx_len: int = None,
                 precomputed_context: mx.array = None) -> mx.array:
@@ -277,8 +408,12 @@ class ANEDraftModel:
         self._compute_rope(rope_offset, ctx_len)
         self._compute_attn_mask(ctx_len)
 
-        for i in range(self.n_layers):
-            self._run_layer(k, i)
+        if self.use_q8:
+            for i in range(self.n_layers):
+                self._run_layer_q8(i)
+        else:
+            for i in range(self.n_layers):
+                self._run_layer(k, i)
 
         k['final_norm'].run_uncached(
             [self.b_hidden, self.w_final_norm],
@@ -439,8 +574,12 @@ class ANEDraftModel:
         Call read_output() / read_draft_tokens() on the main thread after join.
         """
         k = self.kernels
-        for i in range(self.n_layers):
-            self._run_layer(k, i)
+        if self.use_q8:
+            for i in range(self.n_layers):
+                self._run_layer_q8(i)
+        else:
+            for i in range(self.n_layers):
+                self._run_layer(k, i)
         if self.b_logits is not None:
             # Fused final-norm + lm_head → logits [1, vocab_size, 1, w_sq]
             k['final_norm_lm_head'].run_uncached(

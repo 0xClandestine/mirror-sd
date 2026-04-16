@@ -360,6 +360,147 @@ pub fn compile_dflash_kernels_27b(
     compile_kernels(&dflash::DIMS_27B, seq_q, ctx_len, softcap)
 }
 
+/// Container for one transformer layer's quantized projection weights.
+///
+/// Each weight is passed as `(int8_bytes, fp16_scale_bytes, oc, ic)`.  The
+/// int8 bytes are in row-major `[oc, ic]` order; the scale bytes are raw
+/// IEEE 754 fp16 encoded as little-endian uint16 (one per output channel).
+#[pyclass]
+pub struct Q8LayerWeights {
+    pub wq:     dflash::Q8Weight,
+    pub wk:     dflash::Q8Weight,
+    pub wv:     dflash::Q8Weight,
+    pub wo:     dflash::Q8Weight,
+    pub w_gate: dflash::Q8Weight,
+    pub w_up:   dflash::Q8Weight,
+    pub w_down: dflash::Q8Weight,
+}
+
+#[pymethods]
+impl Q8LayerWeights {
+    /// Construct from raw bytes.
+    ///
+    /// Each weight is `(int8_data: bytes, scales_f16: bytes, oc: int, ic: int)`.
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        wq:     (Vec<u8>, Vec<u8>, usize, usize),
+        wk:     (Vec<u8>, Vec<u8>, usize, usize),
+        wv:     (Vec<u8>, Vec<u8>, usize, usize),
+        wo:     (Vec<u8>, Vec<u8>, usize, usize),
+        w_gate: (Vec<u8>, Vec<u8>, usize, usize),
+        w_up:   (Vec<u8>, Vec<u8>, usize, usize),
+        w_down: (Vec<u8>, Vec<u8>, usize, usize),
+    ) -> PyResult<Self> {
+        fn parse(t: (Vec<u8>, Vec<u8>, usize, usize)) -> PyResult<dflash::Q8Weight> {
+            let (int8_data, scale_bytes, oc, ic) = t;
+            if int8_data.len() != oc * ic {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "int8_data len {} != oc*ic {}", int8_data.len(), oc * ic
+                )));
+            }
+            if scale_bytes.len() != oc * 2 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "scale_bytes len {} != oc*2 {}", scale_bytes.len(), oc * 2
+                )));
+            }
+            let scales_f16: Vec<u16> = scale_bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            Ok(dflash::Q8Weight {
+                int8_data: int8_data.into_boxed_slice(),
+                scales_f16,
+                oc,
+                ic,
+            })
+        }
+        Ok(Self {
+            wq:     parse(wq)?,
+            wk:     parse(wk)?,
+            wv:     parse(wv)?,
+            wo:     parse(wo)?,
+            w_gate: parse(w_gate)?,
+            w_up:   parse(w_up)?,
+            w_down: parse(w_down)?,
+        })
+    }
+}
+
+/// Compile per-layer quantized DFlash kernels.
+///
+/// Returns one kernel set per layer.  Each set is a list:
+/// `[mega_qkv_q8, gqa_tile, attn_out, o_proj_residual_q8, ffn_residual_q8]`.
+///
+/// The non-per-layer kernels (`fc_norm`, `final_norm`) are compiled separately
+/// by `compile_dflash_kernels`.
+#[pyfunction]
+pub fn compile_dflash_kernels_q8(
+    py: Python<'_>,
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+    layer_weights: Vec<PyRef<Q8LayerWeights>>,
+    is_27b: bool,
+) -> PyResult<Vec<Vec<ANEKernel>>> {
+    let dims = if is_27b { &dflash::DIMS_27B } else { &dflash::DIMS_8B };
+    let w_sq = dflash::align_width(seq_q);
+    let w_ctx = dflash::align_width(ctx_len);
+    let w_kv = w_ctx + w_sq;
+
+    // Extract all weight data while holding the GIL, then release it for compilation.
+    struct LayerData {
+        wq: dflash::Q8Weight, wk: dflash::Q8Weight, wv: dflash::Q8Weight,
+        wo: dflash::Q8Weight,
+        w_gate: dflash::Q8Weight, w_up: dflash::Q8Weight, w_down: dflash::Q8Weight,
+    }
+    let extracted: Vec<LayerData> = layer_weights.iter().map(|lw| LayerData {
+        wq:     lw.wq.clone(),
+        wk:     lw.wk.clone(),
+        wv:     lw.wv.clone(),
+        wo:     lw.wo.clone(),
+        w_gate: lw.w_gate.clone(),
+        w_up:   lw.w_up.clone(),
+        w_down: lw.w_down.clone(),
+    }).collect();
+
+    let n_layers = extracted.len();
+    let mut all_layers: Vec<Vec<ANEKernel>> = Vec::with_capacity(n_layers);
+
+    py.allow_threads(|| -> PyResult<()> {
+        for ld in extracted {
+            let mega_graph = dflash::build_mega_qkv_kernel_q8(
+                dims, w_sq, w_ctx, ld.wq, ld.wk, ld.wv,
+            );
+            let gqa_graph = dflash::build_gqa_tile_kernel(dims, w_kv);
+            let attn_graph = dflash::build_attn_out_kernel(dims, w_sq, w_kv, softcap);
+            let o_graph = dflash::build_o_proj_residual_kernel_q8(dims, w_sq, softcap, ld.wo);
+            let ffn_graph = dflash::build_ffn_residual_kernel_q8(
+                dims, w_sq, softcap, ld.w_gate, ld.w_up, ld.w_down,
+            );
+
+            let compile = |name: &str, g: ane::Graph| -> PyResult<ANEKernel> {
+                g.compile(NSQualityOfService::UserInteractive)
+                    .map(|exec| ANEKernel { executable: exec, name: name.to_string() })
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("compile '{}' failed: {:?}", name, e)
+                    ))
+            };
+
+            all_layers.push(vec![
+                compile("mega_qkv_q8", mega_graph)?,
+                compile("gqa_tile",    gqa_graph)?,
+                compile("attn_out",    attn_graph)?,
+                compile("o_proj_residual_q8", o_graph)?,
+                compile("ffn_residual_q8",    ffn_graph)?,
+            ]);
+        }
+        Ok(())
+    })?;
+
+    Ok(all_layers)
+}
+
 /// Compile the fused final-norm + lm_head kernel.
 ///
 /// `is_27b`: True for 27B model (hidden=5120), False for 8B (hidden=4096).
