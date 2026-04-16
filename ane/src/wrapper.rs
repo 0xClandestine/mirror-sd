@@ -228,6 +228,59 @@ impl ANEKernel {
         Ok(())
     }
 
+    fn run_cached(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_cached failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn run_direct(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run_cached_direct(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_direct failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn pre_map(&self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.pre_map_request(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' pre_map failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
     fn run_timed(
         &self,
         py: Python<'_>,
