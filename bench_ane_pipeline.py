@@ -88,7 +88,8 @@ _deferred_stream = None  # initialized in main()
 
 def run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
             last_token, mask_token_id, block_size, correction_logits,
-            use_ane_lm_head: bool = False, deferred_lm_head: bool = False):
+            use_ane_lm_head: bool = False, deferred_lm_head: bool = False,
+            in_thread: bool = False):
     """Run one full draft step with fine-grained phase timing.
 
     Replicates _start_draft + thread run + post-join sequence exactly.
@@ -122,14 +123,30 @@ def run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
     ane.prepare_forward(noise_emb, precomputed_context, draft_cache, target_hidden)
     phases["prepare_forward"] = (time.perf_counter() - t0) * 1e3
 
-    # ── Fork: launch pure-ANE thread ──────────────────────────────────────
+    # ── Fork: launch ANE thread (optionally including read_output+lm_head) ──
 
     kernel_ms: list[float] = []
+    thread_result: list = []  # [draft_hidden] or [sampled_tokens]
 
-    def _thread_fn():
-        t = time.perf_counter()
-        ane.run_kernels()
-        kernel_ms.append((time.perf_counter() - t) * 1e3)
+    if in_thread:
+        # IDEA-14 mode: run_kernels + read_output + lm_head-submit all in thread.
+        # Main thread goes straight to verify after join with draft_result ready.
+        def _thread_fn():
+            t = time.perf_counter()
+            ane.run_kernels()
+            kernel_ms.append((time.perf_counter() - t) * 1e3)
+            # read_output: IOSurface→mx.array (thread-safe)
+            dh = ane.read_output()
+            # lm_head on _deferred_stream (non-blocking, concurrent with verify)
+            with mx.stream(_deferred_stream):
+                dl = lm_head_fn(dh[:, -(block_size - 1):, :])
+                sampled = mx.argmax(dl, axis=-1)
+            thread_result.append(sampled)
+    else:
+        def _thread_fn():
+            t = time.perf_counter()
+            ane.run_kernels()
+            kernel_ms.append((time.perf_counter() - t) * 1e3)
 
     t0 = time.perf_counter()
     thread = threading.Thread(target=_thread_fn)
@@ -148,18 +165,29 @@ def run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
 
     # ── Post-join: main thread ────────────────────────────────────────────
 
-    # 5. read_output — IOSurface buffer → mx.array (skipped for ANE lm_head path)
-    if use_ane_lm_head and hasattr(ane, 'b_logits') and ane.b_logits is not None:
-        phases["read_output"] = 0.0   # ANE lm_head path: b_logits holds logits, not hidden
+    # 5. read_output — IOSurface buffer → mx.array
+    if in_thread:
+        # read_output already happened inside the thread — main thread cost = 0.
+        phases["read_output"] = 0.0
+        draft_hidden = None
+    elif use_ane_lm_head and hasattr(ane, 'b_logits') and ane.b_logits is not None:
+        phases["read_output"] = 0.0   # ANE lm_head: b_logits holds logits
         draft_hidden = None
     else:
         t0 = time.perf_counter()
         draft_hidden = ane.read_output()
         phases["read_output"] = (time.perf_counter() - t0) * 1e3
 
-    # 6. lm_head + sample: either ANE (read_draft_tokens) or GPU
+    # 6. lm_head + sample
     t0 = time.perf_counter()
-    if use_ane_lm_head and hasattr(ane, 'read_draft_tokens') and ane.b_logits is not None:
+    if in_thread:
+        # lm_head already submitted in thread — main thread cost = 0.
+        # Force a barrier so the bench loop starts clean.
+        if thread_result:
+            mx.eval(thread_result[0])
+        phases["lm_head_eval"] = 0.0
+        phases["lm_head_path"] = 3.0  # sentinel: 3 = in-thread path
+    elif use_ane_lm_head and hasattr(ane, 'read_draft_tokens') and ane.b_logits is not None:
         # NEON argmax directly on the ANE IOSurface — no GPU, no mx.eval.
         raw = ane.read_draft_tokens()   # (1, seq_q) int32, already on CPU
         _ = raw[:, 1:block_size]        # slice to draft positions (lazy but cheap)
@@ -208,6 +236,10 @@ def main():
                         help="Simulate deferred lm_head: submit to _draft_stream "
                              "without eval, measure only submission overhead "
                              "(the 7ms matmul runs concurrently with verify).")
+    parser.add_argument("--in-thread", action="store_true",
+                        help="Simulate IDEA-14: run read_output + lm_head-submit "
+                             "inside the ANE thread, measure wall time from "
+                             "thread.start() to join() as the true step cost.")
     args = parser.parse_args()
 
     _header("ANE Draft Step Pipeline Profiler")
@@ -217,6 +249,7 @@ def main():
     print(f"  lm_head     : {'real (target model)' if args.target else 'synthetic (proxy timing)'}")
     print(f"  ANE lm_head : {'enabled' if args.ane_lm_head else 'disabled (GPU path)'}")
     print(f"  Deferred lh : {'yes (_draft_stream, no eval)' if args.deferred_lm_head else 'no (immediate mx.eval)'}")
+    print(f"  In-thread   : {'yes (read_output+lm_head in ANE thread)' if args.in_thread else 'no'}")
 
     global _deferred_stream
     _deferred_stream = mx.new_stream(mx.gpu)
@@ -281,7 +314,8 @@ def main():
         run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
                 last_token, mask_token_id, block_size, correction_logits,
                 use_ane_lm_head=args.ane_lm_head,
-                deferred_lm_head=args.deferred_lm_head)
+                deferred_lm_head=args.deferred_lm_head,
+                in_thread=args.in_thread)
         print(f"  warmup {i+1}/{args.warmup}", end="\r", flush=True)
     print()
 
@@ -295,7 +329,8 @@ def main():
         p = run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
                     last_token, mask_token_id, block_size, correction_logits,
                     use_ane_lm_head=args.ane_lm_head,
-                    deferred_lm_head=args.deferred_lm_head)
+                    deferred_lm_head=args.deferred_lm_head,
+                    in_thread=args.in_thread)
         for k, v in p.items():
             all_phases[k].append(v)
         total = sum(p[ph] for ph in PHASE_ORDER if ph in p)

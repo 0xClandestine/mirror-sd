@@ -1212,12 +1212,34 @@ def _spec_generate_parallel(
         else:
             dc_active = dc
         if not use_gpu and buffers_prepared:
-            # All Metal/mx.eval work was done on the main thread in _start_draft.
-            # This thread is PURE ANE (IOSurface reads/writes + CoreML kernels) —
-            # no mx.array creation, no mx.eval, no Metal.
-            # read_output() + lm_head will be called on the main thread after join.
+            # ANE execution phase.  All mx.eval / Metal work was done on the
+            # main thread inside _start_draft before this thread started.
             active_draft.run_kernels()
-            _ane_kernels_pending = True
+
+            # Extend into read_output + lm_head-submit here in the thread so
+            # the main thread can proceed straight to _start_draft + verify
+            # with zero post-join overhead (~4 ms saved per step).
+            #
+            # Thread-safety rationale:
+            #   read_output() — Rust IOSurface lock (py.allow_threads) +
+            #     mx.array creation; both are thread-safe in MLX.
+            #   lm_head_fn() — builds a lazy MLX graph; thread-safe.
+            #   mx.stream(_draft_stream) — independent Metal stream; runs
+            #     concurrently with verify on the default stream.
+            #   draft_result write — visible to main thread after join()
+            #     (join provides the happens-before memory barrier).
+            if has_ane_lm_head:
+                raw_tokens = active_draft.read_draft_tokens()  # NEON argmax
+                draft_result = raw_tokens[:, 1:ne.shape[1]]
+            else:
+                draft_hidden = active_draft.read_output()
+                q_len = ne.shape[1]
+                with mx.stream(_draft_stream):
+                    draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+                    sampled_tokens = sample(draft_logits, temperature)
+                draft_result = sampled_tokens
+            # Signal that main thread needs no post-join finalization.
+            _ane_kernels_pending = False
             return
         q_len = ne.shape[1]
         if use_gpu:
