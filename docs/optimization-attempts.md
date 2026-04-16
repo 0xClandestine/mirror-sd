@@ -140,6 +140,42 @@ fails: `_ANECompiler: ANECCompile() FAILED`.
 
 ---
 
+## EXP-005: Move read_output + lm_head-submit into ANE thread (IDEA-14)  [status: done]
+Date: 2026-04-16
+Idea ref: IDEA-14
+Branch: fix/ane-qk-norm
+Commit: efe0519
+
+### Motivation
+After EXP-003 (deferred lm_head), read_output (3.75ms) remained on the main thread
+post-join. The main thread critical path was: join → read_output(3.75ms) →
+lm_head_submit(0.01ms) → _start_draft(4ms) → verify(197ms) = 204.76ms.
+
+### Change
+Extend the ANE thread's `buffers_prepared` branch to also run `read_output()` and
+submit lm_head to `_draft_stream` before returning. Main thread after join goes
+directly to `_start_draft` + verify with `draft_result` already populated.
+
+### Thread safety
+- `read_output()`: Rust IOSurface `py.allow_threads()` + mx.array creation — both safe
+- `lm_head_fn()`: lazy graph construction — safe
+- `_draft_stream` submit: independent Metal stream — safe
+- `draft_result` write: `join()` provides happens-before barrier
+
+### Results
+Bench total ~62ms (unchanged — bench has no verify, gain is hidden by join_overhead).
+In production (27B, verify=197ms):
+- Thread time: 153ms → ~157ms (still << 197ms verify budget)
+- Serial post-join: 3.75ms → 0ms
+- Step: ~203ms → ~199ms (-2%)
+
+### Combined effect (EXP-003 + EXP-005)
+- lm_head: 7.7ms → 0ms on main thread
+- read_output: 3.75ms → 0ms on main thread
+- Total savings from both: ~11.4ms/step, ~-13% step time (8B proxy)
+
+---
+
 ## Template
 
 ## EXP-NNN: <title>  [status: pending]
