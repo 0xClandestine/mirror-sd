@@ -98,6 +98,30 @@ GPU implementations. Any discrepancy reduces α.
 Save every bench run to a SQLite DB (`bench_results.db`) with git commit hash,
 timestamp, config, and all metrics. Makes regression tracking automatic.
 
+### IDEA-14: Run read_output + lm_head-submit inside the ANE thread
+**Hypothesis**: `read_output()` (3.7ms IOSurface→mx.array copy) currently runs on the
+main thread after join. If we allow it to run at the END of the ANE thread (after
+`run_kernels()` completes, before the thread exits), then by the time main thread
+joins, `draft_hidden` is already a full mx.array and lm_head is already submitted
+to `_draft_stream`. Main thread join → check draft_result → start_verify, with 0
+main-thread overhead from read_output/lm_head.
+**Risk**: `_read_mlx_2d` creates mx.array (Metal buffer alloc) from a non-main thread.
+MLX uses a thread-safe allocator so this is likely safe. The IOSurface has no data
+race since `run_kernels()` is fully done before `read_output()` is called.
+**Expected gain**: 3.7ms + 0ms (lm_head now in thread, runs during verify) = 3.7ms
+additional saving on top of EXP-003. Step: 63ms → 59ms for 8B model.
+**Metric**: bench_ane_pipeline.py after restructuring `_run_draft` / `_ane_kernels_pending`.
+
+### IDEA-15: Chunked ANE lm_head (split vocab into 4096-channel blocks)
+**Hypothesis**: ANE conv1x1 channel limit prevents compiling the full lm_head
+(vocab=152K). If we compile N=37 kernels of 4096 output channels each and run them
+sequentially, the full vocab projection happens on ANE. NEON argmax over the 37
+partial outputs would still be CPU-cheap.
+**Risk**: 37 ANE dispatches × dispatch overhead (~0.3ms each?) = ~11ms overhead.
+ANE lm_head benefit (~11ms saved) may be fully eaten by dispatch overhead.
+**Prerequisite**: Measure actual ANE channel limit and dispatch overhead per kernel.
+**Better alternative**: Single chunked kernel that tiles internally (CoreML may do this).
+
 ### IDEA-13: Thermal throttle detection
 ANE power often drops under sustained load (thermal). bench_ane_power.py already
 samples power; add detection: if avg_mw in second half < 80% of first half,
