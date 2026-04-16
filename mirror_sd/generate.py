@@ -1177,6 +1177,14 @@ def _spec_generate_parallel(
     has_prepare = (hasattr(draft_model, 'prepare_forward') and
                    hasattr(draft_model, 'run_kernels') and
                    hasattr(draft_model, 'read_output'))
+    # True when the ANE model has a fused final_norm+lm_head kernel compiled
+    # and its b_logits output buffer is allocated.  In this case run_kernels()
+    # writes vocab logits directly to ANE IOSurface, and read_draft_tokens()
+    # does a NEON argmax on that buffer — no mx.array, no GPU, no mx.eval.
+    # Saves ~11 ms/step vs the default read_output() + GPU lm_head path.
+    has_ane_lm_head = (has_prepare and
+                       hasattr(draft_model, 'read_draft_tokens') and
+                       getattr(draft_model, 'b_logits', None) is not None)
 
     # Dedicated GPU stream for the lm_head eval in the non-prepared draft path.
     _draft_stream = mx.new_stream(mx.gpu)
@@ -1345,16 +1353,33 @@ def _spec_generate_parallel(
         t_draft_done = time.perf_counter()
         draft_time = t_draft_done - t_draft_start
 
-        # When ANE ran run_kernels() in the thread, read_output() + lm_head
-        # must happen on the main thread (safe — no concurrent Metal access).
+        # When ANE ran run_kernels() in the thread, finalize the draft on the
+        # main thread (safe — no concurrent Metal/ANE access after join).
         if _ane_kernels_pending:
             _ane_kernels_pending = False
-            draft_hidden = draft_model.read_output()
-            q_len = current_block_size
-            draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
-            sampled_tokens = sample(draft_logits, temperature)
-            mx.eval(sampled_tokens)
-            draft_result = sampled_tokens
+            if has_ane_lm_head:
+                # run_kernels() already executed fused final_norm+lm_head on
+                # ANE.  read_draft_tokens() reads argmax via NEON directly
+                # from the IOSurface — no GPU dispatch, no mx.eval, ~0.5 ms.
+                # pos 0 = prediction following the anchor (not a draft token);
+                # pos 1..block_size-1 = predictions for the mask positions.
+                raw_tokens = draft_model.read_draft_tokens()   # (1, seq_q)
+                draft_result = raw_tokens[:, 1:current_block_size]
+            else:
+                # GPU lm_head path.  read_output() copies b_output IOSurface
+                # → mx.array (unavoidable, ~4 ms).  The lm_head matmul is
+                # then submitted to _draft_stream WITHOUT eval so it overlaps
+                # with _start_draft prep and the first ~8 ms of verify.
+                # MLX cross-stream dependency tracking ensures sampled_tokens
+                # is materialized before its values are read below.
+                draft_hidden = draft_model.read_output()
+                q_len = current_block_size
+                with mx.stream(_draft_stream):
+                    draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+                    sampled_tokens = sample(draft_logits, temperature)
+                # No mx.eval — runs concurrently on _draft_stream while the
+                # default stream handles _start_draft + verify below.
+                draft_result = sampled_tokens
 
         sampled_tokens = draft_result
         block_tokens = [output_ids_list[-1]] + [mask_token_id] * (current_block_size - 1)

@@ -84,8 +84,11 @@ def _make_soft_anchor(noise_emb, correction_logits, embed_fn, top_k=8):
     return mx.concatenate([soft, noise_emb[:, 1:, :]], axis=1)
 
 
+_deferred_stream = None  # initialized in main()
+
 def run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
-            last_token, mask_token_id, block_size, correction_logits):
+            last_token, mask_token_id, block_size, correction_logits,
+            use_ane_lm_head: bool = False, deferred_lm_head: bool = False):
     """Run one full draft step with fine-grained phase timing.
 
     Replicates _start_draft + thread run + post-join sequence exactly.
@@ -145,18 +148,43 @@ def run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
 
     # ── Post-join: main thread ────────────────────────────────────────────
 
-    # 5. read_output — IOSurface buffer → mx.array
-    t0 = time.perf_counter()
-    draft_hidden = ane.read_output()
-    phases["read_output"] = (time.perf_counter() - t0) * 1e3
+    # 5. read_output — IOSurface buffer → mx.array (skipped for ANE lm_head path)
+    if use_ane_lm_head and hasattr(ane, 'b_logits') and ane.b_logits is not None:
+        phases["read_output"] = 0.0   # ANE lm_head path: b_logits holds logits, not hidden
+        draft_hidden = None
+    else:
+        t0 = time.perf_counter()
+        draft_hidden = ane.read_output()
+        phases["read_output"] = (time.perf_counter() - t0) * 1e3
 
-    # 6. lm_head + greedy sample + eval
+    # 6. lm_head + sample: either ANE (read_draft_tokens) or GPU
     t0 = time.perf_counter()
-    q_len = block_size
-    draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
-    sampled = mx.argmax(draft_logits, axis=-1)
-    mx.eval(sampled)
-    phases["lm_head_eval"] = (time.perf_counter() - t0) * 1e3
+    if use_ane_lm_head and hasattr(ane, 'read_draft_tokens') and ane.b_logits is not None:
+        # NEON argmax directly on the ANE IOSurface — no GPU, no mx.eval.
+        raw = ane.read_draft_tokens()   # (1, seq_q) int32, already on CPU
+        _ = raw[:, 1:block_size]        # slice to draft positions (lazy but cheap)
+        phases["lm_head_eval"] = (time.perf_counter() - t0) * 1e3
+        phases["lm_head_path"] = 0.0    # sentinel: 0 = ANE path
+    elif deferred_lm_head:
+        # Simulate the _draft_stream deferred path from generate.py:
+        # submit to a separate GPU stream without eval.  Only measures
+        # submission overhead — the actual 7ms matmul is "free" during verify.
+        q_len = block_size
+        with mx.stream(_deferred_stream):
+            draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+            sampled = mx.argmax(draft_logits, axis=-1)
+        # No mx.eval here — matches the new generate.py behavior.
+        phases["lm_head_eval"] = (time.perf_counter() - t0) * 1e3
+        phases["lm_head_path"] = 2.0    # sentinel: 2 = deferred GPU path
+        # Force a barrier so the next run starts clean.
+        mx.eval(sampled)
+    else:
+        q_len = block_size
+        draft_logits = lm_head_fn(draft_hidden[:, -(q_len - 1):, :])
+        sampled = mx.argmax(draft_logits, axis=-1)
+        mx.eval(sampled)
+        phases["lm_head_eval"] = (time.perf_counter() - t0) * 1e3
+        phases["lm_head_path"] = 1.0    # sentinel: 1 = GPU path (immediate)
 
     return phases
 
@@ -171,6 +199,15 @@ def main():
     parser.add_argument("--target",   default=None,
                         help="Path to target model for real lm_head. "
                              "Omit to use a synthetic weight (timing proxy).")
+    parser.add_argument("--ane-lm-head", action="store_true",
+                        help="Compile fused final_norm+lm_head on ANE and use "
+                             "read_draft_tokens() instead of GPU lm_head. "
+                             "NOTE: fails for vocab>=~16K (ANE channel limit). "
+                             "Requires --target for real lm_head weights.")
+    parser.add_argument("--deferred-lm-head", action="store_true",
+                        help="Simulate deferred lm_head: submit to _draft_stream "
+                             "without eval, measure only submission overhead "
+                             "(the 7ms matmul runs concurrently with verify).")
     args = parser.parse_args()
 
     _header("ANE Draft Step Pipeline Profiler")
@@ -178,6 +215,11 @@ def main():
     print(f"  ctx_len     : {args.ctx_len}   seq_q : {args.seq_q}")
     print(f"  Warmup      : {args.warmup}    Runs  : {args.runs}")
     print(f"  lm_head     : {'real (target model)' if args.target else 'synthetic (proxy timing)'}")
+    print(f"  ANE lm_head : {'enabled' if args.ane_lm_head else 'disabled (GPU path)'}")
+    print(f"  Deferred lh : {'yes (_draft_stream, no eval)' if args.deferred_lm_head else 'no (immediate mx.eval)'}")
+
+    global _deferred_stream
+    _deferred_stream = mx.new_stream(mx.gpu)
 
     _section("Loading models")
     import os
@@ -190,7 +232,9 @@ def main():
     print(f"  GPU draft loaded in {time.perf_counter()-t0:.1f}s")
 
     t0 = time.perf_counter()
-    ane = ANEDraftModel(seq_q=args.seq_q, ctx_len=args.ctx_len, config=config)
+    vocab_size = getattr(config, 'vocab_size', None) if args.ane_lm_head else None
+    ane = ANEDraftModel(seq_q=args.seq_q, ctx_len=args.ctx_len, config=config,
+                        vocab_size=vocab_size)
     ane.load_weights(gpu_draft)
     print(f"  ANE compiled+loaded in {time.perf_counter()-t0:.1f}s")
 
@@ -235,7 +279,9 @@ def main():
         ane._rope_cache_key = None
         ane._attn_mask_ctx_len = None
         run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
-                last_token, mask_token_id, block_size, correction_logits)
+                last_token, mask_token_id, block_size, correction_logits,
+                use_ane_lm_head=args.ane_lm_head,
+                deferred_lm_head=args.deferred_lm_head)
         print(f"  warmup {i+1}/{args.warmup}", end="\r", flush=True)
     print()
 
@@ -247,7 +293,9 @@ def main():
         ane._rope_cache_key = None
         ane._attn_mask_ctx_len = None
         p = run_one(ane, embed_fn, lm_head_fn, target_hidden, draft_cache,
-                    last_token, mask_token_id, block_size, correction_logits)
+                    last_token, mask_token_id, block_size, correction_logits,
+                    use_ane_lm_head=args.ane_lm_head,
+                    deferred_lm_head=args.deferred_lm_head)
         for k, v in p.items():
             all_phases[k].append(v)
         total = sum(p[ph] for ph in PHASE_ORDER if ph in p)
