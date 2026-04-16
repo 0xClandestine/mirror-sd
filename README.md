@@ -66,16 +66,16 @@ The `ane/` directory contains a Rust implementation of the DFlash draft model fo
 
 The design: run the target model on GPU and the draft model on ANE **in parallel**, matching the Mirror-SD paper's heterogeneous accelerator design. On Apple Silicon with unified memory, the draft model's inputs (target hidden states) and outputs (draft logits) are exchanged with zero-copy.
 
-### Results (M4 Max, Qwen3.5-27B-4bit + z-lab/Qwen3.5-27B-DFlash, ctx=64)
+### Results (M4 Max, Qwen3.5-27B-4bit + z-lab/Qwen3.5-27B-DFlash, ctx=64, 256 tokens)
 
-| Mode | tok/s | α | draft/step | overlap |
-|---|---:|---:|---:|---:|
-| GPU autoregressive (baseline) | ~26 | — | — | — |
-| GPU-only DFlash spec decode | ~40 | ~9 | ~230ms | — |
-| **ANE‖GPU DFlash (fp16)** | **40** | 9.6 | 231ms | 95% |
-| **ANE‖GPU DFlash (W8A16 q8)** | **85** | 17.9 | 191ms | 90% |
+| Mode | tok/s | α | draft/step | overlap | speedup |
+|---|---:|---:|---:|---:|---:|
+| GPU autoregressive (baseline) | 14.5 | — | — | — | 1.0x |
+| GPU-only DFlash spec decode | ~22 | ~4.5 | ~230ms | — | ~1.5x |
+| **ANE‖GPU DFlash (fp16)** | **40** | 9.6 | 231ms | 95% | **2.8x** |
+| **ANE‖GPU DFlash (W8A16 q8)** | **58** | 17.9 | 191ms | 93% | **4.0x** |
 
-W8A16 quantization cuts draft bandwidth in half (~1.2x kernel speedup) while the quantized draft model achieves higher token acceptance against the fp16 target, combining to **~3.2x over GPU autoregressive**.
+W8A16 quantization cuts draft bandwidth in half (~1.2x kernel speedup) while the quantized draft model achieves higher token acceptance against the fp16 target, combining to **4x over GPU autoregressive**.
 
 ### Architecture
 

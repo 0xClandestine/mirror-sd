@@ -159,12 +159,8 @@ class ANEDraftModel:
     def _make_per_head_norm_weight(self, head_weight: mx.array, n_heads: int, width: int):
         w = align_width(width)
         head_dim = head_weight.shape[0]
-        half = head_dim // 2
-        w_first = head_weight[:half].astype(mx.float32)
-        w_second = head_weight[half:].astype(mx.float32)
-        il = mx.stack([w_first, w_second], axis=1).reshape(head_dim)
-        il_arr = il.reshape(1, 1, head_dim, 1)
-        arr = mx.broadcast_to(il_arr, (1, n_heads, head_dim, w))
+        arr = mx.broadcast_to(head_weight.astype(mx.float32).reshape(1, 1, head_dim, 1),
+                              (1, n_heads, head_dim, w))
         return self.ane.ANETensor.from_buffer(1, n_heads, head_dim, w, memoryview(arr))
 
     def load_weights(self, draft_model: nn.Module, target_model: nn.Module = None):
@@ -212,14 +208,14 @@ class ANEDraftModel:
         setattr(self, f"w_{p}in_norm",
                 self._make_norm_weight_expanded(layer.input_layernorm.weight, self.w_sq))
 
-        q_proj_w_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float16), NH, HD)
-        setattr(self, f"w_{p}q_proj", self._make_weight_buf(q_proj_w_il, NH * HD, H))
+        setattr(self, f"w_{p}q_proj",
+                self._make_weight_buf(sq_w.q_proj.weight.astype(mx.float16), NH * HD, H))
 
         setattr(self, f"w_{p}q_norm_4d",
                 self._make_per_head_norm_weight(sq_w.q_norm.weight, NH, self.w_sq))
 
-        k_proj_w_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float16), NKV, HD)
-        setattr(self, f"w_{p}k_proj", self._make_weight_buf(k_proj_w_il, NKV * HD, H))
+        setattr(self, f"w_{p}k_proj",
+                self._make_weight_buf(sq_w.k_proj.weight.astype(mx.float16), NKV * HD, H))
 
         setattr(self, f"w_{p}k_norm_4d",
                 self._make_per_head_norm_weight(sq_w.k_norm.weight, NKV, self.w_kv))
@@ -302,11 +298,8 @@ class ANEDraftModel:
         H, NH, NKV, HD = self.hidden, self.n_heads, self.n_kv_heads, self.head_dim
         INT = self.intermediate
 
-        q_il = _interleave_head_dims_mx(sq_w.q_proj.weight.astype(mx.float32), NH, HD)
-        wq = self._quantize_weight_q8(q_il.reshape(NH * HD, H))
-
-        k_il = _interleave_head_dims_mx(sq_w.k_proj.weight.astype(mx.float32), NKV, HD)
-        wk = self._quantize_weight_q8(k_il.reshape(NKV * HD, H))
+        wq = self._quantize_weight_q8(sq_w.q_proj.weight.astype(mx.float32).reshape(NH * HD, H))
+        wk = self._quantize_weight_q8(sq_w.k_proj.weight.astype(mx.float32).reshape(NKV * HD, H))
 
         wv = self._quantize_weight_q8(sq_w.v_proj.weight.astype(mx.float32).reshape(NKV * HD, H))
         wo = self._quantize_weight_q8(sq_w.o_proj.weight.astype(mx.float32).reshape(H, NH * HD))
@@ -504,20 +497,23 @@ class ANEDraftModel:
 
         freqs = self._rope_freqs
 
+        # Neox (split-half) RoPE: cos/sin are tiled [f0..f_{hd/2-1}, f0..f_{hd/2-1}]
+        # matching mx.fast.rope(traditional=False) used by the GPU draft model.
+        def _tile(angles):
+            c = mx.concatenate([mx.cos(angles), mx.cos(angles)], axis=1)
+            s = mx.concatenate([mx.sin(angles), mx.sin(angles)], axis=1)
+            return c, s
+
         q_positions = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
-        q_angles = q_positions[:, None] * freqs[None, :]
-        q_cos = mx.repeat(mx.cos(q_angles), 2, axis=1)
-        q_sin = mx.repeat(mx.sin(q_angles), 2, axis=1)
+        q_cos, q_sin = _tile(q_positions[:, None] * freqs[None, :])
         self.b_cos_q.write_buffer(memoryview(q_cos.flatten().astype(mx.float32)))
         self.b_sin_q.write_buffer(memoryview(q_sin.flatten().astype(mx.float32)))
 
         k_ctx_pos = mx.array([rope_offset + p for p in range(ctx_len)], dtype=mx.float32)
         k_noise_pos = mx.array([rope_offset + ctx_len + p for p in range(self.w_sq)], dtype=mx.float32)
 
-        k_ctx_cos = mx.repeat(mx.cos(k_ctx_pos[:, None] * freqs[None, :]), 2, axis=1)
-        k_ctx_sin = mx.repeat(mx.sin(k_ctx_pos[:, None] * freqs[None, :]), 2, axis=1)
-        k_noise_cos = mx.repeat(mx.cos(k_noise_pos[:, None] * freqs[None, :]), 2, axis=1)
-        k_noise_sin = mx.repeat(mx.sin(k_noise_pos[:, None] * freqs[None, :]), 2, axis=1)
+        k_ctx_cos, k_ctx_sin = _tile(k_ctx_pos[:, None] * freqs[None, :])
+        k_noise_cos, k_noise_sin = _tile(k_noise_pos[:, None] * freqs[None, :])
 
         k_cos_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)
         k_sin_full = mx.zeros((1, 1, self.w_kv, HEAD_DIM), dtype=mx.float32)

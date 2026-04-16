@@ -110,6 +110,10 @@ fn tile_kv_heads(
     g.concat(&tiled, 1)
 }
 
+// Neox (split-half) RoPE: matches mx.fast.rope(traditional=False) used by Qwen3.
+// x_rot = cat(-x[hd/2:], x[:hd/2]) along the W dimension.
+// cos/sin are tiled: cos[s, d] == cos[s, d + hd/2] for d < hd/2.
+// No large reshape needed — max ANE height is `seq`, not `seq*hd/2`.
 fn apply_rope(
     g: &mut Graph,
     x: Tensor,
@@ -119,14 +123,12 @@ fn apply_rope(
     seq: usize,
     hd: usize,
 ) -> Tensor {
-    let pairs = seq * hd / 2;
-    let xp = g.reshape(x, Shape { batch: 1, channels: n_heads, height: pairs, width: 2 });
-    let x_e = g.slice(xp, [0, 0, 0, 0], [1, n_heads, pairs, 1]);
-    let x_o = g.slice(xp, [0, 0, 0, 1], [1, n_heads, pairs, 1]);
+    let half = hd / 2;
+    let x1 = g.slice(x, [0, 0, 0, 0],    [1, n_heads, seq, half]);
+    let x2 = g.slice(x, [0, 0, 0, half], [1, n_heads, seq, half]);
     let neg1 = g.constant_with_scalar(-1.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
-    let neg_xo = g.multiplication(x_o, neg1);
-    let rotated = g.concat(&[neg_xo, x_e], 3);
-    let x_rot = g.reshape(rotated, Shape { batch: 1, channels: n_heads, height: seq, width: hd });
+    let neg_x2 = g.multiplication(x2, neg1);
+    let x_rot = g.concat(&[neg_x2, x1], 3);
     let xc = g.multiplication(x, cos);
     let xs = g.multiplication(x_rot, sin);
     g.addition(xc, xs)
