@@ -240,6 +240,8 @@ def main():
                         help="Simulate IDEA-14: run read_output + lm_head-submit "
                              "inside the ANE thread, measure wall time from "
                              "thread.start() to join() as the true step cost.")
+    parser.add_argument("--q8", action="store_true",
+                        help="Use W8A16 int8-quantized ANE kernels (load_weights_q8).")
     args = parser.parse_args()
 
     _header("ANE Draft Step Pipeline Profiler")
@@ -268,7 +270,10 @@ def main():
     vocab_size = getattr(config, 'vocab_size', None) if args.ane_lm_head else None
     ane = ANEDraftModel(seq_q=args.seq_q, ctx_len=args.ctx_len, config=config,
                         vocab_size=vocab_size)
-    ane.load_weights(gpu_draft)
+    if args.q8:
+        ane.load_weights_q8(gpu_draft)
+    else:
+        ane.load_weights(gpu_draft)
     print(f"  ANE compiled+loaded in {time.perf_counter()-t0:.1f}s")
 
     if args.target:

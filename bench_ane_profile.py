@@ -86,7 +86,10 @@ class _ProfiledANEDraftModel:
             k = m.kernels
             t0 = time.perf_counter()
             for i in range(m.n_layers):
-                m._run_layer(k, i)
+                if m.use_q8:
+                    m._run_layer_q8(i)
+                else:
+                    m._run_layer(k, i)
             self.phase_times['layers_total'].append(
                 (time.perf_counter() - t0) * 1e3)
             t0 = time.perf_counter()
@@ -146,44 +149,82 @@ class _ProfiledANEDraftModel:
         for i in range(m.n_layers):
             p = f"l{i}_"
 
-            t0 = time.perf_counter()
-            k['mega_qkv'].run_uncached(
-                [m.b_hidden, getattr(m, f"w_{p}in_norm"),
-                 m.b_context, getattr(m, f"w_{p}k_proj"),
-                 getattr(m, f"w_{p}k_norm_4d"), m.b_cos_k, m.b_sin_k,
-                 getattr(m, f"w_{p}v_proj"), getattr(m, f"w_{p}q_proj"),
-                 getattr(m, f"w_{p}q_norm_4d"), m.b_cos_q, m.b_sin_q],
-                [m.b_k_rope_4d, m.b_v_4d_t, m.b_q_rope_4d],
-            )
-            per_kernel['mega_qkv'].append((time.perf_counter() - t0) * 1e3)
+            if m.use_q8:
+                lk = m.layer_kernels[i]
 
-            t0 = time.perf_counter()
-            k['gqa_tile'].run_uncached(
-                [m.b_k_rope_4d, m.b_v_4d_t], [m.b_kv_tiled],
-            )
-            per_kernel['gqa_tile'].append((time.perf_counter() - t0) * 1e3)
+                t0 = time.perf_counter()
+                lk['mega_qkv_q8'].run_uncached(
+                    [m.b_hidden, getattr(m, f"w_{p}in_norm"),
+                     m.b_context,
+                     getattr(m, f"w_{p}k_norm_4d"), m.b_cos_k, m.b_sin_k,
+                     getattr(m, f"w_{p}q_norm_4d"), m.b_cos_q, m.b_sin_q],
+                    [m.b_k_rope_4d, m.b_v_4d_t, m.b_q_rope_4d],
+                )
+                per_kernel['mega_qkv'].append((time.perf_counter() - t0) * 1e3)
 
-            t0 = time.perf_counter()
-            k['attn_out'].run_uncached(
-                [m.b_q_rope_4d, m.b_kv_tiled, m.b_attn_mask], [m.b_attn_flat],
-            )
-            per_kernel['attn_out'].append((time.perf_counter() - t0) * 1e3)
+                t0 = time.perf_counter()
+                lk['gqa_tile'].run_uncached(
+                    [m.b_k_rope_4d, m.b_v_4d_t], [m.b_kv_tiled],
+                )
+                per_kernel['gqa_tile'].append((time.perf_counter() - t0) * 1e3)
 
-            t0 = time.perf_counter()
-            k['o_proj_residual'].run_uncached(
-                [m.b_attn_flat, getattr(m, f"w_{p}o_proj"), m.b_hidden],
-                [m.b_attn_res],
-            )
-            per_kernel['o_proj_residual'].append((time.perf_counter() - t0) * 1e3)
+                t0 = time.perf_counter()
+                lk['attn_out'].run_uncached(
+                    [m.b_q_rope_4d, m.b_kv_tiled, m.b_attn_mask], [m.b_attn_flat],
+                )
+                per_kernel['attn_out'].append((time.perf_counter() - t0) * 1e3)
 
-            t0 = time.perf_counter()
-            k['ffn_residual'].run_uncached(
-                [m.b_attn_res, getattr(m, f"w_{p}post_norm"),
-                 getattr(m, f"w_{p}gate"), getattr(m, f"w_{p}up"),
-                 getattr(m, f"w_{p}down")],
-                [m.b_hidden],
-            )
-            per_kernel['ffn_residual'].append((time.perf_counter() - t0) * 1e3)
+                t0 = time.perf_counter()
+                lk['o_proj_residual_q8'].run_uncached(
+                    [m.b_attn_flat, m.b_hidden], [m.b_attn_res],
+                )
+                per_kernel['o_proj_residual'].append((time.perf_counter() - t0) * 1e3)
+
+                t0 = time.perf_counter()
+                lk['ffn_residual_q8'].run_uncached(
+                    [m.b_attn_res, getattr(m, f"w_{p}post_norm")],
+                    [m.b_hidden],
+                )
+                per_kernel['ffn_residual'].append((time.perf_counter() - t0) * 1e3)
+            else:
+                t0 = time.perf_counter()
+                k['mega_qkv'].run_uncached(
+                    [m.b_hidden, getattr(m, f"w_{p}in_norm"),
+                     m.b_context, getattr(m, f"w_{p}k_proj"),
+                     getattr(m, f"w_{p}k_norm_4d"), m.b_cos_k, m.b_sin_k,
+                     getattr(m, f"w_{p}v_proj"), getattr(m, f"w_{p}q_proj"),
+                     getattr(m, f"w_{p}q_norm_4d"), m.b_cos_q, m.b_sin_q],
+                    [m.b_k_rope_4d, m.b_v_4d_t, m.b_q_rope_4d],
+                )
+                per_kernel['mega_qkv'].append((time.perf_counter() - t0) * 1e3)
+
+                t0 = time.perf_counter()
+                k['gqa_tile'].run_uncached(
+                    [m.b_k_rope_4d, m.b_v_4d_t], [m.b_kv_tiled],
+                )
+                per_kernel['gqa_tile'].append((time.perf_counter() - t0) * 1e3)
+
+                t0 = time.perf_counter()
+                k['attn_out'].run_uncached(
+                    [m.b_q_rope_4d, m.b_kv_tiled, m.b_attn_mask], [m.b_attn_flat],
+                )
+                per_kernel['attn_out'].append((time.perf_counter() - t0) * 1e3)
+
+                t0 = time.perf_counter()
+                k['o_proj_residual'].run_uncached(
+                    [m.b_attn_flat, getattr(m, f"w_{p}o_proj"), m.b_hidden],
+                    [m.b_attn_res],
+                )
+                per_kernel['o_proj_residual'].append((time.perf_counter() - t0) * 1e3)
+
+                t0 = time.perf_counter()
+                k['ffn_residual'].run_uncached(
+                    [m.b_attn_res, getattr(m, f"w_{p}post_norm"),
+                     getattr(m, f"w_{p}gate"), getattr(m, f"w_{p}up"),
+                     getattr(m, f"w_{p}down")],
+                    [m.b_hidden],
+                )
+                per_kernel['ffn_residual'].append((time.perf_counter() - t0) * 1e3)
 
         self.phase_times['layers_total'].append(
             (time.perf_counter() - t_layers_start) * 1e3
@@ -275,6 +316,8 @@ def main():
                         help="Skip GPU-only spec decode")
     parser.add_argument("--block-size", type=int, default=32,
                         help="ANE draft block size (default: 32; all 1-64 use identical kernels)")
+    parser.add_argument("--q8", action="store_true",
+                        help="Use W8A16 int8-quantized ANE kernels")
     args = parser.parse_args()
 
     import os
@@ -367,7 +410,10 @@ def main():
 
         t0 = time.perf_counter()
         raw_ane = ANEDraftModel(seq_q=ane_block_size, ctx_len=ctx_len, config=config)
-        raw_ane.load_weights(gpu_draft, target_model)
+        if args.q8:
+            raw_ane.load_weights_q8(gpu_draft)
+        else:
+            raw_ane.load_weights(gpu_draft, target_model)
         raw_ane.gpu_fallback = gpu_draft
         print(f"  ANE compiled+loaded in {time.perf_counter()-t0:.1f}s")
 
@@ -550,14 +596,15 @@ def main():
                   f"[min={min(total_vals):.2f}, max={max(total_vals):.2f}]")
 
     # ── 5. Per-kernel breakdown ────────────────────────────────────────────────
-    _section("ANE Per-Kernel Timing  (summed over all layers per call, ms)")
+    use_q8 = any(ane_profiles[c]._m.use_q8 for c in active_depths if c in ane_profiles)
+    _section(f"ANE Per-Kernel Timing  (summed over all layers per call, ms){'  [W8A16 q8]' if use_q8 else ''}")
     kernels = ['mega_qkv', 'gqa_tile', 'attn_out', 'o_proj_residual', 'ffn_residual']
     k_labels = {
-        'mega_qkv'        : 'mega_qkv (Q/K/V + norms + RoPE)',
+        'mega_qkv'        : ('mega_qkv_q8 (Q/K/V+RoPE, w8a16)' if use_q8 else 'mega_qkv (Q/K/V + norms + RoPE)'),
         'gqa_tile'        : 'gqa_tile (GQA KV expand)',
         'attn_out'        : 'attn_out (SDPA)',
-        'o_proj_residual' : 'o_proj_residual',
-        'ffn_residual'    : 'ffn_residual (MLP)',
+        'o_proj_residual' : ('o_proj_residual_q8 (w8a16)' if use_q8 else 'o_proj_residual'),
+        'ffn_residual'    : ('ffn_residual_q8 (MLP, w8a16)' if use_q8 else 'ffn_residual (MLP)'),
     }
     print(f"  Kernel                      {' '.join(f'ctx={c:<6}' for c in active_depths)}")
     _sep("-", 70)

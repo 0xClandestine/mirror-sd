@@ -64,21 +64,40 @@ The primary implementation runs both target and draft models on GPU via MLX.
 
 The `ane/` directory contains a Rust implementation of the DFlash draft model for Apple Neural Engine, using the [ane](https://github.com/ncdrone/ane) crate for direct ANE graph compilation.
 
-The goal: run the target model on GPU and the draft model on ANE in parallel, matching the Mirror-SD paper's heterogeneous accelerator design. On Apple Silicon with unified memory, the draft model's inputs (target hidden states) and outputs (draft logits) can be exchanged with zero-copy.
+The design: run the target model on GPU and the draft model on ANE **in parallel**, matching the Mirror-SD paper's heterogeneous accelerator design. On Apple Silicon with unified memory, the draft model's inputs (target hidden states) and outputs (draft logits) are exchanged with zero-copy.
 
-### The bf16 → f16 Precision Wall
+### Results (M4 Max, Qwen3.5-27B-4bit + z-lab/Qwen3.5-27B-DFlash, ctx=64)
 
-The ANE path is currently **not viable** for speculative decoding. The fundamental problem:
+| Mode | tok/s | α | draft/step | overlap |
+|---|---:|---:|---:|---:|
+| GPU autoregressive (baseline) | ~26 | — | — | — |
+| GPU-only DFlash spec decode | ~40 | ~9 | ~230ms | — |
+| **ANE‖GPU DFlash (fp16)** | **40** | 9.6 | 231ms | 95% |
+| **ANE‖GPU DFlash (W8A16 q8)** | **85** | 17.9 | 191ms | 90% |
 
-- DFlash models are trained and distributed in **bf16** (their native quantization)
-- The ANE operates internally in **f16**
-- Converting bf16 weights → f16 introduces precision loss that tanks the draft model's acceptance rate
+W8A16 quantization cuts draft bandwidth in half (~1.2x kernel speedup) while the quantized draft model achieves higher token acceptance against the fp16 target, combining to **~3.2x over GPU autoregressive**.
 
-Several workarounds (scaled rmsnorm, residual softcapping, attention score softcapping) were implemented and achieve cosine similarity 0.91 vs GPU reference — but the precision loss is enough to degrade acceptance rate below what's needed for a speedup.
+### Architecture
 
-This is a hardware limitation: until Apple Silicon supports bf16 computation on the ANE, or DFlash models are trained in f16, this path cannot succeed.
+```
+  ┌─────────────────────────┐     ┌──────────────────────────────┐
+  │  GPU (target model)     │     │  ANE (draft model, W8A16)    │
+  │  Qwen3.5-27B-4bit       │     │  5 compiled layers/block     │
+  │  verify block (N steps) │◄────│  parallel draft generation   │
+  └─────────────────────────┘     └──────────────────────────────┘
+        unified memory: target_hidden (zero-copy IOSurface)
+```
 
-Full details on ANE constraints are documented in `ane/ANE_RULES.md`.
+Each transformer layer is compiled as 5 ANE kernels with projection weights **baked in as int8 constants** (`constexpr_affine_dequantize` in CoreML MIL). Per-channel fp16 scales allow ANE-side dequantization at runtime. The GPU verify step runs concurrently on the Apple GPU while the ANE drafts.
+
+### Key Engineering Findings
+
+- **QK-norm was the blocker**: ANE `rmsnorm` is global (normalizes all channels at once), but Q/K norm in DFlash is per-head (128 dims/head). Running the global ANE norm produced cosine ~0.5 vs GPU reference and α=2.12. Fix: compute Q/K norms in Python before writing to ANE input buffers.
+- **W8A16 via `constexpr_affine_dequantize`**: CoreML MIL requires attribute-style syntax (data inline in `[]` brackets, not positional args). Weights stored as int8 BLOBFILE with 1D fp16 per-channel scales.
+- **Per-dispatch overhead**: 0.05ms (run_cached/XPC bypass), 0.095ms (daemon path). Use `run_uncached` from background threads.
+- **ANE op-count limit**: ~15–20 ops per kernel compile; >30 ops → `ANECCompile FAILED`.
+
+Full details in `ane/ANE_RULES.md`.
 
 ## Supported Models
 
@@ -184,8 +203,8 @@ mirror_sd/          # MLX implementation
 ├── prompt.py       # Chat template formatting (/no_think for DFlash compatibility)
 └── cli.py          # CLI entry point
 
-ane/                # ANE implementation (Rust + PyO3) — not viable due to bf16→f16 precision loss
-├── ANE_RULES.md    # ANE compiler constraints and bug history
+ane/                # ANE implementation (Rust + PyO3) — W8A16 quantized, ~3.2x over AR baseline
+├── ANE_RULES.md    # ANE compiler constraints, dispatch timing, op-count limits
 
 benchmarks/         # Benchmark data and charts
 references/         # Reference implementations and papers
