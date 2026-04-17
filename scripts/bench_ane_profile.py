@@ -33,7 +33,7 @@ MAX_TOKENS    = 256
 N_WARMUP      = 1
 N_RUNS        = 3
 CTX_DEPTHS    = [64, 128, 256, 512]   # ANE compiled max ctx len variants
-TEMPERATURE   = 0.0
+TEMPERATURE   = 0.6
 
 
 # ── Profiled ANE wrapper ───────────────────────────────────────────────────────
@@ -280,23 +280,29 @@ def _section(title: str):
 
 # ── Run helpers ────────────────────────────────────────────────────────────────
 
-def run_ar(target_model, input_ids, max_tokens, stop_ids):
+def run_ar(target_model, input_ids, max_tokens, stop_ids, tokenizer=None):
     from mirror_sd.generate import ar_generate
-    _, stats = ar_generate(
+    output_ids, stats = ar_generate(
         target_model, input_ids, max_new_tokens=max_tokens,
         stop_token_ids=stop_ids, temperature=TEMPERATURE,
     )
+    if tokenizer is not None:
+        gen_tokens = output_ids[0, input_ids.shape[1]:].tolist()
+        print(f"\n  Output: {tokenizer.decode(gen_tokens, skip_special_tokens=True)!r}")
     return stats
 
 
-def run_spec(target_model, draft_model, input_ids, max_tokens, stop_ids):
+def run_spec(target_model, draft_model, input_ids, max_tokens, stop_ids, tokenizer=None):
     from mirror_sd.generate import spec_generate
-    _, stats, *_ = spec_generate(
+    output_ids, stats, *_ = spec_generate(
         target_model, draft_model, input_ids,
         max_new_tokens=max_tokens,
         stop_token_ids=stop_ids,
         temperature=TEMPERATURE,
     )
+    if tokenizer is not None:
+        gen_tokens = output_ids[0, input_ids.shape[1]:].tolist()
+        print(f"\n  Output: {tokenizer.decode(gen_tokens, skip_special_tokens=True)!r}")
     return stats
 
 
@@ -314,8 +320,8 @@ def main():
                         help="Skip AR baseline (saves ~5 min)")
     parser.add_argument("--skip-gpu",   action="store_true",
                         help="Skip GPU-only spec decode")
-    parser.add_argument("--block-size", type=int, default=32,
-                        help="ANE draft block size (default: 32; all 1-64 use identical kernels)")
+    parser.add_argument("--block-size", type=int, default=16,
+                        help="ANE draft block size (default: 16; all 1-64 use identical kernels)")
     parser.add_argument("--q8", action="store_true",
                         help="Use W8A16 int8-quantized ANE kernels")
     args = parser.parse_args()
@@ -368,7 +374,8 @@ def main():
 
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
-            s = run_ar(target_model, input_ids, max_tokens, stop_ids)
+            s = run_ar(target_model, input_ids, max_tokens, stop_ids,
+                       tokenizer=tokenizer if i == 0 else None)
             ar_results.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)
@@ -387,7 +394,8 @@ def main():
 
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
-            s = run_spec(target_model, gpu_draft, input_ids, max_tokens, stop_ids)
+            s = run_spec(target_model, gpu_draft, input_ids, max_tokens, stop_ids,
+                         tokenizer=tokenizer if i == 0 else None)
             gpu_results.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)
@@ -431,7 +439,8 @@ def main():
         run_list = []
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
-            s = run_spec(target_model, profiled, input_ids, max_tokens, stop_ids)
+            s = run_spec(target_model, profiled, input_ids, max_tokens, stop_ids,
+                         tokenizer=tokenizer if i == 0 else None)
             run_list.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)

@@ -310,11 +310,16 @@ class ANEDraftModel:
         return self.ane.Q8LayerWeights(wq, wk, wv, wo, w_gate, w_up, w_down)
 
     def load_weights_q8(self, draft_model: nn.Module, target_model: nn.Module = None):
-        """Load weights as W8A16 int8 and compile per-layer quantized kernels.
+        """Load weights with W8A16-style quantization and compile per-layer kernels.
 
-        This replaces load_weights() for the quantized inference path.
-        After this call, run_kernels() uses per-layer kernels with baked int8 weights
-        (no fp16 weight IOSurfaces), reducing ANE memory bandwidth by ~2×.
+        The underlying ANE stack is fp16-throughout: int8 values are widened to
+        fp16 (e.g. i8(42) → fp16(42.0)) before being stored in the WeightBlob /
+        IOSurface.  Weight bandwidth at inference is therefore identical to the
+        fp16 path — there is no 2× memory bandwidth reduction.
+
+        What quantization does provide: weights are constrained to integer values
+        in [-127, 127], with a per-channel fp16 scale applied after the conv.
+        The scale multiply is fused with the preceding conv by the ANE compiler.
         """
         # Non-projection weights (fc, norms) — unchanged from fp16 path
         self._load_fc_weights(draft_model)
@@ -393,7 +398,8 @@ class ANEDraftModel:
             )
         k = self.kernels
 
-        self._write_padded(self._padded_hidden, self.b_hidden, noise_embedding)
+        self._write_padded(self._padded_hidden, self.b_hidden,
+                           self._scale_noise_for_ane(noise_embedding))
 
         context = precomputed_context if precomputed_context is not None else self._compute_context(target_hidden)
         self._write_padded(self._padded_context, self.b_context, context)
@@ -428,6 +434,23 @@ class ANEDraftModel:
     def make_cache(self):
         from .dflash import DFlashKVCache
         return [DFlashKVCache() for _ in range(self.n_layers)]
+
+    def _scale_noise_for_ane(self, noise_embedding: mx.array) -> mx.array:
+        """Scale noise_embedding up to avoid fp16 underflow in ANE rmsnorm.
+
+        The ANE in_norm uses a 1/128 prescaling: x_scaled = x/128. For typical
+        token embeddings (rms~0.02) and mask tokens (rms=0), x_scaled^2 underflows
+        to zero in fp16 (min normal ~6e-5). The eps term then dominates, making the
+        normalization wrong and V_noise ~6x too small.
+
+        RMSNorm is scale-invariant: RMSNorm(c*x) = RMSNorm(x) for any c > 0.
+        Pre-scaling to rms >= 1.0 is mathematically equivalent and avoids underflow.
+        The residual error ((scale-1)*noise_rms) is negligible vs attn_out magnitude.
+        """
+        noise_rms = float(mx.sqrt(mx.mean(noise_embedding.astype(mx.float32) ** 2)))
+        if 0 < noise_rms < 1.0:
+            return noise_embedding * (1.0 / noise_rms)
+        return noise_embedding
 
     def _write_padded(self, padded: mx.array, buf, arr: mx.array):
         seq_len = arr.shape[1]
@@ -553,7 +576,8 @@ class ANEDraftModel:
             rope_offset = cache[0].offset
         ctx_len = target_hidden.shape[1]
 
-        self._write_padded(self._padded_hidden, self.b_hidden, noise_embedding)
+        self._write_padded(self._padded_hidden, self.b_hidden,
+                           self._scale_noise_for_ane(noise_embedding))
 
         context = precomputed_context if precomputed_context is not None else self._compute_context(target_hidden)
         self._write_padded(self._padded_context, self.b_context, context)

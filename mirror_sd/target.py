@@ -314,8 +314,6 @@ def forward_with_hidden_states_and_rollback(
         if getattr(layer, 'is_linear', False):
             h, record = _forward_linear_layer_with_record(layer, h, ssm_mask, c)
             rollback_records[i] = record
-        elif inputs.shape[1] > 1 and isinstance(c, KVCache) and c.keys is not None:
-            h = _forward_full_attention_layer_compiled(layer, h, c)
         else:
             h = layer(h, fa_mask, cache=c)
         if i in capture_set:

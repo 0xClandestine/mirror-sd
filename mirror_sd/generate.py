@@ -405,6 +405,9 @@ def spec_generate(
             stop_token_ids, temperature, target_layer_ids,
             override_block_size=override_block_size,
             early_exit_k=early_exit_k,
+            stream_callback=stream_callback,
+            prefill_step_size=prefill_step_size,
+            prompt_cache=prompt_cache,
         )
 
     if mirror_sd:
@@ -1223,7 +1226,7 @@ def _spec_generate_mirror_sd(
 
     output_ids = mx.array([output_ids_list], dtype=mx.int32)
     stats.total_tokens = len(output_ids_list) - num_input_tokens
-    return output_ids, stats
+    return output_ids, stats, target_cache, draft_cache, target_hidden
 
 
 def _pick_exit_layer(target_layer_ids: List[int], num_target_layers: int) -> int:
@@ -1247,7 +1250,10 @@ def _spec_generate_parallel(
     target_layer_ids: Optional[List[int]] = None,
     override_block_size: Optional[int] = None,
     early_exit_k: int = 0,
-) -> Tuple[mx.array, SpecDecodeStats]:
+    stream_callback=None,
+    prefill_step_size: int = 512,
+    prompt_cache=None,
+) -> Tuple[mx.array, SpecDecodeStats, list, list, mx.array]:
     """Parallel ANE||GPU speculative decoding (Mirror-SD Eq. 10).
 
     Pipelines draft and verify so that the next iteration's draft on ANE
@@ -1272,6 +1278,9 @@ def _spec_generate_parallel(
     stats = SpecDecodeStats(parallel_mode=True)
     t_start = time.perf_counter()
 
+    q35 = is_qwen35(target_model)
+    rollback_records = None
+
     embed_fn = get_embed_tokens(target_model)
     lm_head_fn = get_lm_head(target_model)
 
@@ -1287,23 +1296,46 @@ def _spec_generate_parallel(
     if isinstance(output_ids_list, int):
         output_ids_list = [output_ids_list]
 
-    target_cache = cache_module.make_prompt_cache(target_model)
+    target_cache = prompt_cache if prompt_cache is not None else cache_module.make_prompt_cache(target_model)
     draft_cache = draft_model.make_cache()
 
-    # --- Prefill ---
-    logits, embed, hidden_states = forward_with_hidden_states(
-        target_model, input_ids, cache=target_cache, capture_layers=target_layer_ids,
-    )
-    mx.eval(logits, embed, *hidden_states)
-    mx.eval([c.state for c in target_cache])
+    # --- Prefill (chunked) ---
+    num_input = input_ids.shape[1]
+    if num_input > prefill_step_size:
+        print(f"[prefill] {num_input} tokens in chunks of {prefill_step_size}...", flush=True)
+        for chunk_start in range(0, num_input - prefill_step_size, prefill_step_size):
+            chunk = input_ids[:, chunk_start:chunk_start + prefill_step_size]
+            logits_chunk, _, _ = forward_with_hidden_states(
+                target_model, chunk, cache=target_cache, capture_layers=[],
+            )
+            mx.eval(logits_chunk, *_flat_cache_states(target_cache))
+            del logits_chunk
+            print(f"[prefill] {min(chunk_start + prefill_step_size, num_input)}/{num_input}", flush=True)
+        last_start = (num_input // prefill_step_size) * prefill_step_size
+        if last_start >= num_input:
+            last_start = max(0, num_input - prefill_step_size)
+        last_chunk = input_ids[:, last_start:]
+        logits, embed, hidden_states = forward_with_hidden_states(
+            target_model, last_chunk, cache=target_cache, capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
+    else:
+        logits, embed, hidden_states = forward_with_hidden_states(
+            target_model, input_ids, cache=target_cache, capture_layers=target_layer_ids,
+        )
+        first_token = sample(logits[:, -1:, :], temperature)
+        mx.eval(logits, embed, *hidden_states, first_token, *_flat_cache_states(target_cache))
 
-    first_token = sample(logits[:, -1:, :], temperature)
-    mx.eval(first_token)
-    output_ids_list.append(int(first_token[0, 0]))
+    first_tok = int(first_token[0, 0])
+    output_ids_list.append(first_tok)
+    if stream_callback is not None:
+        stream_callback(first_tok)
 
     target_hidden = extract_context_feature(hidden_states, target_layer_ids)
 
     stats.prefill_time = time.perf_counter() - t_start
+    print(f"[prefill] done in {stats.prefill_time*1000:.0f}ms", flush=True)
 
     # --- Decode with pipelined ANE||GPU ---
     start = num_input_tokens
@@ -1463,8 +1495,13 @@ def _spec_generate_parallel(
 
     # Kick off first draft (no GPU verify running yet — no contention).
     # No prior verify logits available yet, so correction_logits=None.
+    # Truncate initial target_hidden to max_ctx_len if the prompt is longer.
+    max_ctx = getattr(draft_model, 'max_ctx_len', target_hidden.shape[1])
+    if target_hidden.shape[1] > max_ctx:
+        target_hidden = target_hidden[:, -max_ctx:, :]
+        mx.eval(target_hidden)
     t_draft_start = time.perf_counter()
-    _start_draft(target_hidden, output_ids_list[-1], draft_cache, 0)
+    _start_draft(target_hidden, output_ids_list[-1], draft_cache, num_input_tokens)
 
     while start < max_length:
         remaining = max_length - start
@@ -1594,10 +1631,17 @@ def _spec_generate_parallel(
                              correction_logits=_prev_correction_logits)
 
             t_verify_start = time.perf_counter()
-            verify_logits, _, verify_hidden = forward_with_hidden_states(
-                target_model, block_output_ids, cache=target_cache,
-                capture_layers=target_layer_ids,
-            )
+            if q35:
+                verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_and_rollback(
+                    target_model, block_output_ids, cache=target_cache,
+                    capture_layers=target_layer_ids,
+                )
+            else:
+                verify_logits, _, verify_hidden = forward_with_hidden_states(
+                    target_model, block_output_ids, cache=target_cache,
+                    capture_layers=target_layer_ids,
+                )
+                rollback_records = None
             posterior = sample(verify_logits, temperature)
             mx.eval(posterior, *verify_hidden)
             mx.eval([c.state for c in target_cache])
@@ -1617,8 +1661,12 @@ def _spec_generate_parallel(
 
         for i in range(acceptance_length):
             output_ids_list.append(draft_tokens[i])
+            if stream_callback is not None:
+                stream_callback(draft_tokens[i])
         correction_token = int(posterior[0, acceptance_length])
         output_ids_list.append(correction_token)
+        if stream_callback is not None:
+            stream_callback(correction_token)
 
         start += acceptance_length + 1
 
@@ -1629,7 +1677,20 @@ def _spec_generate_parallel(
 
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
-            cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
+            if q35 and rollback_records is not None:
+                accepted_inputs = acceptance_length + 1
+                rollback_tensors = [
+                    v for r in rollback_records.values()
+                    for v in r.values() if isinstance(v, mx.array)
+                ]
+                if rollback_tensors:
+                    mx.eval(*rollback_tensors)
+                rollback_linear_caches(target_cache, rollback_records, accepted_inputs)
+                for c in target_cache:
+                    if isinstance(c, KVCache):
+                        c.trim(n_to_trim_target)
+            else:
+                cache_module.trim_prompt_cache(target_cache, n_to_trim_target)
 
         new_target_hidden = mx.concatenate([h[:, :acceptance_length + 1, :] for h in verify_hidden], axis=-1)
 
@@ -1650,10 +1711,13 @@ def _spec_generate_parallel(
         stats.draft_steps += 1
         stats.total_tokens = len(output_ids_list) - num_input_tokens
 
-        # Update target_hidden for the next iteration's _start_draft call.
-        # draft_thread (draft N+1) continues running and is joined at the top of
-        # the next iteration.
-        target_hidden = new_target_hidden
+        # Accumulate target_hidden up to max_ctx_len — mirrors the GPU draft's
+        # growing KV cache.  Without this, the ANE model sees only the last
+        # accepted block (1-32 tokens) from step 2 onwards and generates garbage.
+        target_hidden = mx.concatenate([target_hidden, new_target_hidden], axis=1)
+        if target_hidden.shape[1] > max_ctx:
+            target_hidden = target_hidden[:, -max_ctx:, :]
+        mx.eval(target_hidden)
 
         if stop_token_ids is not None:
             for stop_id in stop_token_ids:
@@ -1681,4 +1745,4 @@ def _spec_generate_parallel(
 
     output_ids = mx.array([output_ids_list], dtype=mx.int32)
     stats.total_tokens = len(output_ids_list) - num_input_tokens
-    return output_ids, stats
+    return output_ids, stats, target_cache, draft_cache, target_hidden

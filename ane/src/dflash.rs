@@ -124,7 +124,7 @@ fn apply_rope(
     hd: usize,
 ) -> Tensor {
     let half = hd / 2;
-    let x1 = g.slice(x, [0, 0, 0, 0],    [1, n_heads, seq, half]);
+    let x1 = g.slice(x, [0, 0, 0, 0], [1, n_heads, seq, half]);
     let x2 = g.slice(x, [0, 0, 0, half], [1, n_heads, seq, half]);
     let neg1 = g.constant_with_scalar(-1.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
     let neg_x2 = g.multiplication(x2, neg1);
@@ -144,7 +144,7 @@ fn conv1x1_proj(g: &mut Graph, input: Tensor, weight: Tensor, oc: usize, ic: usi
 ///
 /// `w`: weight in row-major `[oc, ic]` order, pre-quantized to int8 with per-channel fp16 scales.
 fn conv1x1_proj_q8(g: &mut Graph, input: Tensor, w: Q8Weight) -> Tensor {
-    let w_const = g.quantized_weight_1x1(w.int8_data, w.scales_f16, w.oc, w.ic);
+    let w_const = g.constexpr_quantized_weight_1x1(w.int8_data, w.scales_f16, w.oc, w.ic);
     g.convolution_2d_1x1_dynamic(input, w_const)
 }
 
@@ -338,7 +338,6 @@ pub fn build_ffn_residual_kernel(d: &DFlashDims, w_sq: usize, softcap: f32) -> G
     g
 }
 
-
 pub fn build_final_norm_kernel(d: &DFlashDims, w_sq: usize) -> Graph {
     let mut g = Graph::new();
     let h = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
@@ -450,6 +449,65 @@ pub fn build_ffn_residual_kernel_q8(
     let silu = g.multiplication(gate_out, sig);
     let gate = g.multiplication(silu, up_out);
     let ffn_out = conv1x1_proj_q8(&mut g, gate, w_down);
+
+    let residual = g.addition(h1, ffn_out);
+    if softcap > 0.0 {
+        let inv_cap = g.constant_with_scalar(
+            1.0 / softcap,
+            Shape { batch: 1, channels: 1, height: 1, width: 1 },
+        );
+        let cap_val =
+            g.constant_with_scalar(softcap, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+        let divided = g.multiplication(residual, inv_cap);
+        let tanh_out = g.tanh(divided);
+        let _out = g.multiplication(cap_val, tanh_out);
+    }
+    g
+}
+
+/// Build the ffn_residual kernel with 4-bit LUT-quantized gate/up/down weights baked in.
+///
+/// Each projection weight matrix is quantized to a 16-entry uniform codebook at
+/// graph-build time, reducing BLOBFILE size by ~4× vs fp16.  If ANECCompile()
+/// rejects `constexpr_lut_to_dense`, `compile()` returns an error — check before use.
+///
+/// `gate_f32 / up_f32 / down_f32`: flattened row-major f32 weight matrices.
+///   gate_f32 / up_f32: length = intermediate × hidden  (shape [intermediate, hidden])
+///   down_f32:          length = hidden × intermediate  (shape [hidden, intermediate])
+pub fn build_ffn_residual_kernel_lut4(
+    d: &DFlashDims,
+    w_sq: usize,
+    softcap: f32,
+    gate_f32: &[f32],
+    up_f32: &[f32],
+    down_f32: &[f32],
+) -> Graph {
+    let mut g = Graph::new();
+    let h1 = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let post_norm_w = g.placeholder(Shape { batch: 1, channels: d.hidden, height: 1, width: w_sq });
+    let normed = rmsnorm(&mut g, h1, post_norm_w);
+
+    let w_gate = g.constant_lut4(
+        gate_f32,
+        Shape { batch: d.intermediate, channels: d.hidden, height: 1, width: 1 },
+    );
+    let gate_out = g.convolution_2d_1x1_dynamic(normed, w_gate);
+
+    let w_up = g.constant_lut4(
+        up_f32,
+        Shape { batch: d.intermediate, channels: d.hidden, height: 1, width: 1 },
+    );
+    let up_out = g.convolution_2d_1x1_dynamic(normed, w_up);
+
+    let sig = g.sigmoid(gate_out);
+    let silu = g.multiplication(gate_out, sig);
+    let gate = g.multiplication(silu, up_out);
+
+    let w_down = g.constant_lut4(
+        down_f32,
+        Shape { batch: d.hidden, channels: d.intermediate, height: 1, width: 1 },
+    );
+    let ffn_out = g.convolution_2d_1x1_dynamic(gate, w_down);
 
     let residual = g.addition(h1, ffn_out);
     if softcap > 0.0 {

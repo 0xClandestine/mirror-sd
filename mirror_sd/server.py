@@ -131,9 +131,21 @@ class SpecServer:
         def on_token(tok_id):
             _write_chunk({"content": self.tokenizer.decode([tok_id], skip_special_tokens=True)})
 
+        print(f"[gen] prefill={len(tokens)} tokens, max_new={max_tokens} (streaming)", flush=True)
+        print(f"[gen] prompt tail: {self.tokenizer.decode(tokens[-20:])!r}", flush=True)
+
+        _tok_count = [0]
+        _orig_on_token = on_token
+        def on_token(tok_id):
+            if _tok_count[0] < 20:
+                print(f"[tok] {_tok_count[0]:3d}: id={tok_id}  {self.tokenizer.decode([tok_id])!r}", flush=True)
+            _tok_count[0] += 1
+            _orig_on_token(tok_id)
+
         output_ids, stats = self._do_spec(tokens, max_tokens, temperature, stream_callback=on_token)
 
         gen_count = output_ids.shape[1] - len(tokens)
+        print(f"[gen] {gen_count} tokens @ {stats.tokens_per_sec:.1f} tok/s  α={stats.avg_acceptance_length:.2f}", flush=True)
         _write_chunk({}, finish_reason="stop", usage={
             "prompt_tokens": len(tokens),
             "completion_tokens": gen_count,
@@ -144,9 +156,11 @@ class SpecServer:
         prompt = self._format_prompt(messages)
         tokens = self.tokenizer.encode(prompt)
 
+        print(f"[gen] prefill={len(tokens)} tokens, max_new={max_tokens}", flush=True)
         output_ids, stats = self._do_spec(tokens, max_tokens, temperature)
 
         gen_tokens = output_ids[0, len(tokens):].tolist()
+        print(f"[gen] {len(gen_tokens)} tokens @ {stats.tokens_per_sec:.1f} tok/s  α={stats.avg_acceptance_length:.2f}", flush=True)
         text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
         return {
@@ -221,7 +235,13 @@ class Handler(BaseHTTPRequestHandler):
         srv = Handler.server_instance
         content_length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(content_length)
-        body = json.loads(raw.decode())
+        try:
+            body = json.loads(raw.decode())
+        except Exception as e:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
 
         messages = body.get("messages", [])
         max_tokens = body.get("max_tokens", body.get("max_completion_tokens", 128))
@@ -233,28 +253,40 @@ class Handler(BaseHTTPRequestHandler):
             if not has_system:
                 messages = [{"role": "system", "content": "/no_think"}] + messages
 
-        if stream:
-            self.send_response(200)
-            self.send_header("Content-type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self._set_cors_headers()
-            self.end_headers()
+        try:
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self._set_cors_headers()
+                self.end_headers()
 
-            def write_sse(chunk):
-                data = json.dumps(chunk)
-                self.wfile.write(f"data: {data}\n\n".encode())
+                def write_sse(chunk):
+                    data = json.dumps(chunk)
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+
+                srv.generate_streaming(messages, max_tokens, temperature, write_fn=write_sse)
+                self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-
-            srv.generate_streaming(messages, max_tokens, temperature, write_fn=write_sse)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            result = srv.generate(messages, max_tokens, temperature)
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
+            else:
+                result = srv.generate(messages, max_tokens, temperature)
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self._set_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode())
+        except Exception as e:
+            import traceback, sys
+            traceback.print_exc(file=sys.stderr)
+            try:
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self._set_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            except Exception:
+                pass
 
 
 def main():
@@ -278,24 +310,57 @@ def main():
     parser.add_argument("--turboquant-bits", type=float, default=0.0, help="Enable TurboQuant KV cache at this bit-width (e.g. 2.5, 3.5)")
     parser.add_argument("--auto-ar", action="store_true", help="Auto fallback to AR when acceptance rate is below breakeven")
     parser.add_argument("--auto-ar-threshold", type=float, default=0.35, help="Auto-AR per-token acceptance threshold (default: 0.35)")
+    parser.add_argument("--ane", action="store_true", help="Use ANE draft model (requires compiled Rust extension)")
+    parser.add_argument("--ane-q8", action="store_true", help="Use W8A16 quantized ANE draft (implies --ane)")
+    parser.add_argument("--ane-ctx-len", type=int, default=4096, help="Max context length for ANE kernels (default: 4096)")
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
     print(f"Loading target: {model_path}")
     target_model, tokenizer = mlx_load(model_path)
     print(f"Loading draft:  {args.draft}")
-    draft_model, config = load_dflash_model(args.draft, quantize=args.quantize_draft)
+    gpu_draft, config = load_dflash_model(args.draft, quantize=args.quantize_draft)
     if args.block_size is not None:
         config.block_size = args.block_size
-        draft_model.block_size = args.block_size
+        gpu_draft.block_size = args.block_size
+
+    if args.ane or args.ane_q8:
+        from .ane_model import ANEDraftModel
+        seq_q = config.block_size
+        print(f"Compiling ANE kernels (seq_q={seq_q}, ctx_len={args.ane_ctx_len})...")
+        ane = ANEDraftModel(seq_q=seq_q, ctx_len=args.ane_ctx_len, config=config)
+        if args.ane_q8:
+            ane.load_weights_q8(gpu_draft)
+            print("  ANE W8A16 (q8) ready")
+        else:
+            ane.load_weights(gpu_draft)
+            print("  ANE fp16 ready")
+        draft_model = ane
+    else:
+        draft_model = gpu_draft
 
     srv = SpecServer(target_model, draft_model, tokenizer, config, args)
     Handler.server_instance = srv
 
+    print("Warming up (compiling MLX kernels)...")
+    _warmup_tokens = tokenizer.encode("Hello")
+    _warmup_ids = mx.array(_warmup_tokens)[None]
+    try:
+        spec_generate(
+            target_model, draft_model, _warmup_ids,
+            max_new_tokens=config.block_size + 1,
+            stop_token_ids=get_stop_token_ids(tokenizer),
+            prefill_step_size=args.prefill_step_size,
+        )
+        print("Warmup complete.")
+    except Exception as e:
+        print(f"Warmup failed (non-fatal): {e}")
+
     ThreadingHTTPServer.allow_reuse_address = True
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    ane_tag = "+ANE-Q8" if args.ane_q8 else ("+ANE" if args.ane else "")
     mode = "DFlash+KOD" if args.kod else ("DFlash+ADAPTIVE" if not args.no_adaptive else "DFlash")
-    print(f"Serving {mode} (block_size={config.block_size}) on http://{args.host}:{args.port}")
+    print(f"Serving {mode}{ane_tag} (block_size={config.block_size}) on http://{args.host}:{args.port}")
     print(f"  model: {srv.model_name}")
     print(f"  prompt cache: {args.cache_size} entries")
     try:

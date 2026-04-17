@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod bench_dflash;
 mod dflash;
 mod wrapper;
 

@@ -59,6 +59,33 @@ pip install -e .
 
 `maturin develop` compiles the Rust kernels and installs the `ane` Python extension in-place. The `UV_CONFIG_FILE=/dev/null` bypasses any local uv config that can interfere with maturin's build.
 
+## API Server
+
+OpenAI-compatible server (`/v1/chat/completions`, `/v1/models`):
+
+```bash
+python -m mirror_sd.server \
+  --model ~/.omlx/models/Qwen3.5-27B-4bit \
+  --draft z-lab/Qwen3.5-27B-DFlash \
+  --ane-q8
+```
+
+`--ane-q8` enables the W8A16 ANE draft path. First startup compiles ANE kernels (~80s). The server logs tok/s and acceptance rate after each request:
+
+```
+[gen] 312 tokens @ 83.4 tok/s  α=17.8
+```
+
+Key flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ane-q8` | off | W8A16 ANE draft (fastest) |
+| `--ane` | off | fp16 ANE draft |
+| `--ane-ctx-len` | 4096 | Max context for ANE kernels |
+| `--port` | 8989 | Port |
+| `--no-think` | off | Disable Qwen3 thinking mode |
+
 ## Benchmark
 
 ```bash
