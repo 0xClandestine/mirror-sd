@@ -1264,6 +1264,8 @@ def forward_suffix(
 
     if hasattr(model, 'lm_head') and model.lm_head is not None:
         logits = model.lm_head(h)
+    elif hasattr(model, 'language_model') and hasattr(model.language_model, 'lm_head'):
+        logits = model.language_model.lm_head(h)
     else:
         logits = inner.embed_tokens.as_linear(h)
 

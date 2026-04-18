@@ -1625,11 +1625,10 @@ def _spec_generate_parallel(
             mx.eval(posterior, *verify_hidden)
             mx.eval([c.state for c in target_cache[early_exit_k:]])
         else:
-            # --- Standard path: start draft with soft anchor, verify in full ---
-            if start < max_length:
-                _start_draft(target_hidden, output_ids_list[-1], draft_cache, start,
-                             correction_logits=_prev_correction_logits)
-
+            # --- Standard path: verify in full, then start draft with correct anchor ---
+            # Draft starts AFTER verify so it uses correction_token_N (not stale N-1).
+            # ANE draft = ~39ms; serial step = verify(~187ms) + draft(~39ms) = ~226ms.
+            # At α≈6, this yields ~35 tok/s vs ~5 tok/s with stale parallel anchor.
             t_verify_start = time.perf_counter()
             if q35:
                 verify_logits, _, verify_hidden, rollback_records = forward_with_hidden_states_and_rollback(
@@ -1677,15 +1676,16 @@ def _spec_generate_parallel(
 
         n_to_trim_target = current_block_size - acceptance_length - 1
         if n_to_trim_target > 0:
-            if q35 and rollback_records is not None:
+            if q35:
                 accepted_inputs = acceptance_length + 1
-                rollback_tensors = [
-                    v for r in rollback_records.values()
-                    for v in r.values() if isinstance(v, mx.array)
-                ]
-                if rollback_tensors:
-                    mx.eval(*rollback_tensors)
-                rollback_linear_caches(target_cache, rollback_records, accepted_inputs)
+                if rollback_records is not None:
+                    rollback_tensors = [
+                        v for r in rollback_records.values()
+                        for v in r.values() if isinstance(v, mx.array)
+                    ]
+                    if rollback_tensors:
+                        mx.eval(*rollback_tensors)
+                    rollback_linear_caches(target_cache, rollback_records, accepted_inputs)
                 for c in target_cache:
                     if isinstance(c, KVCache):
                         c.trim(n_to_trim_target)
@@ -1718,6 +1718,14 @@ def _spec_generate_parallel(
         if target_hidden.shape[1] > max_ctx:
             target_hidden = target_hidden[:, -max_ctx:, :]
         mx.eval(target_hidden)
+
+        # Start next draft now that we have: correct anchor (output_ids_list[-1] =
+        # correction_token_N), updated target_hidden, and correct start position.
+        # _prev_correction_logits is from this step's verify (set above), so the
+        # soft anchor is also accurate — it samples around the real correction token.
+        if start < max_length and early_exit_k == 0:
+            _start_draft(target_hidden, output_ids_list[-1], draft_cache, start,
+                         correction_logits=_prev_correction_logits)
 
         if stop_token_ids is not None:
             for stop_id in stop_token_ids:

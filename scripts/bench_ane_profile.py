@@ -280,11 +280,11 @@ def _section(title: str):
 
 # ── Run helpers ────────────────────────────────────────────────────────────────
 
-def run_ar(target_model, input_ids, max_tokens, stop_ids, tokenizer=None):
+def run_ar(target_model, input_ids, max_tokens, stop_ids, tokenizer=None, temperature=TEMPERATURE):
     from mirror_sd.generate import ar_generate
     output_ids, stats = ar_generate(
         target_model, input_ids, max_new_tokens=max_tokens,
-        stop_token_ids=stop_ids, temperature=TEMPERATURE,
+        stop_token_ids=stop_ids, temperature=temperature,
     )
     if tokenizer is not None:
         gen_tokens = output_ids[0, input_ids.shape[1]:].tolist()
@@ -292,13 +292,13 @@ def run_ar(target_model, input_ids, max_tokens, stop_ids, tokenizer=None):
     return stats
 
 
-def run_spec(target_model, draft_model, input_ids, max_tokens, stop_ids, tokenizer=None):
+def run_spec(target_model, draft_model, input_ids, max_tokens, stop_ids, tokenizer=None, temperature=TEMPERATURE):
     from mirror_sd.generate import spec_generate
     output_ids, stats, *_ = spec_generate(
         target_model, draft_model, input_ids,
         max_new_tokens=max_tokens,
         stop_token_ids=stop_ids,
-        temperature=TEMPERATURE,
+        temperature=temperature,
     )
     if tokenizer is not None:
         gen_tokens = output_ids[0, input_ids.shape[1]:].tolist()
@@ -320,10 +320,14 @@ def main():
                         help="Skip AR baseline (saves ~5 min)")
     parser.add_argument("--skip-gpu",   action="store_true",
                         help="Skip GPU-only spec decode")
+    parser.add_argument("--skip-ane",   action="store_true",
+                        help="Skip ANE spec decode section")
     parser.add_argument("--block-size", type=int, default=16,
                         help="ANE draft block size (default: 16; all 1-64 use identical kernels)")
     parser.add_argument("--q8", action="store_true",
                         help="Use W8A16 int8-quantized ANE kernels")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help=f"Sampling temperature (default: {TEMPERATURE})")
     args = parser.parse_args()
 
     import os
@@ -333,6 +337,7 @@ def main():
     n_runs      = args.runs
     ctx_depths  = args.ctx_depths
     ane_block_size = args.block_size
+    temperature = TEMPERATURE if args.temperature is None else args.temperature
 
     _header("ANE DFlash Comprehensive Profile")
     print(f"  Target model : {model_path}")
@@ -342,6 +347,7 @@ def main():
     print(f"  Timed runs   : {n_runs}")
     print(f"  CTX depths   : {ctx_depths}")
     print(f"  Prompt len   : {len(PROMPT)} chars")
+    print(f"  Temperature  : {temperature}")
 
     # ── Load models ───────────────────────────────────────────────────────────
     _section("Loading models")
@@ -370,12 +376,12 @@ def main():
         _section("1 / AR Baseline (GPU autoregressive)")
         print(f"  Warmup ({n_warmup})…", flush=True)
         for _ in range(n_warmup):
-            run_ar(target_model, input_ids, max_tokens, stop_ids)
+            run_ar(target_model, input_ids, max_tokens, stop_ids, temperature=temperature)
 
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
             s = run_ar(target_model, input_ids, max_tokens, stop_ids,
-                       tokenizer=tokenizer if i == 0 else None)
+                       tokenizer=tokenizer if i == 0 else None, temperature=temperature)
             ar_results.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)
@@ -390,12 +396,12 @@ def main():
         _section("2 / GPU-only DFlash Spec Decode")
         print(f"  Warmup ({n_warmup})…", flush=True)
         for _ in range(n_warmup):
-            run_spec(target_model, gpu_draft, input_ids, max_tokens, stop_ids)
+            run_spec(target_model, gpu_draft, input_ids, max_tokens, stop_ids, temperature=temperature)
 
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
             s = run_spec(target_model, gpu_draft, input_ids, max_tokens, stop_ids,
-                         tokenizer=tokenizer if i == 0 else None)
+                         tokenizer=tokenizer if i == 0 else None, temperature=temperature)
             gpu_results.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)
@@ -411,9 +417,12 @@ def main():
     ane_profiles:      Dict[int, _ProfiledANEDraftModel] = {}
 
     _section("3 / ANE DFlash Spec Decode (parallel ANE || GPU)")
-    from mirror_sd.ane_model import ANEDraftModel
+    if args.skip_ane:
+        print("  [ANE spec decode skipped]")
+    else:
+        from mirror_sd.ane_model import ANEDraftModel
 
-    for ctx_len in ctx_depths:
+    for ctx_len in ([] if args.skip_ane else ctx_depths):
         print(f"\n  ── ctx_len={ctx_len} ──", flush=True)
 
         t0 = time.perf_counter()
@@ -431,7 +440,7 @@ def main():
         profiled.disable()
         print(f"  Warmup ({n_warmup})…", flush=True)
         for _ in range(n_warmup):
-            run_spec(target_model, profiled, input_ids, max_tokens, stop_ids)
+            run_spec(target_model, profiled, input_ids, max_tokens, stop_ids, temperature=temperature)
 
         # Timed runs (profiling on)
         profiled.enable()
@@ -440,7 +449,7 @@ def main():
         print(f"  Timing ({n_runs} runs)…", flush=True)
         for i in range(n_runs):
             s = run_spec(target_model, profiled, input_ids, max_tokens, stop_ids,
-                         tokenizer=tokenizer if i == 0 else None)
+                         tokenizer=tokenizer if i == 0 else None, temperature=temperature)
             run_list.append(s)
             gen_s = s.total_time - s.prefill_time
             tps   = s.total_tokens / max(gen_s, 1e-9)
