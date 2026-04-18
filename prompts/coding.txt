@@ -1,0 +1,7 @@
+Write a Python implementation of a least-recently-used (LRU) cache with O(1) get and put operations. The cache should support:
+1. get(key) - Return the value if key exists, otherwise return -1
+2. put(key, value) - Insert or update the value. When the cache reaches capacity, evict the least recently used item.
+
+Use a combination of a hash map and a doubly-linked list. Include a __repr__ method that shows the cache contents in order from most to least recently used. Add comprehensive unit tests using pytest that verify correctness, eviction behavior, and update-on-access ordering.
+
+After the LRU cache, implement a thread-safe version using a reentrant lock, and demonstrate that concurrent reads and writes don't corrupt the internal state. Include a benchmark comparing the single-threaded and thread-safe versions for 100K operations.

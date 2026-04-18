@@ -15,7 +15,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .dflash import DFlashConfig
+from .model import DFlashConfig
+from .cache import DFlashKVCache
 
 
 HIDDEN = 4096
@@ -123,7 +124,7 @@ class ANEDraftModel:
         self.b_context = ane.ANETensor(1, H, 1, w_ctx)
         self.b_hidden = ane.ANETensor(1, H, 1, w_sq)
 
-        self.b_k_rope_4d = ane.ANETensor(1, NKV, w_kv, HD)
+self.b_k_rope_4d = ane.ANETensor(1, NKV, w_kv, HD)
         self.b_v_4d_t = ane.ANETensor(1, NKV, w_kv, HD)
         self.b_q_rope_4d = ane.ANETensor(1, NH, w_sq, HD)
 
@@ -237,6 +238,7 @@ class ANEDraftModel:
                 self._make_weight_buf(layer.mlp.down_proj.weight, H, self.intermediate))
 
     def _load_final_norm_weights(self, model: nn.Module):
+def _load_final_norm_weights(self, model: nn.Module):
         self.w_final_norm = self._make_norm_weight_expanded(model.norm.weight, self.w_sq)
 
     def _load_lm_head_weights(self, target_model: nn.Module):
@@ -426,8 +428,7 @@ class ANEDraftModel:
                            precomputed_context=precomputed_context)
 
     def make_cache(self):
-        from .dflash import DFlashKVCache
-        return [DFlashKVCache() for _ in range(self.n_layers)]
+return [DFlashKVCache() for _ in range(self.n_layers)]
 
     def _write_padded(self, padded: mx.array, buf, arr: mx.array):
         seq_len = arr.shape[1]

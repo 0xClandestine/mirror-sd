@@ -46,6 +46,28 @@ def wait_for_server(url, proc, timeout=60):
     return False
 
 
+def warmup_server(url, model_name):
+    """Send a short request to trigger MLX JIT compilation before benchmarking."""
+    import json as _json
+    payload = _json.dumps({
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+        "temperature": 0.0,
+    }).encode()
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=120)
+        print("  Warmup complete.")
+    except Exception as e:
+        print(f"  Warmup warning: {e}")
+
+
 def run_llama_benchy(base_url, model_name, depths, pp, tg, runs, tokenizer, save_result, latency_mode="generation"):
     cmd = [
         sys.executable, "-m", "llama_benchy",
@@ -56,7 +78,6 @@ def run_llama_benchy(base_url, model_name, depths, pp, tg, runs, tokenizer, save
         "--depth", *[str(d) for d in depths],
         "--runs", str(runs),
         "--latency-mode", latency_mode,
-        "--enable-prefix-caching",
     ]
     if tokenizer:
         cmd.extend(["--tokenizer", tokenizer])
@@ -124,8 +145,8 @@ def build_spec_cmd(model_path, draft_path, port, model_name, args, cfg):
     ]
     if cfg.get("kod"):
         cmd.append("--kod")
-    if args.no_adaptive:
-        cmd.append("--no-adaptive")
+    if args.adaptive_block:
+        cmd.append("--adaptive-block")
     if args.block_size:
         cmd.extend(["--block-size", str(args.block_size)])
     if args.quantize_draft:
@@ -140,7 +161,7 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="Target model path")
     parser.add_argument("--draft", type=str, required=True, help="DFlash draft model path")
     parser.add_argument("--model-name", type=str, default=None, help="Model name for API")
-    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive block size")
+    parser.add_argument("--adaptive-block", action="store_true", help="Enable adaptive block size (default: off)")
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--quantize-draft", type=int, default=None, choices=[4, 8])
     parser.add_argument("--spec-port", type=int, default=8989, help="Port for spec server")
@@ -168,9 +189,9 @@ def main():
 
     results = []
 
-    def start_server(cmd, url, label):
+    def start_server(cmd, url, label, env=None):
         print(f"\n  Starting {label} server...")
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, env=env)
         if not wait_for_server(url, proc):
             if proc.poll() is not None:
                 print(f"ERROR: {label} server crashed (exit code {proc.returncode})")
@@ -202,14 +223,18 @@ def main():
                 sys.executable, "-m", "mlx_lm", "server",
                 "--model", model_path,
                 "--port", str(args.baseline_port),
+                "--host", "0.0.0.0",
             ]
-            proc = start_server(baseline_cmd, baseline_url, "Baseline")
+            env = os.environ.copy()
+            env["HF_HUB_OFFLINE"] = "1"
+            proc = start_server(baseline_cmd, baseline_url, "Baseline", env=env)
+            warmup_server(baseline_url, model_path)
 
             print(f"\n{'='*60}")
             print(f"  BENCHMARKING: Baseline (autoregressive)")
             print(f"{'='*60}")
             rc = run_llama_benchy(
-                baseline_url, model_name, args.depth, args.pp, args.tg, args.runs,
+                baseline_url, model_path, args.depth, args.pp, args.tg, args.runs,
                 tokenizer, tmp, args.latency_mode,
             )
             if rc != 0:
@@ -236,6 +261,7 @@ def main():
             try:
                 cmd = build_spec_cmd(model_path, args.draft, args.spec_port, model_name, args, cfg)
                 proc = start_server(cmd, spec_url, cfg["label"])
+                warmup_server(spec_url, model_name)
 
                 print(f"\n{'='*60}")
                 print(f"  BENCHMARKING: {cfg['label']}")

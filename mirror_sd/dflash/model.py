@@ -2,25 +2,6 @@
 
 Implements the DFlash block-diffusion draft model architecture from
 "DFlash: Block Diffusion for Flash Speculative Decoding" (arXiv:2602.06036).
-
-Architecture (from z-lab/Qwen3-8B-DFlash-b16):
-  fc:           Linear(num_target_features * hidden_size -> hidden_size) - fuses target hidden states
-  hidden_norm:  RMSNorm(hidden_size)
-  layers:       5 x Qwen3DFlashDecoderLayer (target-aware attention + MLP)
-  norm:         RMSNorm(hidden_size) - final norm before target's lm_head
-
-Key design (from Section 4.1 of the DFlash paper):
-  - Target context features are extracted from 5 layers of the target model
-  - Features are fused via fc + hidden_norm into a compact context vector
-  - Context vector is injected into K/V projections of EVERY draft layer
-  - K/V come from both target context (ctx) and draft positions (noise)
-  - All masked positions decoded in parallel (block diffusion, non-causal)
-  - Draft model shares embedding and lm_head with the target model
-
-Critical implementation details vs PyTorch reference:
-  - RoPE is applied to [k_ctx, k_noise] with correct positions for each segment
-  - Draft KV cache accumulates verified prefix and gets cropped after rejection
-  - Non-causal (full) attention mask is explicitly constructed for block diffusion
 """
 
 import math
@@ -29,6 +10,8 @@ from typing import Any, Optional, Tuple, List
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from .cache import DFlashKVCache
 
 
 @dataclass
@@ -130,106 +113,11 @@ def extract_context_feature(
     return mx.concatenate(selected, axis=-1)
 
 
-def sample(logits: mx.array, temperature: float = 0.0) -> mx.array:
-    if temperature < 1e-5:
-        return mx.argmax(logits, axis=-1)
-    return mx.random.categorical(logits / temperature, axis=-1)
-
-
-class DFlashKVCache:
-    """KV cache for the DFlash draft model.
-
-    Unlike the standard KVCache, this supports:
-    - Explicit position tracking (not offset-based) for correct RoPE on
-      concatenated [context, noise] keys
-    - Cropping to discard rejected tokens after verification (like the
-      PyTorch reference's DynamicCache.crop)
-    - Full bidirectional attention within the draft (non-causal)
-    - Optional sliding window with sink to prevent unbounded memory growth
-
-    The cache stores K/V from the verified prefix so that subsequent
-    draft blocks can attend to already-accepted tokens.
-
-    When sink_size and window_size are set, the cache retains the first
-    sink_size positions (sink) and the most recent window_size positions,
-    evicting middle positions when the cache exceeds
-    sink_size + window_size. The offset tracks the total number of
-    positions processed (for correct RoPE), independent of actual
-    cache length.
-    """
-
-    def __init__(self, sink_size: int = 0, window_size: int = 0):
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self.sink_size = int(sink_size)
-        self.window_size = int(window_size)
-
-    def update_and_fetch(self, keys: mx.array, values: mx.array):
-        if self.keys is None:
-            self.keys = keys
-            self.values = values
-        else:
-            self.keys = mx.concatenate([self.keys, keys], axis=2)
-            self.values = mx.concatenate([self.values, values], axis=2)
-        self.offset += keys.shape[2]
-        self._apply_window()
-        return self.keys, self.values
-
-    def _apply_window(self):
-        if self.sink_size <= 0 or self.window_size <= 0:
-            return
-        if self.keys is None or self.values is None:
-            return
-        cache_len = int(self.keys.shape[2])
-        max_len = self.sink_size + self.window_size
-        if cache_len <= max_len:
-            return
-        sink_k = self.keys[:, :, :self.sink_size, :]
-        sink_v = self.values[:, :, :self.sink_size, :]
-        window_k = self.keys[:, :, -self.window_size:, :]
-        window_v = self.values[:, :, -self.window_size:, :]
-        self.keys = mx.concatenate([sink_k, window_k], axis=2)
-        self.values = mx.concatenate([sink_v, window_v], axis=2)
-
-    def trim(self, n: int):
-        """Remove the last n positions from the cache.
-
-        After each draft step, trim(n) removes the noise positions (the
-        speculative draft tokens) while keeping the context positions from
-        the verified prefix. This matches dflash-mlx's
-        trim_draft_cache(cache, block_size).
-        """
-        if self.keys is not None and n > 0:
-            new_length = max(self.keys.shape[2] - n, 0)
-            self.keys = self.keys[..., :new_length, :]
-            self.values = self.values[..., :new_length, :]
-            self.offset -= n
-
-    def state(self):
-        if self.keys is None:
-            return []
-        return [self.keys, self.values]
-
-
 def make_draft_mask(
     q_len: int,
     ctx_len: int,
     dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
-    """Create a non-causal (bidirectional) attention mask for DFlash draft.
-
-    DFlash uses block diffusion where all noise positions attend to each
-    other and to all context positions. The mask shape is
-    [1, 1, q_len, cache_len + ctx_len + q_len] where:
-      - cache_len: previously verified tokens from draft KV cache
-      - ctx_len: target context positions (injected into K/V this step)
-      - q_len: noise/query positions (draft tokens being decoded)
-
-    All query positions can attend to all key positions (full bidirectional).
-    Returns None when no masking is needed (MLX SDPA defaults to full
-    attention without a mask, which is exactly what DFlash wants).
-    """
     return None
 
 
