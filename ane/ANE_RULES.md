@@ -7,7 +7,14 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - All placeholder tensors must have width >= 64
 - Align: `((w + 63) / 64) * 64`
 
-## RMSNorm
+## RMSNorm (CRITICAL: was LayerNorm until bug fix)
+
+- **Bug**: `rmsnorm_with_eps` previously subtracted the mean before squaring (`diff = x - mean(x); sq = diff²`). This computes **variance** (LayerNorm), not **mean-of-squares** (RMSNorm).
+- The 1/128 scaling cancels algebraically for RMSNorm but the mean subtraction does NOT cancel.
+- **Fix**: Remove mean subtraction. Compute `sq = x²` directly, then `mean_sq = reduce_mean(sq)`. This gives true RMSNorm: `x / sqrt(mean(x²) + eps) * w`.
+- For 4096-dim hidden states, the mean is typically small and the LayerNorm/RMSNorm difference is tolerable (~0.998 cosine). For 128-dim per-head Q/K norms, the difference is severe (~0.5 cosine).
+- Since Q/K norms are now computed in Python (FP32), the ANE rmsnorm bug only affects: input_layernorm, post_attention_layernorm, fc_norm, final_norm.
+
 - `rsqrt`/`sqrt` after `reduce` ops **fails** — use `pow(-0.5)` instead
 - Learned weight: multiply `normed * weight` after `x * inv_std`
 - **Weight spatial width MUST match input spatial width** — ANE does NOT broadcast mismatched spatial dims
@@ -100,6 +107,12 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - RoPE cos/sin tables must be runtime inputs (not constants) since positions change per iteration
 - apply_rope alone compiles fine; **two apply_rope calls in one kernel exceeds op limit** — must split
 - K RoPE workaround: use single apply_rope on full K sequence with precomputed cos/sin that already map correct position IDs for ctx and noise segments
+- **CRITICAL: K buffer position mapping** — The ANE packs context + noise along the width dimension. Context occupies positions `[0:ctx_len]`, padding `[ctx_len:w_ctx]`, noise `[w_ctx:w_ctx+seq_q]`, padding `[w_ctx+seq_q:w_kv]`. When reading K for RoPE, you MUST extract context and noise from the correct positions (not a contiguous `[0:kv_len]` slice). Writing back must also place them at the correct buffer positions.
+- **Standalone qk_rope kernel fails at ANE runtime** (status 0x1d) because `apply_rope` reshapes to `[1, heads, pairs, 2]` where width=2 < MIN_SPATIAL_WIDTH(64). In fused kernels the ANE compiler handles intermediate shapes, but standalone kernels must respect minimum spatial width. **Solution**: compute RoPE in Python/GPU instead.
+- Cannot use built-in ops — must implement manually: reshape to pairs, slice even/odd, negate odd, concat, reshape, multiply by cos/sin, add
+- RoPE cos/sin tables must be runtime inputs (not constants) since positions change per iteration
+- apply_rope alone compiles fine; **two apply_rope calls in one kernel exceeds op limit** — must split
+- K RoPE workaround: use single apply_rope on full K sequence with precomputed cos/sin that already map correct position IDs for ctx and noise segments
 
 ### Interleaved vs Half-Rotation RoPE
 - Qwen3 uses **half-rotation** RoPE: pairs dimension `d` with `d + head_dim/2` (i.e., `[x0,...,x63, x64,...,x127]` → rotate `[x0,x64], [x1,x65], ...`).
@@ -145,7 +158,20 @@ Empirically discovered constraints for Apple Neural Engine graph compilation.
 - **Fix 3: Attention score softcapping** — apply `cap * tanh(scores / cap)` before softmax in `attn_out` kernel. Prevents softmax overflow from large attention scores.
 - With all three fixes: cosine similarity = 0.91 vs GPU (no inf/nan)
 
-## Proven kernel splits (DFlash per layer — CURRENT with mega_qkv + softcapping)
+## Proven kernel splits (DFlash per layer — CURRENT: split pipeline + true RMSNorm)
+
+1. `fc_norm`: conv1x1(fc) + true_rmsnorm (Python-computed context) ✓
+2. `mega_proj`: true_rmsnorm(input) → Q/K/V projections (input-pack) → outputs in [heads, seq, HEAD_DIM] format ✓
+   - K: [1, N_KV_HEADS, w_kv, HEAD_DIM] (transposed, interleaved)
+   - V: [1, N_KV_HEADS, w_kv, HEAD_DIM] (transposed, standard)
+   - Q: [1, N_HEADS, w_sq, HEAD_DIM] (transposed, interleaved)
+3. **Python round-trip**: de-interleave → RMSNorm(FP32) → RoPE(FP32) → re-interleave → write back ✓
+   - K context/noise extracted from correct buffer positions (Bug #10 fix)
+4. `gqa_tile`: tile_kv_heads + concat K/V ✓
+5. `attn_out`: SDPA with attention score softcapping ✓
+6. `o_proj_residual`: conv1x1(o_proj) + residual add + softcapping ✓
+7. `ffn_residual`: true_rmsnorm → 2×conv1x1 → swiglu → conv1x1 → residual add + softcapping ✓
+8. `final_norm`: true_rmsnorm ✓
 1. `fc_norm`: conv1x1(fc) + scaled_rmsnorm ✓
 2. `mega_qkv`: scaled_rmsnorm(input) → Q/K/V projections (input-pack) → per-head norms → RoPE ✓ (3 outputs: k_rope_4d, v_4d_t, q_rope_4d)
 3. `gqa_tile`: tile_kv_heads + concat K/V ✓

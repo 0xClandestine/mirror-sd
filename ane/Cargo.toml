@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 numpy = "0.24"
 ane = { path = "../references/ane/crates/ane" }
+objc2-io-surface = "0.3.2"

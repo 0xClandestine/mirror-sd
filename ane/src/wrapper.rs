@@ -1,5 +1,7 @@
+use std::ptr;
 use std::time::Instant;
 
+use objc2_io_surface::IOSurfaceLockOptions;
 use pyo3::prelude::*;
 
 use ane::{Executable, Graph, NSQualityOfService, Shape, TensorData};
@@ -73,9 +75,87 @@ impl ANETensor {
         Ok(())
     }
 
-    fn read_f32(&self) -> PyResult<Vec<f32>> {
-        let slice = self.inner.as_f32_slice();
-        Ok(slice.to_vec())
+    /// Write fp16 data directly into the ANE buffer (no f32 conversion).
+    ///
+    /// `buf` must be a Python buffer whose raw bytes are IEEE 754 fp16 values
+    /// (2 bytes per element, little-endian). Equivalent to `write_buffer` but
+    /// skips the f32→fp16 NEON conversion — use this when the source data is
+    /// already fp16 (e.g. from `mx.float16` arrays).
+    fn write_buffer_f16(&self, py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = buf.call_method0("tobytes")?;
+        let raw: &[u8] = bytes.downcast::<pyo3::types::PyBytes>()?.as_bytes();
+        let u16_count = raw.len() / 2;
+        // Copy fp16 bits into a Vec before releasing the GIL so the Python
+        // buffer cannot be mutated while we write to the IOSurface.
+        let data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const u16, u16_count).to_vec()
+        };
+        let surface = self.inner.surface();
+        py.allow_threads(|| unsafe {
+            surface.lockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
+            let dst = std::slice::from_raw_parts_mut(
+                surface.baseAddress().as_ptr().cast::<u16>(),
+                u16_count,
+            );
+            dst.copy_from_slice(&data);
+            surface.unlockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
+        });
+        Ok(())
+    }
+
+    /// Return argmax over the channels (vocab) dimension for each of the first `seq_len`
+    /// spatial positions.  Expects buffer shape [1, vocab_size, 1, w_sq] (fp16 IOSurface).
+    fn read_argmax(&self, py: Python<'_>, seq_len: usize, vocab_size: usize) -> PyResult<Vec<i32>> {
+        let w_sq = self.inner.shape().width;
+        let total = vocab_size * w_sq;
+        let surface = self.inner.surface();
+        let argmax = py.allow_threads(|| {
+            let mut result = vec![0i32; seq_len];
+            unsafe {
+                surface.lockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+                let src = std::slice::from_raw_parts(
+                    surface.baseAddress().as_ptr().cast::<u16>(),
+                    total,
+                );
+                let mut f32_data = vec![0.0f32; total];
+                ane::neon_convert::f16_to_f32_bulk(src, &mut f32_data);
+                surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+                // Layout: [1, vocab_size, 1, w_sq] → element[c, w] = f32_data[c * w_sq + w]
+                for w in 0..seq_len {
+                    let mut best_val = f32::NEG_INFINITY;
+                    let mut best_idx = 0i32;
+                    for c in 0..vocab_size {
+                        let val = f32_data[c * w_sq + w];
+                        if val > best_val {
+                            best_val = val;
+                            best_idx = c as i32;
+                        }
+                    }
+                    result[w] = best_idx;
+                }
+            }
+            result
+        });
+        Ok(argmax)
+    }
+
+    fn read_f32(&self, py: Python<'_>) -> PyResult<Vec<f32>> {
+        let element_count = {
+            let s = self.inner.shape();
+            s.batch * s.channels * s.height * s.width
+        };
+        let mut result = vec![0.0f32; element_count];
+        let surface = self.inner.surface();
+        py.allow_threads(|| unsafe {
+            surface.lockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+            let src = std::slice::from_raw_parts(
+                surface.baseAddress().as_ptr().cast::<u16>(),
+                element_count,
+            );
+            ane::neon_convert::f16_to_f32_bulk(src, &mut result);
+            surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
+        });
+        Ok(result)
     }
 
     #[getter]
@@ -112,48 +192,111 @@ impl ANEKernel {
         &self.name
     }
 
-    fn run(&self, inputs: Vec<PyRef<ANETensor>>, outputs: Vec<PyRef<ANETensor>>) -> PyResult<()> {
-        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
-        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run failed: {:?}",
-                self.name, e
-            ))
-        })?;
-        Ok(())
-    }
-
-    fn run_uncached(
+    fn run(
         &self,
+        py: Python<'_>,
         inputs: Vec<PyRef<ANETensor>>,
         outputs: Vec<PyRef<ANETensor>>,
     ) -> PyResult<()> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
-        self.executable.run(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run_uncached failed: {:?}",
-                self.name, e
-            ))
-        })?;
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn run_uncached(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_uncached failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn run_cached(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_cached failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn run_direct(
+        &self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.run_cached_direct(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run_direct failed: {:?}",
+                    self.name, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn pre_map(&self,
+        py: Python<'_>,
+        inputs: Vec<PyRef<ANETensor>>,
+        outputs: Vec<PyRef<ANETensor>>,
+    ) -> PyResult<()> {
+        let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
+        let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
+        py.allow_threads(|| self.executable.pre_map_request(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' pre_map failed: {:?}",
+                    self.name, e
+                ))
+            })?;
         Ok(())
     }
 
     fn run_timed(
         &self,
+        py: Python<'_>,
         inputs: Vec<PyRef<ANETensor>>,
         outputs: Vec<PyRef<ANETensor>>,
     ) -> PyResult<f64> {
         let input_refs: Vec<&TensorData> = inputs.iter().map(|t| &t.inner).collect();
         let output_refs: Vec<&TensorData> = outputs.iter().map(|t| &t.inner).collect();
         let start = Instant::now();
-        self.executable.run_cached(&input_refs, &output_refs).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE kernel '{}' run failed: {:?}",
-                self.name, e
-            ))
-        })?;
+        py.allow_threads(|| self.executable.run_cached(&input_refs, &output_refs))
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE kernel '{}' run failed: {:?}",
+                    self.name, e
+                ))
+            })?;
         Ok(start.elapsed().as_secs_f64())
     }
 
@@ -162,8 +305,8 @@ impl ANEKernel {
     }
 }
 
-#[pyfunction]
-pub fn compile_dflash_kernels(
+fn compile_kernels(
+    dims: &dflash::DFlashDims,
     seq_q: usize,
     ctx_len: usize,
     softcap: f32,
@@ -173,24 +316,208 @@ pub fn compile_dflash_kernels(
     let w_kv = w_ctx + w_sq;
 
     let kernel_builders: Vec<(&str, Graph)> = vec![
-        ("fc_norm", dflash::build_fc_norm_kernel(w_ctx)),
-        ("mega_qkv", dflash::build_kqv_plus_vnorm_qnorm_kernel(w_sq, w_ctx)),
-        ("gqa_tile", dflash::build_gqa_tile_kernel(w_kv)),
-        ("attn_out", dflash::build_attn_out_kernel(w_sq, w_kv, softcap)),
-        ("o_proj_residual", dflash::build_o_proj_residual_kernel(w_sq, softcap)),
-        ("ffn_residual", dflash::build_ffn_residual_kernel(w_sq, softcap)),
-        ("final_norm", dflash::build_final_norm_kernel(w_sq)),
+        ("fc_norm", dflash::build_fc_norm_kernel(dims, w_ctx)),
+        ("mega_qkv", dflash::build_mega_qkv_kernel(dims, w_sq, w_ctx)),
+        ("gqa_tile", dflash::build_gqa_tile_kernel(dims, w_kv)),
+        ("attn_out", dflash::build_attn_out_kernel(dims, w_sq, w_kv, softcap)),
+        ("o_proj_residual", dflash::build_o_proj_residual_kernel(dims, w_sq, softcap)),
+        ("ffn_residual", dflash::build_ffn_residual_kernel(dims, w_sq, softcap)),
+        ("final_norm", dflash::build_final_norm_kernel(dims, w_sq)),
     ];
 
     let mut compiled = Vec::new();
     for (name, graph) in kernel_builders {
-        let exec = graph.compile(NSQualityOfService::UserInteractive).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "ANE compile '{}' failed: {:?}",
-                name, e
-            ))
-        })?;
-        compiled.push(ANEKernel { executable: exec, name: name.to_string() });
+        match graph.compile(NSQualityOfService::UserInteractive) {
+            Ok(exec) => {
+                compiled.push(ANEKernel { executable: exec, name: name.to_string() });
+            }
+            Err(e) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "ANE compile '{}' failed: {:?}",
+                    name, e
+                )));
+            }
+        }
     }
     Ok(compiled)
+}
+
+#[pyfunction]
+pub fn compile_dflash_kernels(
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+) -> PyResult<Vec<ANEKernel>> {
+    compile_kernels(&dflash::DIMS_8B, seq_q, ctx_len, softcap)
+}
+
+#[pyfunction]
+pub fn compile_dflash_kernels_27b(
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+) -> PyResult<Vec<ANEKernel>> {
+    compile_kernels(&dflash::DIMS_27B, seq_q, ctx_len, softcap)
+}
+
+/// Container for one transformer layer's quantized projection weights.
+///
+/// Each weight is passed as `(int8_bytes, fp16_scale_bytes, oc, ic)`.  The
+/// int8 bytes are in row-major `[oc, ic]` order; the scale bytes are raw
+/// IEEE 754 fp16 encoded as little-endian uint16 (one per output channel).
+#[pyclass]
+pub struct Q8LayerWeights {
+    pub wq:     dflash::Q8Weight,
+    pub wk:     dflash::Q8Weight,
+    pub wv:     dflash::Q8Weight,
+    pub wo:     dflash::Q8Weight,
+    pub w_gate: dflash::Q8Weight,
+    pub w_up:   dflash::Q8Weight,
+    pub w_down: dflash::Q8Weight,
+}
+
+#[pymethods]
+impl Q8LayerWeights {
+    /// Construct from raw bytes.
+    ///
+    /// Each weight is `(int8_data: bytes, scales_f16: bytes, oc: int, ic: int)`.
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        wq:     (Vec<u8>, Vec<u8>, usize, usize),
+        wk:     (Vec<u8>, Vec<u8>, usize, usize),
+        wv:     (Vec<u8>, Vec<u8>, usize, usize),
+        wo:     (Vec<u8>, Vec<u8>, usize, usize),
+        w_gate: (Vec<u8>, Vec<u8>, usize, usize),
+        w_up:   (Vec<u8>, Vec<u8>, usize, usize),
+        w_down: (Vec<u8>, Vec<u8>, usize, usize),
+    ) -> PyResult<Self> {
+        fn parse(t: (Vec<u8>, Vec<u8>, usize, usize)) -> PyResult<dflash::Q8Weight> {
+            let (int8_data, scale_bytes, oc, ic) = t;
+            if int8_data.len() != oc * ic {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "int8_data len {} != oc*ic {}", int8_data.len(), oc * ic
+                )));
+            }
+            if scale_bytes.len() != oc * 2 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "scale_bytes len {} != oc*2 {}", scale_bytes.len(), oc * 2
+                )));
+            }
+            let scales_f16: Vec<u16> = scale_bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            Ok(dflash::Q8Weight {
+                int8_data: int8_data.into_boxed_slice(),
+                scales_f16,
+                oc,
+                ic,
+            })
+        }
+        Ok(Self {
+            wq:     parse(wq)?,
+            wk:     parse(wk)?,
+            wv:     parse(wv)?,
+            wo:     parse(wo)?,
+            w_gate: parse(w_gate)?,
+            w_up:   parse(w_up)?,
+            w_down: parse(w_down)?,
+        })
+    }
+}
+
+/// Compile per-layer quantized DFlash kernels.
+///
+/// Returns one kernel set per layer.  Each set is a list:
+/// `[mega_qkv_q8, gqa_tile, attn_out, o_proj_residual_q8, ffn_residual_q8]`.
+///
+/// The non-per-layer kernels (`fc_norm`, `final_norm`) are compiled separately
+/// by `compile_dflash_kernels`.
+#[pyfunction]
+pub fn compile_dflash_kernels_q8(
+    py: Python<'_>,
+    seq_q: usize,
+    ctx_len: usize,
+    softcap: f32,
+    layer_weights: Vec<PyRef<Q8LayerWeights>>,
+    is_27b: bool,
+) -> PyResult<Vec<Vec<ANEKernel>>> {
+    let dims = if is_27b { &dflash::DIMS_27B } else { &dflash::DIMS_8B };
+    let w_sq = dflash::align_width(seq_q);
+    let w_ctx = dflash::align_width(ctx_len);
+    let w_kv = w_ctx + w_sq;
+
+    // Extract all weight data while holding the GIL, then release it for compilation.
+    struct LayerData {
+        wq: dflash::Q8Weight, wk: dflash::Q8Weight, wv: dflash::Q8Weight,
+        wo: dflash::Q8Weight,
+        w_gate: dflash::Q8Weight, w_up: dflash::Q8Weight, w_down: dflash::Q8Weight,
+    }
+    let extracted: Vec<LayerData> = layer_weights.iter().map(|lw| LayerData {
+        wq:     lw.wq.clone(),
+        wk:     lw.wk.clone(),
+        wv:     lw.wv.clone(),
+        wo:     lw.wo.clone(),
+        w_gate: lw.w_gate.clone(),
+        w_up:   lw.w_up.clone(),
+        w_down: lw.w_down.clone(),
+    }).collect();
+
+    let n_layers = extracted.len();
+    let mut all_layers: Vec<Vec<ANEKernel>> = Vec::with_capacity(n_layers);
+
+    py.allow_threads(|| -> PyResult<()> {
+        for ld in extracted {
+            let mega_graph = dflash::build_mega_qkv_kernel_q8(
+                dims, w_sq, w_ctx, ld.wq, ld.wk, ld.wv,
+            );
+            let gqa_graph = dflash::build_gqa_tile_kernel(dims, w_kv);
+            let attn_graph = dflash::build_attn_out_kernel(dims, w_sq, w_kv, softcap);
+            let o_graph = dflash::build_o_proj_residual_kernel_q8(dims, w_sq, softcap, ld.wo);
+            let ffn_graph = dflash::build_ffn_residual_kernel_q8(
+                dims, w_sq, softcap, ld.w_gate, ld.w_up, ld.w_down,
+            );
+
+            let compile = |name: &str, g: ane::Graph| -> PyResult<ANEKernel> {
+                g.compile(NSQualityOfService::UserInteractive)
+                    .map(|exec| ANEKernel { executable: exec, name: name.to_string() })
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("compile '{}' failed: {:?}", name, e)
+                    ))
+            };
+
+            all_layers.push(vec![
+                compile("mega_qkv_q8", mega_graph)?,
+                compile("gqa_tile",    gqa_graph)?,
+                compile("attn_out",    attn_graph)?,
+                compile("o_proj_residual_q8", o_graph)?,
+                compile("ffn_residual_q8",    ffn_graph)?,
+            ]);
+        }
+        Ok(())
+    })?;
+
+    Ok(all_layers)
+}
+
+/// Compile the fused final-norm + lm_head kernel.
+///
+/// `is_27b`: True for 27B model (hidden=5120), False for 8B (hidden=4096).
+#[pyfunction]
+pub fn compile_lm_head_kernel(
+    seq_q: usize,
+    vocab_size: usize,
+    is_27b: bool,
+) -> PyResult<ANEKernel> {
+    let dims = if is_27b { &dflash::DIMS_27B } else { &dflash::DIMS_8B };
+    let w_sq = dflash::align_width(seq_q);
+    let graph = dflash::build_final_norm_lm_head_kernel(dims, w_sq, vocab_size);
+    match graph.compile(NSQualityOfService::UserInteractive) {
+        Ok(exec) => Ok(ANEKernel { executable: exec, name: "final_norm_lm_head".to_string() }),
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "ANE compile 'final_norm_lm_head' failed: {:?}",
+            e
+        ))),
+    }
 }
